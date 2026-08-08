@@ -22,7 +22,7 @@ type Profile = 'micro' | 'default' | 'hard' | 'critical' | 'ops' | 'memory_text'
 type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
 type AutoGraduationProfileId = 'cautious' | 'balanced' | 'fast_learning';
 type WorkflowArchetypeId = 'briefing' | 'research' | 'analysis' | 'ops' | 'general';
-type FolderDropLaneState = 'not_configured' | 'needs_share' | 'active';
+type FolderDropLaneState = 'not_configured' | 'no_library_yet' | 'needs_share' | 'active';
 
 interface ProviderStatus {
   configured: boolean;
@@ -234,12 +234,15 @@ const AUTO_GRADUATION_PROFILES: Array<{
 // state of the lane, not a summary of it.
 const FOLDER_DROP_LANE_COPY: Record<FolderDropLaneState, string> = {
   not_configured: "Folder drop isn't configured on this server yet.",
+  no_library_yet:
+    "Your Violema Library folder doesn't exist yet. It's created the first time a mission files something there — run a mission with a library step, then come back.",
   needs_share: 'Share your Violema Library folder with the reader address below, then verify.',
   active: 'Violema can see files you drop in your Violema Library folder.',
 };
 
 const FOLDER_DROP_LANE_LABEL: Record<FolderDropLaneState, string> = {
   not_configured: 'Not configured',
+  no_library_yet: 'Not created yet',
   needs_share: 'Needs share',
   active: 'Active',
 };

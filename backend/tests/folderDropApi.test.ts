@@ -227,6 +227,36 @@ test('an unconfigured folder-drop lane reports not_configured and never audits',
   });
 });
 
+test('a workspace with a working reader but no Violema Library folder yet reports no_library_yet, never not_configured', async () => {
+  // MEASURED IN PRODUCTION: purpleorangehq and workspace_158339ffa04cc7ef both
+  // have a working platform reader but no rootFolderId yet (their first
+  // library write has not happened), and reported `not_configured` — which
+  // blames the SERVER for a WORKSPACE-level condition. No lane-state
+  // override here: findLibraryRootFolderId genuinely returns null in this
+  // fresh temp workspace (there is no Composio connection at all, so the
+  // Drive lookup fails closed to null, same as "the folder does not exist"),
+  // and the real getFolderDropLaneState must read that as no_library_yet
+  // because a reader key IS configured.
+  const readerKeyEnvValue = buildTestReaderKeyEnvValue('reader@test.iam');
+
+  await withApiServer({ readerKeyEnvValue }, async ({ baseUrl, sessionToken }) => {
+    const status = await fetch(`${baseUrl}/api/workspace/library/folder-drop`, {
+      headers: authHeaders(sessionToken),
+    });
+    assert.equal(status.status, 200);
+    const statusBody = await status.json() as Record<string, unknown>;
+    assert.equal(statusBody.laneState, 'no_library_yet');
+    assert.equal(statusBody.readerEmail, 'reader@test.iam');
+    assert.equal(statusBody.rootFolderId, null);
+
+    assert.equal(
+      readFolderDropShareAuditEvents().length,
+      0,
+      'no_library_yet must never audit an enablement — the lane never reached active.',
+    );
+  });
+});
+
 test('the first transition to active audits exactly once, even across repeated verify calls', async () => {
   const readerKeyEnvValue = buildTestReaderKeyEnvValue('reader@test.iam');
 

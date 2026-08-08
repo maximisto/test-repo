@@ -36,10 +36,16 @@ assert(settingsSource.includes('/api/workspace/library/folder-drop/verify'), 'Se
 assert(settingsSource.includes('/api/workspace/library/folder-drop/share'), 'SettingsPage exposes a Share control wired to the share endpoint.');
 assert(settingsSource.includes('/api/workspace/library/url'), 'SettingsPage talks to the library URL-ingestion API.');
 
-// 3. The three lane-state copies, verbatim.
+// 3. The four lane-state copies, verbatim.
 assert(
   settingsSource.includes("Folder drop isn't configured on this server yet."),
   'not_configured lane-state copy is present verbatim.',
+);
+assert(
+  settingsSource.includes(
+    "Your Violema Library folder doesn't exist yet. It's created the first time a mission files something there — run a mission with a library step, then come back.",
+  ),
+  'no_library_yet lane-state copy is present verbatim — a workspace-level condition, never a server misconfiguration.',
 );
 assert(
   settingsSource.includes('Share your Violema Library folder with the reader address below, then verify.'),

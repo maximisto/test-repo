@@ -179,6 +179,31 @@ test('not_configured never adds a sweep warning', async () => {
   assert.deepEqual(result.data.sweep?.warnings, []);
 });
 
+test('no_library_yet never adds a sweep warning either — nothing is wrong, the library simply has not been created', async () => {
+  // Distinct from not_configured: the platform reader IS working here, the
+  // WORKSPACE just has no Violema Library folder yet. Neither condition is
+  // an operator-actionable problem, so neither may add a warning.
+  setLibrarySweepOverridesForTests({ laneState: 'no_library_yet' });
+  const drive = createFakeDrive({ appFiles: [] });
+
+  const result = await readLibrary(
+    'ws_test',
+    SECTION,
+    {},
+    { execute: drive.execute, fetchText: drive.fetchText },
+  );
+
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.data.sweep?.laneState, 'no_library_yet');
+  assert.deepEqual(result.data.sweep?.warnings, []);
+  assert.equal(
+    result.data.entries.filter((entry) => entry.origin === 'operator_file').length,
+    0,
+    'no_library_yet must never fabricate operator entries',
+  );
+});
+
 test('a workspace whose library root does not exist yet reads as not_configured with no warning', async () => {
   // No override here: this exercises the REAL getFolderDropLaneState(null)
   // short-circuit, which returns 'not_configured' without ever touching a
