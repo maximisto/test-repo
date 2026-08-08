@@ -99,7 +99,7 @@ export const SWEEP_COMPOSIO_MAX_PAGES = 10;
 export const SWEEP_MEMO_MAX_ENTRIES = 50;
 export const SWEEP_MEMO_TTL_MS = 15 * 60 * 1000;
 
-export type FolderDropLaneState = 'not_configured' | 'needs_share' | 'active';
+export type FolderDropLaneState = 'not_configured' | 'no_library_yet' | 'needs_share' | 'active';
 
 export interface LibrarySweepDeps {
   /** Test seam. Default: built from `readDriveReaderConfig()`; `null` when the lane is unconfigured. */
@@ -224,31 +224,49 @@ export async function shareLibraryFolderWithReader(
 // --- lane state -----------------------------------------------------------------
 
 /**
- * The three buckets, named explicitly.
+ * The four buckets, named explicitly.
  *
  * `needs_share` is the only state that produces an operator-facing
  * instruction ("re-share your Violema Library folder"). Everything that is
  * OUR problem must therefore land somewhere else, or a single platform
  * outage renders as an accusation in every workspace's every run — telling
  * thousands of operators to fix something they did not break, and hiding our
- * own incident behind onboarding UI.
+ * own incident behind onboarding UI. `no_library_yet` is likewise never OUR
+ * problem or the OPERATOR's fault — it is just a workspace that has not
+ * written its first library entry yet — so it must never render as a server
+ * misconfiguration either.
  *
- * - `not_configured`: no reader key on this server, OR `rootFolderId` is null
- *   (the workspace's `Violema Library` folder does not exist yet — nothing
- *   has ever been shared, so there is nothing to re-share), OR the key is
- *   present but unusable, OR the platform side failed in a way the operator
- *   cannot act on:
+ * - `not_configured`: no reader key on this server, OR the key is present
+ *   but unusable, OR the platform side failed in a way the operator cannot
+ *   act on:
  *     · `auth_failed` — malformed/expired/revoked platform credential.
- *     · HTTP 401/403 on files.list — Drive API disabled on the project, the
- *       service account suspended, an org-policy change. `timedFetch` maps
- *       every non-ok Drive status to `http_error`, so the CODE cannot
- *       separate these; the STATUS can.
+ *     · HTTP 401/403 on the folder-meta probe — Drive API disabled on the
+ *       project, the service account suspended, an org-policy change.
+ *       `timedFetch` maps every non-ok Drive status to `http_error`, so the
+ *       CODE cannot separate these; the STATUS can.
  *     · `timeout` / `too_large` — transient or platform-bound, never
  *       something re-sharing a folder would fix.
- * - `needs_share`: a working key that reached Drive and was told the folder
- *   is not there for it. A folder not shared with the reader returns 404,
- *   which is what makes this cleanly separable from the 401/403 bucket above.
- * - `active`: the reader listed the folder successfully.
+ * - `no_library_yet`: a reader IS configured, but `rootFolderId` is null —
+ *   this workspace's `Violema Library` folder does not exist yet (it is
+ *   created lazily on the first library write). Nothing has ever been
+ *   shared, so there is nothing to re-share and nothing wrong with the
+ *   server; this is purely "come back after your first mission run."
+ * - `needs_share`: a working key, a folder that DOES exist, and a probe that
+ *   was told the folder is not there for it. A folder not shared with the
+ *   reader returns 404 on the metadata probe, which is what makes this
+ *   cleanly separable from the 401/403 bucket above.
+ * - `active`: the reader could genuinely read the folder's own metadata.
+ *
+ * WHY THE PROBE IS A METADATA FETCH ON THE FOLDER, NEVER A CHILD LISTING
+ *
+ * Google Drive returns HTTP 200 with an empty file list when the caller
+ * lacks access to a folder — it does not error. A child listing therefore
+ * cannot distinguish "this folder is empty" from "I cannot see this folder
+ * at all," which is exactly the gap that let an inaccessible folder report
+ * `active` with zero files and zero warnings. `getFolderMeta` (Drive's
+ * `files.get` on the folder id itself) genuinely 404s/403s when the reader
+ * cannot see it, so it is the only thing either `getFolderDropLaneState` or
+ * `sweepOperatorFiles` may use to decide whether the lane is truly open.
  */
 function laneStateForDriveReaderError(error: DriveReaderError): FolderDropLaneState {
   if (error.code === 'auth_failed') return 'not_configured';
@@ -266,10 +284,17 @@ export async function getFolderDropLaneState(
   }
 
   const reader = resolveReader(deps);
-  if (!reader || !rootFolderId) return 'not_configured';
+  if (!reader) return 'not_configured';
+  // A configured reader with no folder to point at is a workspace-level
+  // condition (the library has not been created yet), never a server
+  // misconfiguration — see the bucket doc above.
+  if (!rootFolderId) return 'no_library_yet';
 
   try {
-    await reader.listFolderTree(rootFolderId);
+    // The access probe, deliberately NOT `listFolderTree`: Drive returns
+    // HTTP 200 with an empty file list for a folder the caller cannot see,
+    // so a child listing can never tell "empty" apart from "inaccessible."
+    await reader.getFolderMeta(rootFolderId);
     return 'active';
   } catch (error) {
     if (!(error instanceof DriveReaderError)) throw error;
@@ -564,6 +589,19 @@ export async function sweepOperatorFiles(
   const nowFn = deps.now ?? (() => new Date());
 
   const warnings: string[] = [];
+
+  // Verify access BEFORE ever listing children. `listFolderTree` on a folder
+  // this reader cannot see returns HTTP 200 with an empty array, not an
+  // error — so without this check, a blind folder would "successfully"
+  // sweep zero files with zero warnings, which is exactly the silent
+  // failure this module exists to prevent. `getFolderMeta` genuinely
+  // 404s/403s when the reader lacks access.
+  try {
+    await reader.getFolderMeta(input.rootFolderId);
+  } catch (error) {
+    if (!(error instanceof DriveReaderError)) throw error;
+    return { laneState: laneStateForDriveReaderError(error), entries: [], warnings: [] };
+  }
 
   let tree: DriveFolderTree;
   try {

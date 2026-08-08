@@ -38,16 +38,30 @@ interface FakeReaderOptions {
   fileContents?: Record<string, Buffer>;
   docExports?: Record<string, string>;
   listError?: Error;
+  /**
+   * Models the folder-access probe. Defaults to a successful metadata fetch
+   * (the folder is accessible) — most fixtures are not testing accessibility
+   * at all. Set this to model a folder the reader genuinely cannot see: a
+   * real Drive 403/404 on `files.get`, distinct from `listError`, which
+   * models a listing-time failure on an ALREADY-accessible folder.
+   */
+  getFolderMetaError?: Error;
 }
 
 function createFakeReader(options: FakeReaderOptions) {
   const downloadCalls: string[] = [];
   const exportCalls: string[] = [];
+  const getFolderMetaCalls: string[] = [];
 
   const reader: DriveReader = {
     async listFolderTree() {
       if (options.listError) throw options.listError;
       return { files: options.tree, truncated: options.treeTruncated ?? false };
+    },
+    async getFolderMeta(folderId: string) {
+      getFolderMetaCalls.push(folderId);
+      if (options.getFolderMetaError) throw options.getFolderMetaError;
+      return { id: folderId, name: 'Violema Library', mimeType: FOLDER_MIME };
     },
     async downloadFile(fileId: string) {
       downloadCalls.push(fileId);
@@ -63,7 +77,7 @@ function createFakeReader(options: FakeReaderOptions) {
     },
   };
 
-  return { reader, downloadCalls, exportCalls };
+  return { reader, downloadCalls, exportCalls, getFolderMetaCalls };
 }
 
 interface ComposioPage {
@@ -644,6 +658,15 @@ test('a download stream that dies mid-read yields contentError, and never throws
         headers: { 'content-type': 'application/json' },
       });
     }
+    // sweepOperatorFiles now verifies access with a folder-meta probe BEFORE
+    // ever listing — this test's tree is served directly (see below), but the
+    // access probe still genuinely calls through to the real reader.
+    if (url.startsWith(`https://www.googleapis.com/drive/v3/files/${ROOT_ID}?`)) {
+      return new Response(
+        JSON.stringify({ id: ROOT_ID, name: 'Violema Library', mimeType: FOLDER_MIME }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }
     if (url.includes('/files/broken-pdf?alt=media')) {
       let pulls = 0;
       const body = new ReadableStream({
@@ -712,11 +735,19 @@ test('a download stream that dies mid-read yields contentError, and never throws
 
 // --- lane state ---------------------------------------------------------------------
 
-test('lane state: null reader → not_configured; reader 404 on root list → needs_share; list ok → active', async () => {
+test('lane state: null reader → not_configured; reader configured but no root folder yet → no_library_yet; reader 404 on folder-meta probe → needs_share; probe ok → active', async () => {
   assert.equal(await getFolderDropLaneState(ROOT_ID, { reader: null }), 'not_configured');
 
+  // The probe is a metadata fetch on the folder itself (`getFolderMeta`),
+  // never a child listing (`listFolderTree`) — Drive returns HTTP 200 with an
+  // empty file list for a folder the caller cannot see, so a listing throw
+  // would never model a real inaccessible-folder response. `listFolderTree`
+  // here throws unconditionally to prove it is never reached in this path.
   const failingReader: DriveReader = {
     listFolderTree: async () => {
+      throw new Error('listFolderTree must not be reached by the access probe');
+    },
+    getFolderMeta: async () => {
       throw new DriveReaderError('http_error', 'not found', 404);
     },
     downloadFile: async () => {
@@ -730,6 +761,7 @@ test('lane state: null reader → not_configured; reader 404 on root list → ne
 
   const okReader: DriveReader = {
     listFolderTree: async () => ({ files: [], truncated: false }),
+    getFolderMeta: async (folderId: string) => ({ id: folderId, name: 'Violema Library', mimeType: FOLDER_MIME }),
     downloadFile: async () => {
       throw new Error('unused');
     },
@@ -738,6 +770,77 @@ test('lane state: null reader → not_configured; reader 404 on root list → ne
     },
   };
   assert.equal(await getFolderDropLaneState(ROOT_ID, { reader: okReader }), 'active');
+
+  // A reader IS configured (okReader), but this workspace has no Violema
+  // Library folder yet (rootFolderId null) — that is a workspace-level
+  // condition, never a server misconfiguration, and must never be reported
+  // as `not_configured`.
+  assert.equal(await getFolderDropLaneState(null, { reader: okReader }), 'no_library_yet');
+});
+
+test('the realistic Drive fake: listFolderTree returns an empty array (not a throw) while getFolderMeta 404s — the lane must read needs_share, never active', async () => {
+  // This is the exact shape of the production bug: Google Drive returns HTTP
+  // 200 with an empty file list when the caller lacks access to a folder —
+  // it does NOT error. A fake that models inaccessibility as a listing THROW
+  // (as earlier versions of this suite did) can never catch a regression
+  // back to probing via listFolderTree, because it never exercises the one
+  // response shape Drive actually returns for a blind folder.
+  const blindButNonThrowingReader: DriveReader = {
+    async listFolderTree() {
+      return { files: [], truncated: false };
+    },
+    async getFolderMeta() {
+      throw new DriveReaderError('http_error', 'not found', 404);
+    },
+    async downloadFile() {
+      throw new Error('unused');
+    },
+    async exportDoc() {
+      throw new Error('unused');
+    },
+  };
+
+  assert.equal(
+    await getFolderDropLaneState(ROOT_ID, { reader: blindButNonThrowingReader }),
+    'needs_share',
+    'an inaccessible folder that lists empty must never be reported active',
+  );
+});
+
+test('sweepOperatorFiles must never report success on a folder it cannot see: getFolderMeta 404 -> needs_share, empty entries, listFolderTree never called', async () => {
+  // Same realistic-Drive-fake shape as the lane-state test above, but against
+  // sweepOperatorFiles directly: without its own access check, a blind
+  // folder's listFolderTree returns 200 with an empty array, and the sweep
+  // would "successfully" report laneState: active with zero entries and zero
+  // warnings — the exact silent failure this fix closes. sweepOperatorFiles
+  // must verify access via getFolderMeta BEFORE ever calling listFolderTree.
+  let listFolderTreeCalled = false;
+  const blindButNonThrowingReader: DriveReader = {
+    async listFolderTree() {
+      listFolderTreeCalled = true;
+      return { files: [], truncated: false };
+    },
+    async getFolderMeta() {
+      throw new DriveReaderError('http_error', 'not found', 404);
+    },
+    async downloadFile() {
+      throw new Error('unused');
+    },
+    async exportDoc() {
+      throw new Error('unused');
+    },
+  };
+  const { execute } = createComposioFake({ [ROOT_ID]: [{ files: [] }] });
+
+  const result = await sweepOperatorFiles(
+    { workspaceId: 'ws_test', rootFolderId: ROOT_ID, budgetBytes: 1_000_000 },
+    { reader: blindButNonThrowingReader, execute },
+  );
+
+  assert.equal(result.laneState, 'needs_share', 'a blind folder must never be reported active');
+  assert.deepEqual(result.entries, []);
+  assert.deepEqual(result.warnings, []);
+  assert.equal(listFolderTreeCalled, false, 'sweepOperatorFiles must check access before ever listing children');
 });
 
 // A platform outage must never render as "re-share your folder" in every
@@ -774,8 +877,15 @@ const laneStateCases: Array<{ label: string; error: DriveReaderError; expected: 
 
 for (const testCase of laneStateCases) {
   test(`lane state: ${testCase.label} → ${testCase.expected}`, async () => {
+    // The access probe (`getFolderMeta`) is what both `getFolderDropLaneState`
+    // and `sweepOperatorFiles` consult now — `listFolderTree` throws
+    // unconditionally to prove neither call path reaches it when the probe
+    // itself fails.
     const failingReader: DriveReader = {
       listFolderTree: async () => {
+        throw new Error('listFolderTree must not be reached when the access probe already failed');
+      },
+      getFolderMeta: async () => {
         throw testCase.error;
       },
       downloadFile: async () => {
@@ -793,12 +903,13 @@ for (const testCase of laneStateCases) {
       { reader: failingReader },
     );
     assert.equal(result.laneState, testCase.expected);
+    assert.deepEqual(result.entries, [], 'a failed access probe must never yield entries');
   });
 }
 
-test('DriveReaderError.status is actually populated on the files.list path', async () => {
+test('DriveReaderError.status is actually populated on both the files.list AND the files.get (folder-meta probe) paths', async () => {
   // The 401/403 classification above is worthless if `status` is undefined
-  // in the one place the lane check reads it.
+  // in the one place the lane check actually reads it: the folder-meta probe.
   const { privateKey } = crypto.generateKeyPairSync('rsa', {
     modulusLength: 2048,
     publicKeyEncoding: { type: 'spki', format: 'pem' },
@@ -827,12 +938,21 @@ test('DriveReaderError.status is actually populated on the files.list path', asy
     return true;
   });
 
+  await assert.rejects(reader.getFolderMeta(ROOT_ID), (error: unknown) => {
+    if (!(error instanceof DriveReaderError)) assert.fail('expected a DriveReaderError');
+    assert.equal(error.status, 403, 'files.get (the actual lane-state probe) must carry the HTTP status through');
+    return true;
+  });
+
   assert.equal(await getFolderDropLaneState(ROOT_ID, { reader }), 'not_configured');
 });
 
 test('auth_failed is a platform-side problem, not a share problem: it maps to not_configured', async () => {
   const authFailedReader: DriveReader = {
     listFolderTree: async () => {
+      throw new Error('listFolderTree must not be reached when the access probe already failed');
+    },
+    getFolderMeta: async () => {
       throw new DriveReaderError('auth_failed', 'the platform key could not be used to sign the auth token');
     },
     downloadFile: async () => {

@@ -298,6 +298,68 @@ test('listFolderTree reports truncated: false when the whole tree fits the page 
   assert.equal(tree.files[0]?.parentFolderId, rootId);
 });
 
+// --- getFolderMeta: the real access probe -----------------------------------
+//
+// listFolderTree cannot serve as an access probe: Drive returns HTTP 200 with
+// an empty file list when the caller lacks access to a folder, so an
+// inaccessible folder is indistinguishable from an empty one if a child
+// listing is all a caller ever does. getFolderMeta calls files.get on the
+// folder itself, which genuinely 404s/403s when the reader cannot see it.
+
+test('getFolderMeta requests files.get with id,name,mimeType fields and returns the metadata', async () => {
+  const { privateKey } = generateTestKeypair();
+  const clientEmail = 'folder-meta-reader@test.iam.gserviceaccount.com';
+  const folderId = 'probe-folder-id';
+
+  let requestedUrl: string | null = null;
+
+  const fetchImpl: DriveReaderFetch = async (input) => {
+    const url = typeof input === 'string' ? input : input.toString();
+    if (url === TOKEN_URL) return jsonResponse({ access_token: 'tok', expires_in: 3600 });
+    if (url.startsWith(`https://www.googleapis.com/drive/v3/files/${folderId}?`)) {
+      requestedUrl = url;
+      return jsonResponse({ id: folderId, name: 'Violema Library', mimeType: 'application/vnd.google-apps.folder' });
+    }
+    throw new Error(`Unexpected fetch to ${url}`);
+  };
+
+  const reader = createDriveReader({ clientEmail, privateKey }, fetchImpl);
+  const meta = await reader.getFolderMeta(folderId);
+
+  assert.deepEqual(meta, {
+    id: folderId,
+    name: 'Violema Library',
+    mimeType: 'application/vnd.google-apps.folder',
+  });
+  assert.ok(requestedUrl, 'expected a files.get request');
+  const params = new URL(requestedUrl as string).searchParams;
+  assert.equal(params.get('fields'), 'id,name,mimeType');
+});
+
+test('getFolderMeta surfaces a 404 (folder not shared with the reader) as DriveReaderError http_error carrying status 404', async () => {
+  const { privateKey } = generateTestKeypair();
+  const clientEmail = 'folder-meta-404-reader@test.iam.gserviceaccount.com';
+  const folderId = 'unshared-folder-id';
+
+  const fetchImpl: DriveReaderFetch = async (input) => {
+    const url = typeof input === 'string' ? input : input.toString();
+    if (url === TOKEN_URL) return jsonResponse({ access_token: 'tok', expires_in: 3600 });
+    if (url.startsWith(`https://www.googleapis.com/drive/v3/files/${folderId}?`)) {
+      return new Response(JSON.stringify({ error: 'not found' }), { status: 404 });
+    }
+    throw new Error(`Unexpected fetch to ${url}`);
+  };
+
+  const reader = createDriveReader({ clientEmail, privateKey }, fetchImpl);
+
+  await assert.rejects(reader.getFolderMeta(folderId), (error: unknown) => {
+    if (!(error instanceof DriveReaderError)) assert.fail('expected a DriveReaderError');
+    assert.equal(error.code, 'http_error');
+    assert.equal(error.status, 404);
+    return true;
+  });
+});
+
 // --- downloadFile size guard -------------------------------------------------
 
 test('downloadFile refuses oversized content with DriveReaderError too_large', async () => {
