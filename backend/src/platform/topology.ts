@@ -109,10 +109,10 @@ const WORKER_DEFINITIONS: Record<AgentRole, WorkerDefinition> = {
 };
 
 const MODEL_LABEL_BY_BAND: Record<IntelligenceBand, string> = {
-  critical: 'Claude Opus / frontier review',
-  hard: 'GPT-5.4 / deep reasoning',
-  default: 'Claude Sonnet / Qwen-class reasoning',
-  micro: 'MiniMax + low-cost memory routing',
+  critical: 'Claude Opus 5 / frontier review',
+  hard: 'Claude Opus 5 / deep reasoning',
+  default: 'Claude Sonnet 5 / balanced reasoning',
+  micro: 'GPT-4.1 mini / low-cost routing',
 };
 
 export function getWorkerDefinition(role: AgentRole): WorkerDefinition {

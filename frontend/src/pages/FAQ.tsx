@@ -84,7 +84,7 @@ const CATEGORIES = [
       },
       {
         q: 'Who builds the AI that powers VIOLEMA?',
-        a: 'VIOLEMA uses a routed model stack rather than a single model. Claude Sonnet handles most interactive work, GPT-5.4 covers harder reasoning, GPT-5.4 Nano handles lightweight and operational lanes, Claude Opus is reserved for critical high-stakes tasks, and Mistral handles embeddings and memory. That keeps the system both capable and efficient.',
+        a: 'VIOLEMA uses a routed model stack rather than a single model. Claude Sonnet 5 handles most interactive work, Claude Opus 5 covers harder reasoning and critical high-stakes tasks, GPT-4.1 mini and Claude Haiku handle lightweight and operational lanes, and Mistral handles embeddings and memory. That keeps the system both capable and efficient.',
       },
       {
         q: 'Can I connect VIOLEMA to my internal tools without exposing credentials?',

@@ -163,7 +163,7 @@ const WORKER_DEFINITIONS: Array<{
     label: 'Violema Manager',
     laneType: 'core',
     preferredBand: 'default',
-    modelLabel: 'Claude Sonnet / orchestration',
+    modelLabel: 'Claude Sonnet 5 / orchestration',
     summary: 'Owns decomposition, routing, quality thresholds, and worker handoffs.',
   },
   {
@@ -171,7 +171,7 @@ const WORKER_DEFINITIONS: Array<{
     label: 'Research Lead',
     laneType: 'core',
     preferredBand: 'default',
-    modelLabel: 'Sonnet / Qwen-class reasoning',
+    modelLabel: 'Sonnet 5 / balanced reasoning',
     summary: 'Finds external evidence, current sources, and context.',
   },
   {
@@ -179,7 +179,7 @@ const WORKER_DEFINITIONS: Array<{
     label: 'Analysis Lead',
     laneType: 'core',
     preferredBand: 'hard',
-    modelLabel: 'GPT-5.4 / deep reasoning',
+    modelLabel: 'Opus 5 / deep reasoning',
     summary: 'Interprets tradeoffs, metrics, and patterns into decisions.',
   },
   {
@@ -187,7 +187,7 @@ const WORKER_DEFINITIONS: Array<{
     label: 'Operations Lead',
     laneType: 'core',
     preferredBand: 'default',
-    modelLabel: 'Sonnet / Nano hybrid',
+    modelLabel: 'Sonnet 5 / Haiku hybrid',
     summary: 'Handles tools, delivery, and workflow orchestration.',
   },
   {
@@ -195,7 +195,7 @@ const WORKER_DEFINITIONS: Array<{
     label: 'Build Lead',
     laneType: 'core',
     preferredBand: 'hard',
-    modelLabel: 'GPT-5.4 / implementation',
+    modelLabel: 'Opus 5 / implementation',
     summary: 'Takes technical tasks that require structured implementation.',
   },
   {
@@ -203,7 +203,7 @@ const WORKER_DEFINITIONS: Array<{
     label: 'Review Lead',
     laneType: 'core',
     preferredBand: 'critical',
-    modelLabel: 'Opus / high-assurance review',
+    modelLabel: 'Opus 5 / high-assurance review',
     summary: 'Applies final risk checks when a workflow justifies stricter review.',
   },
   {
@@ -211,7 +211,7 @@ const WORKER_DEFINITIONS: Array<{
     label: 'Elastic lane 01',
     laneType: 'elastic',
     preferredBand: 'critical',
-    modelLabel: 'Opus / difficult finish work',
+    modelLabel: 'Opus 5 / difficult finish work',
     summary: 'Opens for hard synthesis, difficult framing, and polished final output.',
   },
   {
@@ -219,7 +219,7 @@ const WORKER_DEFINITIONS: Array<{
     label: 'Elastic lane 02',
     laneType: 'elastic',
     preferredBand: 'hard',
-    modelLabel: 'GPT-5.4 / parallel reasoning',
+    modelLabel: 'Opus 5 / parallel reasoning',
     summary: 'Opens for decomposition, extra reasoning depth, and parallel analysis.',
   },
   {
@@ -227,7 +227,7 @@ const WORKER_DEFINITIONS: Array<{
     label: 'Elastic lane 03',
     laneType: 'elastic',
     preferredBand: 'micro',
-    modelLabel: 'GPT-5.4 Nano / low-cost throughput',
+    modelLabel: 'GPT-4.1 mini / low-cost throughput',
     summary: 'Opens for delivery, operational overflow, and tool-heavy work.',
   },
   {
