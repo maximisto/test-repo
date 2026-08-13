@@ -325,10 +325,17 @@ function errorResult(
  */
 export function classifyFailure(error: unknown): IntegrationReadinessError['code'] {
   let text = '';
-  try {
-    text = JSON.stringify(error).toLowerCase();
-  } catch {
-    text = String(error).toLowerCase();
+  if (error instanceof Error) {
+    // JSON.stringify(new Error(...)) is '{}' — Error properties are
+    // non-enumerable — which silently classified every THROWN error as a
+    // generic query failure no matter what its message said.
+    text = `${error.name}: ${error.message}`.toLowerCase();
+  } else {
+    try {
+      text = JSON.stringify(error).toLowerCase();
+    } catch {
+      text = String(error).toLowerCase();
+    }
   }
 
   if (
@@ -344,6 +351,9 @@ export function classifyFailure(error: unknown): IntegrationReadinessError['code
     text.includes('connected account') ||
     text.includes('not connected') ||
     text.includes('connection not found') ||
+    // The bridge itself is off (`Composio is not configured`): the lane is
+    // not ready, as opposed to a live lane whose query transiently failed.
+    text.includes('not configured') ||
     text.includes('unauthorized') ||
     text.includes('401')
   ) {
