@@ -205,6 +205,7 @@ test('the analyze, summarize, fallback-summary and intel-extraction prompts all 
   assert.ok(server.AUTOMATION_SUMMARIZE_SYSTEM_PROMPT.includes(rule));
   assert.ok(server.AUTOMATION_FALLBACK_SUMMARY_SYSTEM_PROMPT.includes(rule));
   assert.ok(server.AUTOMATION_INTEL_EXTRACTION_SYSTEM_PROMPT.includes(rule));
+  assert.ok(server.AUTOMATION_MEMO_SYSTEM_PROMPT.includes(rule));
 });
 
 test('a whitespace-padded forged delimiter does not survive neutralization', async () => {

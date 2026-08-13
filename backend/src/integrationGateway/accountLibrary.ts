@@ -164,6 +164,16 @@ export function isLibraryBaselineFileName(fileName: string): boolean {
   return fileName.includes(LIBRARY_BASELINE_TITLE_PREFIX);
 }
 
+/**
+ * Human-clickable Drive link for a library entry, built from the id the
+ * append path already returns. Drive's canonical `file/d/<id>/view` shape —
+ * access control stays entirely Drive's: the link only opens for people the
+ * customer's own sharing settings allow.
+ */
+export function buildLibraryEntryViewLink(fileId: string): string {
+  return `https://drive.google.com/file/d/${encodeURIComponent(fileId)}/view`;
+}
+
 const DOWNLOAD_TIMEOUT_MS = 10_000;
 
 /** Bounded text fetch for a presigned download URL. */

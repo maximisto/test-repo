@@ -127,7 +127,10 @@ import {
 } from './platform/automationLifecycle';
 import { resolveAutomationStepSeverity } from './platform/stepSeverity';
 import {
+  AUTOMATION_MEMO_MAX_TOKENS,
+  AUTOMATION_MEMO_WORD_LIMIT,
   AUTOMATION_SUMMARY_WORD_LIMIT,
+  appendFullAnalysisLink,
   automationSummaryTokenBudget,
   requireCompleteAutomationSummary,
 } from './platform/automationSummaryPolicy';
@@ -317,6 +320,7 @@ import {
   provisionLibrarySection,
   readAccountLibraryEntryTitle,
   readAccountLibrarySection,
+  buildLibraryEntryViewLink,
   summarizeLibrarySection,
 } from './integrationGateway/accountLibrary';
 import { updateLibraryBaseline } from './integrationGateway/libraryBaseline';
@@ -4278,6 +4282,14 @@ export const AUTOMATION_SUMMARIZE_SYSTEM_PROMPT =
 export const AUTOMATION_FALLBACK_SUMMARY_SYSTEM_PROMPT =
   `Summarize the completed automation run in concise markdown. Lead with the highest-value outcome, then note any failure or delivery issue briefly. ${UNTRUSTED_EVIDENCE_PROMPT_RULE}`;
 
+// The delivery tier of the two-tier deliverable: the full brief persists in
+// the account library, and this prompt condenses it into what actually lands
+// in Slack. It consumes a document drafted FROM fenced third-party evidence,
+// so the untrusted-source rule rides along like every other evidence-reading
+// prompt in this file.
+export const AUTOMATION_MEMO_SYSTEM_PROMPT =
+  `You condense a finished VIOLEMA brief into a short delivery memo of at most ${AUTOMATION_MEMO_WORD_LIMIT} words. Keep the sharpest facts, numbers, dates, and the "Next actions" — bullets over prose, no tables. Keep at most three inline markdown links drawn from the brief; never introduce a URL that is not in it. Output the memo only, with no meta commentary. ${UNTRUSTED_EVIDENCE_PROMPT_RULE}`;
+
 // Nested inside the analyze step, triggered only when the step title/objective
 // matches /competitor|competitive|market/i. Its output is charted (pricing,
 // funding) and delivered to operators as evidence-backed data, so it reads
@@ -4436,6 +4448,10 @@ async function executeAutomationCore(
   const stepErrors: string[] = [];
   const pendingApprovalRequestedEvents: PendingApprovalRequestedLedgerEvent[] = [];
   let summaryText = '';
+  // Set once the run's findings are recorded in the account library — the
+  // deliver step uses it to swap the full brief for the memo tier and link
+  // back to the persisted document.
+  let libraryDocLink: string | null = null;
   let delivery: Record<string, unknown> | null = null;
   let deliveryError: string | null = null;
 
@@ -4560,6 +4576,7 @@ async function executeAutomationCore(
           payload: libraryOutput,
           origin: liveOrigin(ACCOUNT_LIBRARY_BACKING_SOURCE, new Date().toISOString()),
         });
+        libraryDocLink = buildLibraryEntryViewLink(libraryResult.fileId);
         stepExecution.status = 'succeeded';
         stepExecution.summary = libraryResult.created
           ? `Recorded this run in the ${libraryResult.section} library as "${libraryResult.fileName}".`
@@ -4872,7 +4889,37 @@ async function executeAutomationCore(
           }
         }
 
-        const body = summaryText || buildAutomationDeliveryFallbackBody(automation, artifacts, stepExecutions, stepErrors);
+        // Two-tier deliverable: when the full brief is already persisted in
+        // the library, what lands in the channel is a short memo condensed on
+        // the cheap lane, linking back to the full document. Without a
+        // persisted document there is nothing to link, so the full brief
+        // delivers as before — a memo alone would silently lose the analysis.
+        let body = summaryText || buildAutomationDeliveryFallbackBody(automation, artifacts, stepExecutions, stepErrors);
+        if (summaryText && libraryDocLink) {
+          try {
+            const memoResult = await runAutomationStepWithTimeout(
+              `Memo tier for "${step.title}"`,
+              generateTextDetailed(
+                'ops',
+                AUTOMATION_MEMO_SYSTEM_PROMPT,
+                [{ role: 'user', content: summaryText }],
+                AUTOMATION_MEMO_MAX_TOKENS,
+                workspaceId,
+              ),
+            );
+            body = appendFullAnalysisLink(requireCompleteAutomationSummary(memoResult), libraryDocLink);
+          } catch (error) {
+            // Fail soft and honest: the reviewed full brief delivers instead,
+            // and the warning names why the memo tier did not run.
+            stepExecution.warnings = [
+              ...(stepExecution.warnings ?? []),
+              `The memo tier failed (${error instanceof Error ? error.message : 'unknown error'}); the full brief was delivered instead.`,
+            ];
+            body = appendFullAnalysisLink(body, libraryDocLink);
+          }
+        } else if (libraryDocLink) {
+          body = appendFullAnalysisLink(body, libraryDocLink);
+        }
 
         if (isWorkflowDeliveryApprovalRequired({
           workflowId: runContext.workflowId,

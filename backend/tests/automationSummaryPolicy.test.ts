@@ -1,8 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  AUTOMATION_MEMO_MAX_TOKENS,
+  AUTOMATION_MEMO_WORD_LIMIT,
   AUTOMATION_SUMMARY_BASE_TOKENS,
   AUTOMATION_SUMMARY_TOKEN_CEILING,
+  AUTOMATION_SUMMARY_WORD_LIMIT,
+  appendFullAnalysisLink,
   automationSummaryTokenBudget,
   requireCompleteAutomationSummary,
 } from '../src/platform/automationSummaryPolicy';
@@ -53,6 +57,25 @@ test('requireCompleteAutomationSummary rejects provider-truncated drafts', () =>
       stopReason: 'max_tokens',
     }),
     /output limit/i,
+  );
+});
+
+test('the memo tier is a real condensation with room to finish', () => {
+  // Two tiers only make sense if the memo is meaningfully shorter than the
+  // brief it condenses, and the token bound must leave the word limit
+  // reachable — a memo refused for truncation on every run would just be
+  // the 2026-08-11 failure with extra steps.
+  assert.equal(AUTOMATION_MEMO_WORD_LIMIT, 350);
+  assert.ok(AUTOMATION_MEMO_WORD_LIMIT < AUTOMATION_SUMMARY_WORD_LIMIT);
+  assert.ok(AUTOMATION_MEMO_MAX_TOKENS >= AUTOMATION_MEMO_WORD_LIMIT * 2);
+  assert.ok(AUTOMATION_MEMO_MAX_TOKENS < AUTOMATION_SUMMARY_BASE_TOKENS);
+});
+
+test('appendFullAnalysisLink points the memo at the persisted document', () => {
+  const linked = appendFullAnalysisLink('## Memo\n- Rival at $179.\n', 'https://drive.google.com/file/d/abc123/view');
+  assert.equal(
+    linked,
+    '## Memo\n- Rival at $179.\n\n_Full analysis: [open in your Violema Library](https://drive.google.com/file/d/abc123/view)_',
   );
 });
 
