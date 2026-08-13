@@ -204,6 +204,59 @@ test('no_library_yet never adds a sweep warning either — nothing is wrong, the
   );
 });
 
+test('a sweep that degrades to needs_share after an active probe is authoritative: lane state and warning both report it', async () => {
+  // The pre-read probe and the sweep's own access probe are two separate
+  // Drive calls. If the operator revokes the share (or the folder becomes
+  // unreadable) BETWEEN them, the sweep comes back degraded with zero
+  // entries — and the read must report THAT, not the stale 'active' from
+  // the first probe. Reporting active-with-no-entries here is exactly the
+  // silent evidence omission the folder-drop lane exists to prevent.
+  setLibrarySweepOverridesForTests({
+    laneState: 'active',
+    sweep: { laneState: 'needs_share', entries: [], warnings: [] },
+  });
+  const drive = createFakeDrive({ appFiles: [] });
+
+  const result = await readLibrary(
+    'ws_test',
+    SECTION,
+    {},
+    { execute: drive.execute, fetchText: drive.fetchText },
+  );
+
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.data.sweep?.laneState, 'needs_share', 'the sweep verdict is later and must win');
+  assert.deepEqual(result.data.sweep?.warnings, [NEEDS_SHARE_WARNING]);
+  assert.equal(
+    result.data.entries.filter((entry) => entry.origin === 'operator_file').length,
+    0,
+  );
+});
+
+test('a sweep that degrades to not_configured after an active probe reports not_configured with no share warning', async () => {
+  // Same race, platform-side flavor: auth/timeout failures on the sweep's
+  // probe land in not_configured — never the operator's problem, so no
+  // re-share instruction. But the lane must still stop claiming active.
+  setLibrarySweepOverridesForTests({
+    laneState: 'active',
+    sweep: { laneState: 'not_configured', entries: [], warnings: [] },
+  });
+  const drive = createFakeDrive({ appFiles: [] });
+
+  const result = await readLibrary(
+    'ws_test',
+    SECTION,
+    {},
+    { execute: drive.execute, fetchText: drive.fetchText },
+  );
+
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.data.sweep?.laneState, 'not_configured');
+  assert.deepEqual(result.data.sweep?.warnings, []);
+});
+
 test('a workspace whose library root does not exist yet reads as not_configured with no warning', async () => {
   // No override here: this exercises the REAL getFolderDropLaneState(null)
   // short-circuit, which returns 'not_configured' without ever touching a

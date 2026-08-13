@@ -789,10 +789,17 @@ export async function readLibrary(
   // capped to half the total content budget, so a heavy drop can never crowd
   // out every app-written entry.
   const rootFolderId = root.folderId;
-  const laneState = await getFolderDropLaneState(rootFolderId);
+  const probedLaneState = await getFolderDropLaneState(rootFolderId);
+  // The probe above and the sweep below each run their own access check —
+  // two separate Drive calls, so access can be revoked (or a platform
+  // failure can begin) between them. When both ran, the sweep's verdict is
+  // the LATER fact and the one the returned entries were actually gated by,
+  // so it is authoritative: reporting the probe's stale 'active' alongside
+  // an empty degraded sweep would be silent evidence omission.
+  let laneState = probedLaneState;
   const sweepWarnings: string[] = [];
   let operatorEntries: AccountLibraryEntry[] = [];
-  if (laneState === 'active' && rootFolderId) {
+  if (probedLaneState === 'active' && rootFolderId) {
     let sweepResult: LibrarySweepResult;
     try {
       sweepResult = await sweepOperatorFiles(
@@ -803,7 +810,11 @@ export async function readLibrary(
       if (!(error instanceof LibrarySweepError)) throw error;
       return libraryFailure('integration_query_failed', 'Folder-drop listing could not complete.');
     }
+    laneState = sweepResult.laneState;
     sweepWarnings.push(...sweepResult.warnings);
+    if (sweepResult.laneState === 'needs_share') {
+      sweepWarnings.push(FOLDER_DROP_NEEDS_SHARE_WARNING);
+    }
     operatorEntries = sweepResult.entries.map((entry) => ({
       fileId: entry.fileId,
       fileName: entry.fileName,
@@ -814,7 +825,7 @@ export async function readLibrary(
       origin: 'operator_file' as const,
       ...(entry.contentError ? { contentError: entry.contentError } : {}),
     }));
-  } else if (laneState === 'needs_share') {
+  } else if (probedLaneState === 'needs_share') {
     sweepWarnings.push(FOLDER_DROP_NEEDS_SHARE_WARNING);
   }
   const sweep = { laneState, warnings: sweepWarnings };
