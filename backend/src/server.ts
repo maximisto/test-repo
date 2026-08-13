@@ -164,11 +164,17 @@ import {
   type AutomationStepKind,
   type PersistedAutomationStep,
   buildCreditSnapshot,
+  buildCreditBudgetBlock,
+  buildCreditBudgetOverrunWarning,
   buildCreditOverrunReason,
   buildInsufficientCreditsBlock,
   checkRunAffordability,
+  countPlannedModelCalls,
   type CreditBlockDescriptor,
+  type CreditBudgetBlockDescriptor,
+  CREDIT_BUDGET_EXCEEDED_CODE,
   INSUFFICIENT_CREDITS_CODE,
+  readPerRunCreditBudget,
   settleCreditHoldWithOverrun,
   buildMissionRecords,
   buildDelegationRuntimeContext,
@@ -5160,7 +5166,7 @@ function recordPreExecutionBlockedRun(input: {
   noteTitle: string;
   noteCode: string;
   blockers: unknown[];
-  blockKey: 'readinessBlock' | 'creditBlock';
+  blockKey: 'readinessBlock' | 'creditBlock' | 'creditBudgetBlock';
   block: Record<string, unknown>;
 }) {
   const { workspaceId, summary } = input;
@@ -5316,6 +5322,28 @@ function recordCreditBlockedAutomationRun(input: {
   });
 }
 
+/** The per-mission budget's pause-and-ask, recorded the same way every other pre-execution block is. */
+function recordCreditBudgetBlockedAutomationRun(input: {
+  automationId: string;
+  automationName: string;
+  automationDescription?: string;
+  notify?: string | null;
+  steps?: PersistedAutomationStep[];
+  workspaceId: string;
+  workflowId: string;
+  block: CreditBudgetBlockDescriptor;
+}) {
+  return recordPreExecutionBlockedRun({
+    ...input,
+    summary: input.block.summary,
+    noteTitle: `${input.automationName} paused — over its per-run credit budget`,
+    noteCode: CREDIT_BUDGET_EXCEEDED_CODE,
+    blockers: input.block.blockers,
+    blockKey: 'creditBudgetBlock',
+    block: { ...input.block },
+  });
+}
+
 /**
  * Read back whatever a run has already persisted through `persistProgress`.
  *
@@ -5389,6 +5417,7 @@ function checkManualRunAffordability(
       automationRuns: 1,
       toolCalls: plan.estimatedToolCalls,
       complexity: plan.complexity,
+      modelCallCount: countPlannedModelCalls(automation.steps),
     });
     const affordability = checkRunAffordability({
       workspaceId,
@@ -5436,6 +5465,7 @@ export async function runAutomation(automation: {
   condition?: string;
   timezone?: string;
   reviewFeedback?: string;
+  credit_budget_per_run?: number;
 }) {
   const workspaceId = automation.workspaceId || DEFAULT_WORKSPACE_ID;
   const workflowId = inferWorkflowIdFromAutomation(automation);
@@ -5494,6 +5524,7 @@ export async function runAutomation(automation: {
     automationRuns: 1,
     toolCalls: toolCallCount,
     complexity,
+    modelCallCount: countPlannedModelCalls(automation.steps),
   });
   const estimatedCredits = Math.max(estimate.estimatedCredits, executionPlan.estimatedCredits);
   const affordability = checkRunAffordability({ workspaceId, estimatedCredits });
@@ -5517,6 +5548,37 @@ export async function runAutomation(automation: {
       ok: false as const,
       error: creditBlock.summary,
       deliveryError: creditBlock.summary,
+    };
+  }
+
+  // ── Per-mission budget gate ────────────────────────────────────────────────
+  // The workspace could afford this run; the question here is whether the
+  // OPERATOR allowed this mission to cost this much. Refusing is free at this
+  // point — nothing recorded, held, or sent — which is what "pause and ask"
+  // means: the run blocks with both numbers named, and the operator decides
+  // between raising the budget and trimming the mission.
+  const perRunBudget = readPerRunCreditBudget(automation.credit_budget_per_run);
+  if (perRunBudget !== null && estimatedCredits > perRunBudget) {
+    const budgetBlock = buildCreditBudgetBlock({
+      automationName: automation.name,
+      estimatedCredits,
+      budgetCredits: perRunBudget,
+    });
+    recordCreditBudgetBlockedAutomationRun({
+      automationId: automation.id,
+      automationName: automation.name,
+      automationDescription: automation.description,
+      notify: automation.notify,
+      steps: automation.steps,
+      workspaceId,
+      workflowId,
+      block: budgetBlock,
+    });
+    console.warn(`[automation] ${automation.id} blocked before execution: ${budgetBlock.summary}`);
+    return {
+      ok: false as const,
+      error: budgetBlock.summary,
+      deliveryError: budgetBlock.summary,
     };
   }
 
@@ -5721,10 +5783,28 @@ export async function runAutomation(automation: {
       automation.condition ? `Condition note: ${automation.condition}` : null,
     ].filter(Boolean).join('\n\n');
     const summary = execution.summaryText || fallbackSummary;
+    // Computed before classification so the review gate can carry the
+    // budget-overrun fact: the estimate fit under the mission's budget, but
+    // spend is billed on actual tokens, and a crossing must be said plainly
+    // rather than left for the ledger to reveal.
+    const actualCredits = estimateSuccessfulAutomationCredits(execution.stepExecutions);
+    const budgetOverrunWarnings =
+      perRunBudget !== null && actualCredits > perRunBudget
+        ? [{
+            stepId: 'credit_budget',
+            title: 'Credit budget',
+            message: buildCreditBudgetOverrunWarning({
+              automationName: automation.name,
+              actualCredits,
+              budgetCredits: perRunBudget,
+            }),
+          }]
+        : [];
     const outcome = classifyAutomationRunOutcome({
       deliveryWaitingForReview,
       deliveryError: execution.deliveryError,
       stepExecutions: execution.stepExecutions,
+      extraWarnings: budgetOverrunWarnings,
     });
     // An approver decides from the review gate, so what the run could not finish
     // has to be on it before anything is persisted or announced.
@@ -5744,7 +5824,6 @@ export async function runAutomation(automation: {
     }
 
     const actualToolCalls = execution.stepExecutions.reduce((total, step) => total + Math.max(0, Math.trunc(step.toolCalls || 0)), 0);
-    const actualCredits = estimateSuccessfulAutomationCredits(execution.stepExecutions);
 
     finalizeTaskRun(taskRun.id, {
       status: outcome.runStatus,
@@ -8890,6 +8969,14 @@ app.patch('/api/automations/:id', async (req: Request, res: Response) => {
   if (req.body.status === 'active' || req.body.status === 'paused') {
     patch.status = req.body.status;
   }
+  // Per-mission credit budget: a positive integer sets it, null clears it,
+  // anything else is ignored rather than stored — the run gate reads this
+  // field fail-safe (no budget means no per-mission bound).
+  if (typeof req.body.creditBudgetPerRun === 'number') {
+    const budget = readPerRunCreditBudget(req.body.creditBudgetPerRun);
+    if (budget !== null) patch.credit_budget_per_run = budget;
+  }
+  if (req.body.creditBudgetPerRun === null) patch.credit_budget_per_run = undefined;
 
   try {
     const deliveryDraft = validateAutomationDeliveryDraft({

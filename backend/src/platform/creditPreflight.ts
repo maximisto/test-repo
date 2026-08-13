@@ -165,6 +165,99 @@ export function buildInsufficientCreditsBlock(input: {
   };
 }
 
+// ── Per-mission credit budget — the refusal pattern applied to spend ─────────
+//
+// The workspace-level affordability gate above answers "can this workspace
+// pay at all?". The per-mission budget answers a different question the
+// operator actually asked: "is this ONE mission allowed to cost this much per
+// run?" On 2026-08-11 a growing library pushed a mission's real cost to 228
+// credits against a 68-credit estimate, and the only way the operator found
+// out was the ledger. A mission with a budget now pauses BEFORE spending when
+// the estimate crosses it, and says so — the same honest-refusal shape as a
+// missing connection or missing business context.
+
+export const CREDIT_BUDGET_EXCEEDED_CODE = 'credit_budget_exceeded';
+
+/** Sanitize an operator-set per-run budget: a positive integer, or null for "no budget". */
+export function readPerRunCreditBudget(value: unknown): number | null {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null;
+  const truncated = Math.trunc(value);
+  return truncated > 0 ? truncated : null;
+}
+
+export interface CreditBudgetBlocker {
+  code: typeof CREDIT_BUDGET_EXCEEDED_CODE;
+  source: 'credits';
+  message: string;
+  can_continue: false;
+  nextAction: { label: string; route: string };
+}
+
+export interface CreditBudgetBlockDescriptor {
+  code: typeof CREDIT_BUDGET_EXCEEDED_CODE;
+  summary: string;
+  blockers: CreditBudgetBlocker[];
+  estimatedCredits: number;
+  budgetCredits: number;
+  blockedAt: string;
+}
+
+/**
+ * The pause-and-ask block for a run whose ESTIMATE crosses the mission's
+ * budget. Both numbers are named so the operator can decide between raising
+ * the budget and trimming the mission without opening the ledger — and it
+ * states that nothing was spent, because blocking before the first model
+ * call is the entire point.
+ */
+export function buildCreditBudgetBlock(input: {
+  automationName: string;
+  estimatedCredits: number;
+  budgetCredits: number;
+  now?: Date;
+}): CreditBudgetBlockDescriptor {
+  const summary = [
+    `"${input.automationName}" paused before running: its estimated cost crosses the per-run budget set for this mission.`,
+    `Estimated ${input.estimatedCredits} credits against a ${input.budgetCredits}-credit budget.`,
+    'Nothing was spent and nothing was sent.',
+    "Raise the mission's budget or trim its steps, then run it again.",
+  ].join(' ');
+
+  return {
+    code: CREDIT_BUDGET_EXCEEDED_CODE,
+    summary,
+    blockers: [
+      {
+        code: CREDIT_BUDGET_EXCEEDED_CODE,
+        source: 'credits',
+        message: summary,
+        can_continue: false,
+        nextAction: { label: 'Review mission budget', route: '/dashboard' },
+      },
+    ],
+    estimatedCredits: input.estimatedCredits,
+    budgetCredits: input.budgetCredits,
+    blockedAt: (input.now || new Date()).toISOString(),
+  };
+}
+
+/**
+ * The warning for a run whose ACTUAL cost crossed the budget the estimate
+ * fit under. Spend cannot be un-spent, so the honest move is to say it
+ * plainly on the run the operator reviews — silent burning is exactly what
+ * the budget exists to prevent.
+ */
+export function buildCreditBudgetOverrunWarning(input: {
+  automationName: string;
+  actualCredits: number;
+  budgetCredits: number;
+}): string {
+  return [
+    `This run cost ${input.actualCredits} credits — over the ${input.budgetCredits}-credit per-run budget set for "${input.automationName}".`,
+    'The work is kept and the cost is on the ledger.',
+    "If this keeps happening, raise the mission's budget or trim its steps.",
+  ].join(' ');
+}
+
 /**
  * The honest reason recorded on a run whose actual cost exceeded what the
  * workspace could pay at settle time.

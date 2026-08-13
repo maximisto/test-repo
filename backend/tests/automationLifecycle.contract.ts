@@ -311,6 +311,36 @@ test('classifyAutomationRunOutcome blocks failed delivery but preserves review g
   assert.match(String(failedDeliveryOutcome.reviewSummary), /Slack target/);
 });
 
+test('classifyAutomationRunOutcome carries run-level extra warnings onto every outcome', () => {
+  // The per-mission credit budget produces a RUN-level fact (the total
+  // crossed the budget) that no single step owns. It must ride the same
+  // runWarnings channel step warnings do, on success and review outcomes
+  // alike, so the approver sees it on the gate.
+  const overrun = {
+    stepId: 'credit_budget',
+    title: 'Credit budget',
+    message: 'This run cost 228 credits — over the 150-credit per-run budget.',
+  };
+
+  const reviewOutcome = classifyAutomationRunOutcome({
+    deliveryWaitingForReview: true,
+    stepExecutions: [
+      { kind: 'deliver', title: 'Deliver', status: 'succeeded', stepId: 'step_deliver' },
+    ],
+    extraWarnings: [overrun],
+  });
+  assert.deepEqual(reviewOutcome.runWarnings, [overrun]);
+  assert.match(String(reviewOutcome.reviewSummary), /228 credits/);
+
+  const cleanOutcome = classifyAutomationRunOutcome({
+    stepExecutions: [
+      { kind: 'summarize', title: 'Draft', status: 'succeeded', stepId: 'step_draft' },
+    ],
+    extraWarnings: [overrun],
+  });
+  assert.deepEqual(cleanOutcome.runWarnings, [overrun]);
+});
+
 test('classifyAutomationRunOutcome prioritizes failed steps over waiting review gates', () => {
   const outcome = classifyAutomationRunOutcome({
     deliveryWaitingForReview: true,

@@ -9,6 +9,13 @@ export interface CostEstimateInput {
   artifactCount?: number;
   complexity?: 'low' | 'medium' | 'high';
   durationSeconds?: number;
+  /**
+   * Model generations the planned run will make. Without this term the
+   * estimate carried no token cost at all, while the runtime charge is
+   * token-DOMINATED — a talk-day run estimated at 68 credits settled at 228,
+   * almost entirely token credits the estimate never mentioned.
+   */
+  modelCallCount?: number;
 }
 
 export interface CostEstimateBreakdown {
@@ -20,6 +27,7 @@ export interface CostEstimateBreakdown {
   artifactCredits: number;
   durationCredits: number;
   complexityCredits: number;
+  projectedTokenCredits: number;
 }
 
 export interface RuntimeCreditInput {
@@ -108,6 +116,41 @@ function roundUsd(value: number): number {
   return Math.round(value * 1_000_000) / 1_000_000;
 }
 
+/**
+ * Expected total tokens (prompt + completion) one automation model call
+ * moves, for pre-run estimation. Calibrated against the 2026-08-11 espresso
+ * runs: evidence blocks near the 24KB library ceiling plus scaled output
+ * budgets put a drafting call at roughly this size. Deliberately a round
+ * planning figure, not a promise — the runtime charge still bills actual
+ * tokens.
+ */
+export const EXPECTED_TOKENS_PER_MODEL_CALL = 4000;
+
+/**
+ * How many model generations a planned run will make, from its steps:
+ * each analyze/summarize step is one; a library write adds the baseline
+ * merge; a deliver step adds the memo tier only when a library write exists
+ * (the memo tier links to the persisted document, so it never runs without
+ * one). Kept here, next to the estimator that consumes it, so the count and
+ * the credit math cannot drift apart.
+ */
+export function countPlannedModelCalls(
+  steps: Array<{ kind?: string; inputs?: Record<string, unknown> } | null | undefined> | undefined | null,
+): number {
+  const list = (steps ?? []).filter(
+    (step): step is { kind?: string; inputs?: Record<string, unknown> } => Boolean(step),
+  );
+  const draftingCalls = list.filter((step) => step.kind === 'analyze' || step.kind === 'summarize').length;
+  const hasLibraryWrite = list.some((step) => {
+    if (step.kind !== 'query') return false;
+    const source = typeof step.inputs?.source === 'string' ? step.inputs.source.trim().toLowerCase() : '';
+    const queryType = typeof step.inputs?.query_type === 'string' ? step.inputs.query_type.trim().toLowerCase() : '';
+    return source === 'account_library' && queryType === 'write';
+  });
+  const hasDeliver = list.some((step) => step.kind === 'deliver');
+  return draftingCalls + (hasLibraryWrite ? 1 : 0) + (hasLibraryWrite && hasDeliver ? 1 : 0);
+}
+
 export function estimateCreditCost(input: CostEstimateInput): CostEstimate {
   const baseCredits = BASE_TASK_CREDITS[input.taskKind] || 0;
   const modelCredits = MODEL_TIER_CREDITS[input.modelTier] || 0;
@@ -118,6 +161,14 @@ export function estimateCreditCost(input: CostEstimateInput): CostEstimate {
   const durationCredits = Math.ceil(normalizeCount(input.durationSeconds) / 60) * DEFAULT_DURATION_CREDIT_COST_PER_MINUTE;
   const complexityCredits =
     input.complexity === 'high' ? 12 : input.complexity === 'medium' ? 5 : 0;
+  // The same per-1K rate the runtime charge bills, applied to the projected
+  // token volume — the term whose absence made estimates read 3× low.
+  const modelCallCount = normalizeCount(input.modelCallCount);
+  const projectedTokenCredits =
+    modelCallCount > 0
+      ? Math.ceil((modelCallCount * EXPECTED_TOKENS_PER_MODEL_CALL) / 1000) *
+        (MODEL_TIER_CREDITS_PER_1K_TOKENS[input.modelTier] || 0)
+      : 0;
 
   const estimatedCredits =
     baseCredits +
@@ -127,7 +178,8 @@ export function estimateCreditCost(input: CostEstimateInput): CostEstimate {
     reviewCredits +
     artifactCredits +
     durationCredits +
-    complexityCredits;
+    complexityCredits +
+    projectedTokenCredits;
 
   const rationale = [
     `base:${baseCredits}`,
@@ -138,6 +190,7 @@ export function estimateCreditCost(input: CostEstimateInput): CostEstimate {
     `artifacts:${artifactCredits}`,
     `duration:${durationCredits}`,
     `complexity:${complexityCredits}`,
+    `projected_tokens:${projectedTokenCredits}`,
   ];
 
   return {
@@ -151,6 +204,7 @@ export function estimateCreditCost(input: CostEstimateInput): CostEstimate {
       artifactCredits,
       durationCredits,
       complexityCredits,
+      projectedTokenCredits,
     },
     rationale,
   };

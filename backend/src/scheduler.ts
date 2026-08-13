@@ -62,6 +62,13 @@ export interface AutomationRecord {
   studio_state?: AutomationStudioState;
   notify?: string;
   condition?: string;
+  /**
+   * Operator-set ceiling on what one run of this mission may cost. A run
+   * whose ESTIMATE crosses it pauses and asks instead of spending; a run
+   * whose actual cost crosses it carries a named warning. Absent means no
+   * per-mission bound — the workspace-level affordability gate still applies.
+   */
+  credit_budget_per_run?: number;
   status: 'active' | 'paused';
   last_run_at?: string;
   last_run_status?: 'succeeded' | 'failed';
@@ -881,11 +888,12 @@ export function loadPersistedAutomations(
  *   version, workflowId, name, description, authoring_mode, workflow_prompt,
  *   actions, steps, execution_policy
  *
- * OPERATOR-OWNED — when it runs, where it delivers, and whose it is. Never
- * overwritten by a seed, because the console is the authority on these and a
- * silent revert is indistinguishable from a bug:
+ * OPERATOR-OWNED — when it runs, where it delivers, whose it is, and what it
+ * may spend. Never overwritten by a seed, because the console is the
+ * authority on these and a silent revert is indistinguishable from a bug:
  *   status, schedule, cron_expression, timezone, notify, condition,
- *   workspaceId, owner_user_id, studio_state, created_at, and the run history
+ *   credit_budget_per_run, workspaceId, owner_user_id, studio_state,
+ *   created_at, and the run history
  *   (last_run_at, last_run_status, consecutive_failures, next_run_at)
  *
  * Consequence worth stating plainly: a seed can no longer change the cadence or
@@ -919,6 +927,7 @@ function mergeSeedIntoStoredAutomation(
     timezone: stored.timezone,
     notify: stored.notify,
     condition: stored.condition,
+    credit_budget_per_run: stored.credit_budget_per_run,
     studio_state: stored.studio_state,
     created_at: stored.created_at,
     last_run_at: stored.last_run_at,

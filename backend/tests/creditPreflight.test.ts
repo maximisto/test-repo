@@ -297,6 +297,59 @@ test('a blocked-for-credits run costs zero: no hold is taken and the balance is 
   );
 });
 
+test('the per-run budget sanitizer accepts only positive integers', async () => {
+  assertSandboxed();
+  const { readPerRunCreditBudget } = await import('../src/platform/creditPreflight');
+
+  assert.equal(readPerRunCreditBudget(150), 150);
+  assert.equal(readPerRunCreditBudget(150.9), 150);
+  assert.equal(readPerRunCreditBudget(0), null);
+  assert.equal(readPerRunCreditBudget(-20), null);
+  assert.equal(readPerRunCreditBudget(Number.NaN), null);
+  assert.equal(readPerRunCreditBudget('150'), null);
+  assert.equal(readPerRunCreditBudget(undefined), null);
+  assert.equal(readPerRunCreditBudget(null), null);
+});
+
+test('the budget block pauses with both numbers and spends nothing by construction', async () => {
+  assertSandboxed();
+  const { buildCreditBudgetBlock, CREDIT_BUDGET_EXCEEDED_CODE } = await import('../src/platform/creditPreflight');
+
+  const block = buildCreditBudgetBlock({
+    automationName: 'Competitor monitor',
+    estimatedCredits: 228,
+    budgetCredits: 150,
+    now: new Date('2026-08-13T09:00:00.000Z'),
+  });
+
+  assert.equal(block.code, CREDIT_BUDGET_EXCEEDED_CODE);
+  assert.match(block.summary, /paused before running/);
+  assert.match(block.summary, /Estimated 228 credits against a 150-credit budget/);
+  assert.match(block.summary, /Nothing was spent and nothing was sent/);
+  assert.equal(block.blockers.length, 1);
+  assert.equal(block.blockers[0].code, CREDIT_BUDGET_EXCEEDED_CODE);
+  assert.equal(block.blockers[0].can_continue, false);
+  assert.ok(block.blockers[0].nextAction.route, 'the pause must point somewhere actionable');
+  assert.equal(block.estimatedCredits, 228);
+  assert.equal(block.budgetCredits, 150);
+  assert.equal(block.blockedAt, '2026-08-13T09:00:00.000Z');
+});
+
+test('the budget overrun warning names both numbers and keeps the work', async () => {
+  assertSandboxed();
+  const { buildCreditBudgetOverrunWarning } = await import('../src/platform/creditPreflight');
+
+  const warning = buildCreditBudgetOverrunWarning({
+    automationName: 'Competitor monitor',
+    actualCredits: 228,
+    budgetCredits: 150,
+  });
+
+  assert.match(warning, /228 credits/);
+  assert.match(warning, /150-credit per-run budget/);
+  assert.match(warning, /kept/);
+});
+
 test('the overrun reason keeps the run readable rather than blaming the customer', async () => {
   assertSandboxed();
   const { buildCreditOverrunReason } = await import('../src/platform/creditPreflight');

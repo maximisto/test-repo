@@ -587,8 +587,18 @@ export function classifyAutomationRunOutcome(input: {
   deliveryWaitingForReview?: boolean;
   deliveryError?: string | null;
   stepExecutions: ClassifiableStep[];
+  /**
+   * Run-level facts that belong on the review gate but were not produced by
+   * any single step — e.g. the per-mission credit budget being crossed by
+   * the run's total. Carried on every outcome the same way step warnings
+   * are.
+   */
+  extraWarnings?: AutomationRunWarning[];
 }): AutomationRunOutcome {
-  const runWarnings = collectAutomationRunWarnings(input.stepExecutions);
+  const runWarnings = [
+    ...collectAutomationRunWarnings(input.stepExecutions),
+    ...(input.extraWarnings ?? []),
+  ];
   const warningDetail = runWarnings.length > 0 ? ` Not everything completed: ${describeRunWarnings(runWarnings)}` : '';
 
   // Evidence integrity first. A critical failure means the output's truth is in
