@@ -60,9 +60,28 @@ class RetryableModelStatusError extends Error {
 class ModelRequestError extends Error {
   status: number;
 
-  constructor(provider: Provider, response: Response, message: string) {
-    super(`${provider} request failed: ${message || response.statusText}`);
-    this.status = response.status;
+  constructor(route: { provider: Provider; model: string }, status: number, message: string) {
+    super(`${route.provider}/${route.model} request failed (${status}): ${message}`);
+    this.status = status;
+  }
+}
+
+/**
+ * The connection died while the response body was still streaming — the
+ * 8:51 AM talk-morning failure shape. `response.json()` used to throw a bare
+ * SyntaxError here, outside the retry wrapper, with no provider or model
+ * named anywhere. Explicitly retryable: a mid-body death is as transient as
+ * a mid-connect one.
+ */
+class ModelResponseReadError extends Error {
+  retryable = true;
+
+  constructor(route: { provider: Provider; model: string }, cause: unknown) {
+    super(
+      `${route.provider}/${route.model} response could not be read: the connection died before the reply finished (${
+        cause instanceof Error ? cause.message : String(cause)
+      }).`,
+    );
   }
 }
 
@@ -115,6 +134,7 @@ function getErrorStatus(error: unknown) {
 }
 
 export function isRetryableModelError(error: unknown, depth = 0): boolean {
+  if ((error as { retryable?: unknown })?.retryable === true) return true;
   const status = getErrorStatus(error);
   if (status === 429 || (typeof status === 'number' && status >= 500)) return true;
 
@@ -629,36 +649,71 @@ async function generateWithOpenAI(route: ModelRoute, system: string, messages: M
     requestBody.reasoning_effort = route.reasoningEffort;
   }
 
-  const response = await fetchModelResponseWithRetry('OpenAI text generation', `${route.baseUrl}/chat/completions`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(requestBody),
+  // The whole exchange — fetch, body read, and envelope checks — sits inside
+  // ONE retry wrapper. The body read used to happen after the retry wrapper
+  // had already returned, so a connection dying mid-body threw a bare
+  // SyntaxError with no retry, no provider, and no model attached: the
+  // 8:51 AM talk-morning step death.
+  return withModelRetry('OpenAI text generation', async () => {
+    const response = await fetch(`${route.baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(requestBody),
+    });
+    if (response.status === 429 || response.status >= 500) {
+      throw new RetryableModelStatusError(response);
+    }
+
+    let data: {
+      error?: { message?: string; code?: number };
+      choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
+      usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+    };
+    try {
+      data = await response.json() as typeof data;
+    } catch (error) {
+      throw new ModelResponseReadError(route, error);
+    }
+
+    if (!response.ok) {
+      throw new ModelRequestError(route, response.status, data.error?.message || response.statusText);
+    }
+
+    // OpenRouter wraps upstream provider failures in an HTTP 200 with an
+    // `error` body. Falling through here returned `text: ''`, which callers
+    // then misreported as an empty or truncated generation. The upstream
+    // status code (when present) drives retry/fallback classification the
+    // same way a real HTTP status would; an unlabeled failure counts as a
+    // 502 so it stays transient.
+    if (data.error?.message) {
+      const upstreamStatus = typeof data.error.code === 'number' ? data.error.code : 502;
+      throw new ModelRequestError(route, upstreamStatus, data.error.message);
+    }
+
+    const choice = data.choices?.[0];
+    if (choice?.finish_reason === 'error') {
+      throw new ModelRequestError(
+        route,
+        502,
+        `the provider reported an error finish${choice.message?.content?.trim() ? '' : ' with no content'}.`,
+      );
+    }
+
+    return {
+      text: choice?.message?.content?.trim() || '',
+      stopReason: choice?.finish_reason,
+      usage: data.usage
+        ? {
+            inputTokens: data.usage.prompt_tokens,
+            outputTokens: data.usage.completion_tokens,
+            totalTokens: data.usage.total_tokens,
+            provider: route.provider,
+            model: route.model,
+            baseUrl: route.baseUrl,
+          }
+        : undefined,
+    };
   });
-
-  const data = await response.json() as {
-    error?: { message?: string };
-    choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
-    usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
-  };
-
-  if (!response.ok) {
-    throw new ModelRequestError(route.provider, response, data.error?.message || response.statusText);
-  }
-
-  return {
-    text: data.choices?.[0]?.message?.content?.trim() || '',
-    stopReason: data.choices?.[0]?.finish_reason,
-    usage: data.usage
-      ? {
-          inputTokens: data.usage.prompt_tokens,
-          outputTokens: data.usage.completion_tokens,
-          totalTokens: data.usage.total_tokens,
-          provider: route.provider,
-          model: route.model,
-          baseUrl: route.baseUrl,
-        }
-      : undefined,
-  };
 }
 
 async function generateWithAnthropicRoute(route: ModelRoute, system: string, messages: MessageParam[], maxTokens: number, workspaceId?: string): Promise<TextGenerationResult> {
