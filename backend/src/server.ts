@@ -127,8 +127,8 @@ import {
 } from './platform/automationLifecycle';
 import { resolveAutomationStepSeverity } from './platform/stepSeverity';
 import {
-  AUTOMATION_SUMMARY_MAX_TOKENS,
   AUTOMATION_SUMMARY_WORD_LIMIT,
+  automationSummaryTokenBudget,
   requireCompleteAutomationSummary,
 } from './platform/automationSummaryPolicy';
 import { extractToolArtifactsFromResult, type StoredToolArtifact } from './platform/toolArtifacts';
@@ -4757,13 +4757,18 @@ async function executeAutomationCore(
       }
 
       if (step.kind === 'summarize') {
+        // The output budget scales with the evidence handed to the model —
+        // a growing library kept pushing table-heavy drafts past the old
+        // fixed cap (two refused runs on 2026-08-11). The truncation guard
+        // below still refuses anything that hits the scaled ceiling.
+        const summaryUserContent = `${step.objective}${buildReviewFeedbackBlock(automation.reviewFeedback)}\n\n${buildAutomationEvidenceBlock(automation, artifacts, stepExecutions, stepErrors)}`;
         const summaryResult = await runAutomationStepWithTimeout(
           `Summary step "${step.title}"`,
           generateTextDetailed(
           step.modelTier || plan.suggestedModelTier,
           AUTOMATION_SUMMARIZE_SYSTEM_PROMPT,
-          [{ role: 'user', content: `${step.objective}${buildReviewFeedbackBlock(automation.reviewFeedback)}\n\n${buildAutomationEvidenceBlock(automation, artifacts, stepExecutions, stepErrors)}` }],
-          AUTOMATION_SUMMARY_MAX_TOKENS,
+          [{ role: 'user', content: summaryUserContent }],
+          automationSummaryTokenBudget(summaryUserContent.length),
           workspaceId,
           ),
         );
