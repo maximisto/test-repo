@@ -7548,7 +7548,19 @@ app.get('/api/workspace/library/folder-drop', async (req: Request, res: Response
     res.json({ laneState: 'not_configured', readerEmail: null, rootFolderId: null });
     return;
   }
-  const rootFolderId = await findLibraryRootFolderId(workspaceId);
+  const rootLookup = await findLibraryRootFolderId(workspaceId);
+  if (!rootLookup.ok) {
+    // A failed lookup is OUR incident, not the operator's onboarding state —
+    // answering `no_library_yet` here would hide an outage behind "run your
+    // first mission" copy. The settings card renders any non-200 as an
+    // honest "could not load" notice.
+    res.status(502).json({
+      error: 'Your folder-drop status could not be checked right now.',
+      code: 'folder_drop_lookup_failed',
+    });
+    return;
+  }
+  const rootFolderId = rootLookup.folderId;
   const laneState = await getFolderDropLaneState(rootFolderId);
   res.json({ laneState, readerEmail, rootFolderId });
 });
@@ -7560,7 +7572,15 @@ app.post('/api/workspace/library/folder-drop/verify', async (req: Request, res: 
     return;
   }
   const { workspaceId } = resolveWorkspaceContext(req);
-  const rootFolderId = await findLibraryRootFolderId(workspaceId);
+  const rootLookup = await findLibraryRootFolderId(workspaceId);
+  if (!rootLookup.ok) {
+    res.status(502).json({
+      error: 'Your folder-drop status could not be checked right now.',
+      code: 'folder_drop_lookup_failed',
+    });
+    return;
+  }
+  const rootFolderId = rootLookup.folderId;
   const laneState = await getFolderDropLaneState(rootFolderId);
   stampFolderDropEnabledOnFirstActivation({
     workspaceId,
@@ -7578,7 +7598,15 @@ app.post('/api/workspace/library/folder-drop/share', async (req: Request, res: R
     return;
   }
   const { workspaceId } = resolveWorkspaceContext(req);
-  const rootFolderId = await findLibraryRootFolderId(workspaceId);
+  const rootLookup = await findLibraryRootFolderId(workspaceId);
+  if (!rootLookup.ok) {
+    res.status(502).json({
+      error: 'Your folder-drop status could not be checked right now.',
+      code: 'folder_drop_lookup_failed',
+    });
+    return;
+  }
+  const rootFolderId = rootLookup.folderId;
   const readerEmail = getFolderDropReaderEmail();
 
   // Nothing to share to (lane unconfigured) or nowhere to share (the

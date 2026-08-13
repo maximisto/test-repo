@@ -429,25 +429,44 @@ async function createFolder(
   return { ok: true, folderId };
 }
 
+export type FindLibraryRootFolderResult =
+  | { ok: true; folderId: string | null }
+  | { ok: false; failure: LibraryFailure };
+
 /**
  * Read-only lookup of the workspace's `Violema Library` root folder id, for
  * callers (the folder-drop lane API) that only need the id — not a full
  * library read.
  *
- * Folds a lookup FAILURE into `null`, same as "the folder does not exist
- * yet": the folder-drop lane already treats a missing root folder as
- * `not_configured` (see `librarySweep.getFolderDropLaneState`), so a
- * transient Composio hiccup here should degrade the same way rather than
- * throwing out of an HTTP handler.
+ * The result is discriminated because "the folder does not exist" and "the
+ * lookup could not run" are different facts with different owners. Only a
+ * WORKING lookup that comes back empty may report confirmed absence
+ * (`ok: true, folderId: null` → the lane reads as `no_library_yet`). A
+ * failed lookup used to fold into the same `null`, which dressed a platform
+ * outage in onboarding copy — HTTP 200 "run your first mission" while
+ * Composio was down.
+ *
+ * One deliberate exception keeps absence honest rather than alarmist: a
+ * workspace with no usable Drive lane at all (`integration_not_ready` /
+ * `integration_not_connected` — no connected account, or the Composio
+ * bridge itself is off) cannot have an app-created library, so that case IS
+ * confirmed absence, not an outage.
  */
 export async function findLibraryRootFolderId(
   workspaceId: string,
   deps: AccountLibraryDeps = {},
-): Promise<string | null> {
-  if (!workspaceId.trim()) return null;
+): Promise<FindLibraryRootFolderResult> {
+  if (!workspaceId.trim()) return { ok: true, folderId: null };
   const execute = deps.execute ?? executeComposioAction;
   const result = await findFolderByName(execute, workspaceId, LIBRARY_ROOT_FOLDER_NAME);
-  return result.ok ? result.folderId : null;
+  if (result.ok) return { ok: true, folderId: result.folderId };
+  if (
+    result.failure.code === 'integration_not_ready' ||
+    result.failure.code === 'integration_not_connected'
+  ) {
+    return { ok: true, folderId: null };
+  }
+  return { ok: false, failure: result.failure };
 }
 
 async function findOrCreateFolder(

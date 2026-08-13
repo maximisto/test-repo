@@ -12,6 +12,7 @@ import {
   appendLibraryEntry,
   buildLibraryEntryFileName,
   ensureLibraryFolder,
+  findLibraryRootFolderId,
   isLibraryFailure,
   readLibrary,
   renderLibraryContextMarkdown,
@@ -556,4 +557,57 @@ test('a mission naming both google_drive and account_library reports one blocker
     [ACCOUNT_LIBRARY_BACKING_SOURCE],
     'One connection to fix must read as one blocker.',
   );
+});
+
+// --- findLibraryRootFolderId: confirmed absence vs failed lookup ---------------
+
+test('findLibraryRootFolderId reports a found folder and a confirmed absence distinctly from failure', async () => {
+  const found = createDriveFake({ folders: [{ id: 'root-1', name: LIBRARY_ROOT_FOLDER_NAME }] });
+  assert.deepEqual(await findLibraryRootFolderId('ws_test', { execute: found.execute }), {
+    ok: true,
+    folderId: 'root-1',
+  });
+
+  // An empty listing from a WORKING lookup is the only thing allowed to mean
+  // "the folder does not exist yet."
+  const absent = createDriveFake();
+  assert.deepEqual(await findLibraryRootFolderId('ws_test', { execute: absent.execute }), {
+    ok: true,
+    folderId: null,
+  });
+});
+
+test('a Composio outage on the root lookup reports lookup failure, never a fresh workspace', async () => {
+  // Sol's [medium] finding: every failed lookup used to fold to null, so a
+  // platform outage rendered as no_library_yet — onboarding copy hiding an
+  // incident. A failure that is not "this workspace has no Drive lane" must
+  // surface as a failure.
+  const execute: PartnerComposioExecutor = async () => {
+    throw new Error('upstream unavailable');
+  };
+  const result = await findLibraryRootFolderId('ws_test', { execute });
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.equal(result.failure.code, 'integration_query_failed');
+});
+
+test('a workspace with no Drive connection still reads as confirmed absence, not an outage', async () => {
+  // No connected account means no app-created library can exist — that is a
+  // genuine "no library yet", and the settings card should keep saying so.
+  const noConnection: PartnerComposioExecutor = async () => {
+    throw new Error('connected account not found for entity');
+  };
+  assert.deepEqual(await findLibraryRootFolderId('ws_test', { execute: noConnection }), {
+    ok: true,
+    folderId: null,
+  });
+
+  // Same for a server whose Composio bridge is off entirely (dev/test).
+  const bridgeOff: PartnerComposioExecutor = async () => {
+    throw new Error('Composio is not configured. Set COMPOSIO_API_KEY to enable.');
+  };
+  assert.deepEqual(await findLibraryRootFolderId('ws_test', { execute: bridgeOff }), {
+    ok: true,
+    folderId: null,
+  });
 });

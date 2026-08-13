@@ -39,6 +39,7 @@ function closeServer(server: http.Server | null) {
 // itself uses is the same one these helpers read/write through.
 let adminAccessStoreModule: typeof import('../src/adminAccessStore') | null = null;
 let librarySweepModule: typeof import('../src/integrationGateway/librarySweep') | null = null;
+let accountLibraryModule: typeof import('../src/integrationGateway/accountLibrary') | null = null;
 
 /** Scoped to this endpoint's action, so assertions never depend on event ordering. */
 function readFolderDropShareAuditEvents() {
@@ -105,8 +106,10 @@ async function withApiServer(
     const betaProgram = await import('../src/betaProgram');
     const adminAccessStore = await import('../src/adminAccessStore');
     const librarySweep = await import('../src/integrationGateway/librarySweep');
+    const accountLibrary = await import('../src/integrationGateway/accountLibrary');
     adminAccessStoreModule = adminAccessStore;
     librarySweepModule = librarySweep;
+    accountLibraryModule = accountLibrary;
     const acceptedAt = '2026-07-11T12:01:00.000Z';
 
     consent.recordBetaConsent({
@@ -159,6 +162,7 @@ async function withApiServer(
     librarySweepModule?.setLibrarySweepOverridesForTests(null);
     adminAccessStoreModule = null;
     librarySweepModule = null;
+    accountLibraryModule = null;
     process.chdir(originalCwd);
     if (typeof originalApproved === 'string') process.env.VIOLEMA_APPROVED_EMAILS = originalApproved;
     else delete process.env.VIOLEMA_APPROVED_EMAILS;
@@ -345,5 +349,44 @@ test('concurrent verify + share requests racing the first activation audit exact
     const events = readFolderDropShareAuditEvents();
     assert.equal(events.length, 1, 'exactly one enablement event across concurrent verify+share calls.');
     assert.equal(events[0].workspaceId, workspaceId);
+  });
+});
+
+test('a failed root-folder lookup surfaces as a platform failure, never as onboarding copy', async (t) => {
+  // Sol's [medium] finding, route level: a Composio outage during the root
+  // lookup used to fold to null and answer HTTP 200 `no_library_yet` —
+  // directing operators to run a mission while the platform was down. All
+  // three routes must refuse with a 502 and a distinct code instead, and
+  // nothing may audit an enablement.
+  const readerKeyEnvValue = buildTestReaderKeyEnvValue('reader@test.iam');
+
+  await withApiServer({ readerKeyEnvValue }, async ({ baseUrl, sessionToken }) => {
+    if (!accountLibraryModule) throw new Error('accountLibrary module not loaded yet.');
+    t.mock.method(accountLibraryModule, 'findLibraryRootFolderId', async () => ({
+      ok: false as const,
+      failure: accountLibraryModule!.buildLibraryAccessFailure('integration_query_failed'),
+    }));
+
+    const status = await fetch(`${baseUrl}/api/workspace/library/folder-drop`, {
+      headers: authHeaders(sessionToken),
+    });
+    assert.equal(status.status, 502);
+    const statusBody = await status.json() as Record<string, unknown>;
+    assert.equal(statusBody.code, 'folder_drop_lookup_failed');
+    assert.equal(statusBody.laneState, undefined, 'a failed lookup must not invent a lane state');
+
+    const verify = await fetch(`${baseUrl}/api/workspace/library/folder-drop/verify`, {
+      method: 'POST',
+      headers: authHeaders(sessionToken),
+    });
+    assert.equal(verify.status, 502);
+
+    const share = await fetch(`${baseUrl}/api/workspace/library/folder-drop/share`, {
+      method: 'POST',
+      headers: authHeaders(sessionToken),
+    });
+    assert.equal(share.status, 502);
+
+    assert.equal(readFolderDropShareAuditEvents().length, 0, 'a failed lookup must never audit an enablement.');
   });
 });
