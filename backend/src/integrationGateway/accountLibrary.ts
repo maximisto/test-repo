@@ -148,6 +148,22 @@ export const MAX_TOTAL_CONTENT_BYTES = 24_000;
 /** Upper bound on a single appended entry, well under Drive's 10MB text limit. */
 export const MAX_ENTRY_MARKDOWN_BYTES = 200_000;
 
+/**
+ * Title prefix of the rolling current-state baseline entries the compaction
+ * lane (`libraryBaseline.ts`) maintains. One compact digest of everything the
+ * section knows, refreshed after each run that records findings — so a
+ * mission's prompt context can be "the baseline plus what is newer than it"
+ * instead of an ever-growing stack of full historical memos. That stack is
+ * what burned credits and pushed drafts past the summary cap on 2026-08-11:
+ * every run re-paid the input tokens for N full prior memos and produced a
+ * longer memo because it saw them.
+ */
+export const LIBRARY_BASELINE_TITLE_PREFIX = 'Current state (rolling baseline)';
+
+export function isLibraryBaselineFileName(fileName: string): boolean {
+  return fileName.includes(LIBRARY_BASELINE_TITLE_PREFIX);
+}
+
 const DOWNLOAD_TIMEOUT_MS = 10_000;
 
 /** Bounded text fetch for a presigned download URL. */
@@ -331,6 +347,21 @@ async function runDriveAction(
 /** Drive query strings are single-quoted, so quotes and backslashes must escape. */
 function escapeDriveQueryValue(value: string): string {
   return value.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}
+
+/**
+ * Keep the newest-first file list down to "newer than the baseline, plus the
+ * baseline itself". Older baselines in the tail are dropped with the rest —
+ * each baseline supersedes every entry older than it, including its own
+ * predecessors.
+ */
+function compactFileListAroundBaseline(files: Record<string, unknown>[]): Record<string, unknown>[] {
+  const baselineIndex = files.findIndex((file) => {
+    const name = asString(file.name);
+    return Boolean(name && isLibraryBaselineFileName(name));
+  });
+  if (baselineIndex === -1) return files;
+  return files.slice(0, baselineIndex + 1);
 }
 
 function readDriveFiles(payload: unknown): Record<string, unknown>[] {
@@ -784,7 +815,7 @@ export const FOLDER_DROP_NEEDS_SHARE_WARNING =
 export async function readLibrary(
   workspaceId: string,
   section: string,
-  options: { limit?: number } = {},
+  options: { limit?: number; includeOperatorFiles?: boolean } = {},
   deps: AccountLibraryDeps = {},
 ): Promise<IntegrationQuerySuccess<AccountLibrarySnapshot> | LibraryFailure> {
   const normalizedSection = normalizeSection(section);
@@ -796,6 +827,10 @@ export async function readLibrary(
   const now = deps.now ? deps.now() : new Date();
   const startedAt = Date.now();
   const limit = clampReadLimit(options.limit);
+  // App-entries-only mode for internal lanes (the baseline merge) that reason
+  // over Violema's own written entries and have no business paying for a
+  // folder-drop sweep. The default — every mission read — keeps the sweep.
+  const includeOperatorFiles = options.includeOperatorFiles !== false;
 
   const root = await findFolderByName(execute, workspaceId, LIBRARY_ROOT_FOLDER_NAME);
   if (!root.ok) return root.failure;
@@ -808,46 +843,49 @@ export async function readLibrary(
   // capped to half the total content budget, so a heavy drop can never crowd
   // out every app-written entry.
   const rootFolderId = root.folderId;
-  const probedLaneState = await getFolderDropLaneState(rootFolderId);
-  // The probe above and the sweep below each run their own access check —
-  // two separate Drive calls, so access can be revoked (or a platform
-  // failure can begin) between them. When both ran, the sweep's verdict is
-  // the LATER fact and the one the returned entries were actually gated by,
-  // so it is authoritative: reporting the probe's stale 'active' alongside
-  // an empty degraded sweep would be silent evidence omission.
-  let laneState = probedLaneState;
   const sweepWarnings: string[] = [];
   let operatorEntries: AccountLibraryEntry[] = [];
-  if (probedLaneState === 'active' && rootFolderId) {
-    let sweepResult: LibrarySweepResult;
-    try {
-      sweepResult = await sweepOperatorFiles(
-        { workspaceId, rootFolderId, budgetBytes: Math.floor(MAX_TOTAL_CONTENT_BYTES / 2) },
-        { execute },
-      );
-    } catch (error) {
-      if (!(error instanceof LibrarySweepError)) throw error;
-      return libraryFailure('integration_query_failed', 'Folder-drop listing could not complete.');
-    }
-    laneState = sweepResult.laneState;
-    sweepWarnings.push(...sweepResult.warnings);
-    if (sweepResult.laneState === 'needs_share') {
+  let sweep: { laneState: FolderDropLaneState; warnings: string[] } | undefined;
+  if (includeOperatorFiles) {
+    const probedLaneState = await getFolderDropLaneState(rootFolderId);
+    // The probe above and the sweep below each run their own access check —
+    // two separate Drive calls, so access can be revoked (or a platform
+    // failure can begin) between them. When both ran, the sweep's verdict is
+    // the LATER fact and the one the returned entries were actually gated by,
+    // so it is authoritative: reporting the probe's stale 'active' alongside
+    // an empty degraded sweep would be silent evidence omission.
+    let laneState = probedLaneState;
+    if (probedLaneState === 'active' && rootFolderId) {
+      let sweepResult: LibrarySweepResult;
+      try {
+        sweepResult = await sweepOperatorFiles(
+          { workspaceId, rootFolderId, budgetBytes: Math.floor(MAX_TOTAL_CONTENT_BYTES / 2) },
+          { execute },
+        );
+      } catch (error) {
+        if (!(error instanceof LibrarySweepError)) throw error;
+        return libraryFailure('integration_query_failed', 'Folder-drop listing could not complete.');
+      }
+      laneState = sweepResult.laneState;
+      sweepWarnings.push(...sweepResult.warnings);
+      if (sweepResult.laneState === 'needs_share') {
+        sweepWarnings.push(FOLDER_DROP_NEEDS_SHARE_WARNING);
+      }
+      operatorEntries = sweepResult.entries.map((entry) => ({
+        fileId: entry.fileId,
+        fileName: entry.fileName,
+        modifiedTime: entry.modifiedTime,
+        webViewLink: entry.webViewLink,
+        content: entry.content,
+        truncated: entry.truncated,
+        origin: 'operator_file' as const,
+        ...(entry.contentError ? { contentError: entry.contentError } : {}),
+      }));
+    } else if (probedLaneState === 'needs_share') {
       sweepWarnings.push(FOLDER_DROP_NEEDS_SHARE_WARNING);
     }
-    operatorEntries = sweepResult.entries.map((entry) => ({
-      fileId: entry.fileId,
-      fileName: entry.fileName,
-      modifiedTime: entry.modifiedTime,
-      webViewLink: entry.webViewLink,
-      content: entry.content,
-      truncated: entry.truncated,
-      origin: 'operator_file' as const,
-      ...(entry.contentError ? { contentError: entry.contentError } : {}),
-    }));
-  } else if (probedLaneState === 'needs_share') {
-    sweepWarnings.push(FOLDER_DROP_NEEDS_SHARE_WARNING);
+    sweep = { laneState, warnings: sweepWarnings };
   }
-  const sweep = { laneState, warnings: sweepWarnings };
   const operatorBytesUsed = operatorEntries.reduce(
     (total, entry) => total + (entry.content ? Buffer.byteLength(entry.content, 'utf8') : 0),
     0,
@@ -890,7 +928,13 @@ export async function readLibrary(
   });
   if (!listing.ok) return listing.failure;
 
-  const files = readDriveFiles(listing.data).slice(0, limit);
+  // Compaction: everything older than the newest rolling baseline is already
+  // folded INTO that baseline, so reading it again would re-pay its bytes in
+  // every prompt for information the baseline already carries. Applied to
+  // the newest-first listing BEFORE any content download, so the dropped
+  // tail costs neither content budget nor tokens. A section with no baseline
+  // reads exactly as before.
+  const files = compactFileListAroundBaseline(readDriveFiles(listing.data)).slice(0, limit);
   const appEntries: AccountLibraryEntry[] = [];
   // App entries fill whatever budget the operator sweep above left behind, so
   // the two origins share one ceiling instead of each getting a full one.
@@ -1094,7 +1138,12 @@ export function renderLibraryContextMarkdown(snapshot: AccountLibrarySnapshot): 
 
   const rendered = snapshot.entries
     .map((item) => {
-      const heading = `### ${item.entryDate || item.fileName}`;
+      // The baseline is compacted state, not one more dated memo — the model
+      // should read it as "what is already known", and the dated entries
+      // above it as what is newer than that knowledge.
+      const heading = isLibraryBaselineFileName(item.fileName)
+        ? `### Rolling current-state baseline (as of ${item.entryDate || item.fileName})`
+        : `### ${item.entryDate || item.fileName}`;
       const content = item.content?.trim()
         ? item.content.trim()
         : `_(content unavailable: ${item.contentError || 'unreadable'})_`;

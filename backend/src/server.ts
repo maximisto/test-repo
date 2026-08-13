@@ -319,6 +319,7 @@ import {
   readAccountLibrarySection,
   summarizeLibrarySection,
 } from './integrationGateway/accountLibrary';
+import { updateLibraryBaseline } from './integrationGateway/libraryBaseline';
 import {
   getFolderDropLaneState,
   getFolderDropReaderEmail,
@@ -4580,6 +4581,39 @@ async function executeAutomationCore(
             : `Account library already held today's ${libraryResult.section} entry.`,
           metadata: { source: ACCOUNT_LIBRARY_BACKING_SOURCE, ...libraryOutput },
         });
+
+        // Compaction lane: fold what this run just recorded into the rolling
+        // current-state baseline on the cheap model, so the next run's prompt
+        // carries compact state instead of an ever-growing stack of full
+        // memos (the 2026-08-11 credit-burn spiral). Auxiliary by design — a
+        // failed refresh is a named warning, never a failed run — and only a
+        // NEWLY created entry triggers it: an idempotent same-day rerun
+        // recorded nothing new, so there is nothing to fold in.
+        if (libraryResult.created) {
+          try {
+            const baselineResult = await runAutomationStepWithTimeout(
+              `Baseline refresh for "${libraryResult.section}"`,
+              updateLibraryBaseline({
+                workspaceId,
+                section: libraryResult.section,
+                latestFindingsMarkdown: summaryText,
+                untrustedRule: UNTRUSTED_EVIDENCE_PROMPT_RULE,
+                neutralize: neutralizeUntrustedDelimiters,
+              }),
+            );
+            if (!baselineResult.ok) {
+              stepExecution.warnings = [
+                ...(stepExecution.warnings ?? []),
+                `The rolling baseline was not refreshed this run: ${baselineResult.message}`,
+              ];
+            }
+          } catch (error) {
+            stepExecution.warnings = [
+              ...(stepExecution.warnings ?? []),
+              `The rolling baseline was not refreshed this run: ${error instanceof Error ? error.message : 'unknown error'}`,
+            ];
+          }
+        }
         continue;
       }
 
