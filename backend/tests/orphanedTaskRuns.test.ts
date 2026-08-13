@@ -38,7 +38,20 @@ test('sweepOrphanedTaskRuns fails runs stranded in running/retrying from before 
     const byId = new Map(runs.map((run) => [run.id, run]));
     assert.equal(byId.get(orphanRunning.id)?.status, 'failed');
     assert.ok(byId.get(orphanRunning.id)?.finishedAt, 'Swept run must carry finishedAt.');
-    assert.match(String(byId.get(orphanRunning.id)?.error), /restart/i);
+    // Facts, never a canned diagnosis: the sweep knows the run never
+    // finished, not WHY it died. The old message blamed "a backend restart"
+    // for every stranded run — the stale 512MB-PM2-cap-era explanation —
+    // which also covered for runs a swallowed error abandoned mid-uptime.
+    assert.match(String(byId.get(orphanRunning.id)?.error), /never finished/i);
+    assert.doesNotMatch(String(byId.get(orphanRunning.id)?.error), /restart|memory|pm2/i, 'No asserted cause.');
+    assert.match(String(byId.get(orphanRunning.id)?.error), /cause was not recorded/i, 'The unknown is named.');
+    assert.equal(
+      byId.get(orphanRunning.id)?.metadata?.orphanSweptAtBoot,
+      bootTime.toISOString(),
+      'The sweep stamps the boot it acted at.',
+    );
+    assert.equal(byId.get(orphanRunning.id)?.metadata?.orphanSweptFromStatus, 'running');
+    assert.equal(byId.get(orphanRetrying.id)?.metadata?.orphanSweptFromStatus, 'retrying');
     assert.equal(byId.get(orphanRetrying.id)?.status, 'failed');
     assert.equal(byId.get(finished.id)?.status, 'succeeded', 'Finished runs stay untouched.');
     assert.equal(byId.get(freshAfterBoot.id)?.status, 'running', 'Post-boot runs stay untouched.');

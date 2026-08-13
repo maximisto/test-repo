@@ -229,8 +229,20 @@ export function finalizeTaskRun(taskRunId: string, patch: {
 }
 
 /**
- * In-flight runs live only in process memory, so a restart strands their
- * records in running/retrying forever. Called once at boot to fail them.
+ * In-flight runs live only in process memory, so a process death strands
+ * their records in running/retrying forever. Called once at boot to fail
+ * them.
+ *
+ * The stamped error states FACTS, never a diagnosis. The sweep knows
+ * exactly one thing: the run had not finished by the time this boot found
+ * it. It does not know why — a crash, a deploy, an OOM kill, or a swallowed
+ * error that abandoned the run mid-uptime all look identical from here. The
+ * previous message asserted "interrupted by a backend restart", which after
+ * the 2026-07-30 incident read as the (long-fixed) 512MB PM2 cap and
+ * dressed every stranded run in a stale explanation, including runs a code
+ * bug had orphaned while the process kept running. Real causes belong where
+ * they are knowable: the step that died records its own error at failure
+ * time, and only a run that never got that chance lands here.
  */
 export function sweepOrphanedTaskRuns(bootTime: Date) {
   const swept: TaskRunRecord[] = [];
@@ -242,7 +254,13 @@ export function sweepOrphanedTaskRuns(bootTime: Date) {
       ...run,
       status: 'failed',
       finishedAt: new Date().toISOString(),
-      error: 'Interrupted by a backend restart before completion. Safe to rerun.',
+      error:
+        'This run never finished: the backend found it still marked in progress at startup. Its actual failure cause was not recorded. Safe to rerun.',
+      metadata: {
+        ...run.metadata,
+        orphanSweptAtBoot: bootTime.toISOString(),
+        orphanSweptFromStatus: run.status,
+      },
     };
     swept.push(updated);
     return updated;
