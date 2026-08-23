@@ -4241,9 +4241,23 @@ function hasObservedGenerationUsage(usage: AutomationGenerationCall['usage']): b
     .some((value) => typeof value === 'number' && Number.isFinite(value) && value > 0);
 }
 
+/**
+ * Whether a generation attempt's accounting is settled. A successful
+ * generation needs a non-zero usage tuple. A FAILED attempt whose provider
+ * answered with an HTTP error status reports an explicit all-zero tuple:
+ * nothing was generated, so zero is the truthful figure and the attempt
+ * needs no reconciliation. An attempt with no usage at all stays unknown.
+ */
+function isGenerationCallAccounted(call: Pick<AutomationGenerationCall, 'status' | 'usage'>): boolean {
+  if (hasReliableGenerationUsage(call.usage)) return true;
+  if (call.status !== 'failed' || !call.usage) return false;
+  const { inputTokens, outputTokens, totalTokens } = call.usage;
+  return inputTokens === 0 && outputTokens === 0 && totalTokens === 0;
+}
+
 function findUnreconciledGenerationCalls(stepExecutions: AutomationStepExecution[]) {
   return readAutomationGenerationCalls(stepExecutions)
-    .filter((call) => !hasReliableGenerationUsage(call.usage));
+    .filter((call) => !isGenerationCallAccounted(call));
 }
 
 function hasBlockingAutomationStepFailure(stepExecutions: AutomationStepExecution[]) {
@@ -4446,7 +4460,7 @@ export function projectedAuthorizedStepCredits(step: AutomationStepExecution): n
   // usage. Keep its full pre-request authorization committed for the rest of
   // this run; a later retry may start only if both attempts still fit.
   const unreportedAttemptAuthorizations = (step.generationCalls ?? [])
-    .filter((call) => !hasReliableGenerationUsage(call.usage))
+    .filter((call) => !isGenerationCallAccounted(call))
     .reduce((total, call) => total + Math.max(0, Math.trunc(call.authorizedTokenCredits ?? 0)), 0);
   return reportedUsageCharge + unreportedAttemptAuthorizations;
 }
@@ -4459,7 +4473,7 @@ function completedAutomationCredits(
     if (step === currentStep || step.status === 'skipped' || step.status === 'planned') return total;
     const actualCredits = Math.max(0, Math.trunc(step.actualCredits ?? step.charge?.actualCredits ?? 0));
     const hasUnreconciledAttempt = (step.generationCalls ?? [])
-      .some((call) => !hasReliableGenerationUsage(call.usage));
+      .some((call) => !isGenerationCallAccounted(call));
     // A completed step's known minimum is not its maximum when the provider
     // omitted part or all of usage. Keep that attempt's full authorization in
     // the mission envelope so a later step cannot spend the same remainder.
@@ -5682,7 +5696,7 @@ async function executeAutomationCore(
       const event = succeededEvent;
       if (!event) throw new Error('Generation completed without a successful accounting event.');
       const unresolvedAttemptCount = (input.stepExecution.generationCalls ?? [])
-        .filter((call) => !hasReliableGenerationUsage(call.usage)).length;
+        .filter((call) => !isGenerationCallAccounted(call)).length;
       if (unresolvedAttemptCount > 0) {
         // Do not let a known minimum masquerade as freed mission budget. The
         // provider call may have returned useful text, but without complete
@@ -7077,7 +7091,7 @@ function buildOrphanedAttemptSettlementPending(
   const generationCalls = readAutomationGenerationCalls(steps);
   if (!holdId || !automationId || !Number.isFinite(authorizedCredits)) return null;
 
-  const accountingIncomplete = generationCalls.some((call) => !hasReliableGenerationUsage(call.usage));
+  const accountingIncomplete = generationCalls.some((call) => !isGenerationCallAccounted(call));
   const hasPreparedGenerationAttempt = steps
     .flatMap((step) => step.generationCalls ?? [])
     .some((call) => call.status === 'prepared');
@@ -7146,7 +7160,7 @@ function hasUnresolvedOrphanedGenerationAttempt(
     ? run.metadata.stepExecutions as AutomationStepExecution[]
     : [];
   const calls = readAutomationGenerationCalls(steps);
-  return calls.length > 0 && calls.some((call) => !hasReliableGenerationUsage(call.usage));
+  return calls.length > 0 && calls.some((call) => !isGenerationCallAccounted(call));
 }
 
 function hasOrphanedMutatingToolAttempt(

@@ -1038,6 +1038,25 @@ function openAIUsage(
   };
 }
 
+/**
+ * Usage for a request the provider rejected with an HTTP error status and no
+ * usage body. Nothing was generated, so the truthful figure is an explicit
+ * zero, not "unknown": an unknown attempt quarantines the whole automation,
+ * which turned every transient 5xx into a paused mission. Ambiguous failures
+ * (a 200 error envelope, a body dying mid-stream, a timeout) keep reporting
+ * no usage and stay quarantined.
+ */
+function rejectedRequestUsage(route: ModelRoute): TextGenerationUsage {
+  return {
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    provider: route.provider,
+    model: route.model,
+    baseUrl: route.baseUrl,
+  };
+}
+
 async function generateWithOpenAI(
   route: ModelRoute,
   system: string,
@@ -1096,7 +1115,7 @@ async function generateWithOpenAI(
     });
     if (response.status === 429 || response.status >= 500) {
       const failure = await readBoundedModelError(response, route);
-      throw new ModelRequestError(route, response.status, failure.cause, failure.usage);
+      throw new ModelRequestError(route, response.status, failure.cause, failure.usage ?? rejectedRequestUsage(route));
     }
 
     let data: {
@@ -1115,7 +1134,7 @@ async function generateWithOpenAI(
         route,
         response.status,
         data.error?.message || response.statusText,
-        openAIUsage(route, data.usage),
+        openAIUsage(route, data.usage) ?? rejectedRequestUsage(route),
       );
     }
 
