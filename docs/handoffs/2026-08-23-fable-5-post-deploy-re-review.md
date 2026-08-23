@@ -135,3 +135,29 @@ No billable call executes, so the ceiling holds, but a budget-blocked run can de
 3. **Product decision for Max:** what `credit_budget_per_run` means to an operator. Recommendation: validate it at save time against the hard envelope and show both numbers in the editor when that UI ships.
 4. NF-5, NF-6, NF-7 as a follow-up PR; NF-8 to the backlog.
 5. The 83(b) deadline (~2026-08-26) still outranks all of the above.
+
+---
+
+## Repair status (2026-08-23, branch `fix/fable5-rereview-hotfix`)
+
+Every defect above is repaired on the branch, test-first, one commit per defect. Not pushed; not deployed.
+
+| Defect | Commit | Regression test (fails before, passes after) |
+|---|---|---|
+| NF-2 hook-wrapped budget refusal | `5a38bf5` | `tests/automationHookBudgetRefusal.test.ts` (real `withModelRetry` via mocked fetch) |
+| NF-4 `listingHasMore` falls open | `d376c58` | `tests/libraryBaseline.test.ts` "a full listing page without a page token" |
+| NF-7 CJK word count | `234b9d5` | `tests/automationSummaryPolicy.test.ts` "unspaced CJK text" |
+| **NF-9 (new)** rejected request = unknown usage → run quarantined, automation paused | `0e9a3c0` | `tests/modelProviderErrors.test.ts` "explicit zero usage"; route test below |
+| NF-1 manual hold = hard envelope, 1×1 retries, "raise the budget" copy | `8e195ff` | `tests/serverMissionBudgetPreflight.test.ts` (rewritten: 200 on a 1,000-credit workspace, retry after 502, settle at usage); `tests/automationWorkspaceBalanceExhaustion.test.ts` |
+| NF-5 SDK errors route-blind | `2cddfdb` | `tests/modelFallback.test.ts` "exhausted Anthropic SDK failure" |
+| NF-6 never-connected Drive → 502 + toast | `bf9ec68` | `tests/folderDropApi.test.ts` "not-connected Drive"; `frontend/tests/folderDrop.contract.mjs` |
+| NF-3 never-baselined section locks up | `c0f27e8` | `tests/libraryBaseline.test.ts` "legacy section ... bootstraps" and "mission read ... proceeds with a warning" |
+
+**NF-9** was found while writing NF-1's acceptance test and is arguably the most damaging of the set for scheduled runs: a provider HTTP error whose body carried no usage was recorded as an attempt with *unknown* usage, so the retry succeeded and the run then failed closed for "manual accounting reconciliation", the task was blocked, and the automation was **paused**. `tests/automationUnknownUsageAccounting.test.ts` (`retry_then_success`) asserted this as intended. A rejected request generated nothing, so the transport now reports an explicit zero tuple and reconciliation accepts an explicit zero on a *failed* attempt. Ambiguous failures (200 error envelopes, mid-body death, timeouts) still quarantine.
+
+Measured after the fix (local seeded shapes): manual hold = card estimate for all three missions (605, 172, 776), ratio 1.0.
+
+Deliberately not changed:
+- The byte-safe per-call gate and the capped settlement (F5-01) are untouched; the ceiling contract holds.
+- The quarantine for genuinely ambiguous provider failures is untouched. Whether a 120 s timeout should pause an automation is a product decision for Max.
+- The estimate itself is still priced against the 120 KB evidence ceiling and is likely 2-3x above settled actuals (the 08-13 real run settled at 228 against a ~776 card). Calibrating it needs the prod ledger.
