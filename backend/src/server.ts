@@ -10508,6 +10508,40 @@ function stampFolderDropEnabledOnFirstActivation(input: {
   });
 }
 
+/**
+ * Lane states the folder-drop API can answer. The sweep's own states cover a
+ * configured reader; `drive_not_connected` is the customer-side precondition
+ * below them: the workspace has no usable Google Drive grant, so the lookup
+ * could not run. That is a known next action, not a platform incident.
+ */
+type FolderDropApiLaneState = FolderDropLaneState | 'drive_not_connected';
+
+function respondFolderDropLookupFailure(
+  res: Response,
+  failure: ReturnType<typeof buildLibraryAccessFailure>,
+  readerEmail: string,
+) {
+  if (failure.code === 'integration_not_connected' || failure.code === 'integration_not_ready') {
+    const laneState: FolderDropApiLaneState = 'drive_not_connected';
+    res.json({
+      laneState,
+      readerEmail,
+      rootFolderId: null,
+      message: failure.message,
+      nextAction: failure.nextAction,
+    });
+    return;
+  }
+  // Anything else is OUR incident, not the operator's onboarding state.
+  // Answering `no_library_yet` here would hide an outage behind "run your
+  // first mission" copy; the settings card renders any non-200 as an honest
+  // "could not load" notice.
+  res.status(502).json({
+    error: 'Your folder-drop status could not be checked right now.',
+    code: 'folder_drop_lookup_failed',
+  });
+}
+
 app.get('/api/workspace/library/folder-drop', async (req: Request, res: Response) => {
   const authUser = getAuthenticatedUser(req);
   if (!authUser) {
@@ -10526,14 +10560,7 @@ app.get('/api/workspace/library/folder-drop', async (req: Request, res: Response
   }
   const rootLookup = await findLibraryRootFolderId(workspaceId);
   if (!rootLookup.ok) {
-    // A failed lookup is OUR incident, not the operator's onboarding state —
-    // answering `no_library_yet` here would hide an outage behind "run your
-    // first mission" copy. The settings card renders any non-200 as an
-    // honest "could not load" notice.
-    res.status(502).json({
-      error: 'Your folder-drop status could not be checked right now.',
-      code: 'folder_drop_lookup_failed',
-    });
+    respondFolderDropLookupFailure(res, rootLookup.failure, readerEmail);
     return;
   }
   const rootFolderId = rootLookup.folderId;
@@ -10555,10 +10582,7 @@ app.post('/api/workspace/library/folder-drop/verify', async (req: Request, res: 
   }
   const rootLookup = await findLibraryRootFolderId(workspaceId);
   if (!rootLookup.ok) {
-    res.status(502).json({
-      error: 'Your folder-drop status could not be checked right now.',
-      code: 'folder_drop_lookup_failed',
-    });
+    respondFolderDropLookupFailure(res, rootLookup.failure, readerEmail);
     return;
   }
   const rootFolderId = rootLookup.folderId;
@@ -10586,10 +10610,7 @@ app.post('/api/workspace/library/folder-drop/share', async (req: Request, res: R
   }
   const rootLookup = await findLibraryRootFolderId(workspaceId);
   if (!rootLookup.ok) {
-    res.status(502).json({
-      error: 'Your folder-drop status could not be checked right now.',
-      code: 'folder_drop_lookup_failed',
-    });
+    respondFolderDropLookupFailure(res, rootLookup.failure, readerEmail);
     return;
   }
   const rootFolderId = rootLookup.folderId;

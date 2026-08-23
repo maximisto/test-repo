@@ -22,7 +22,7 @@ type Profile = 'micro' | 'default' | 'hard' | 'critical' | 'ops' | 'memory_text'
 type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
 type AutoGraduationProfileId = 'cautious' | 'balanced' | 'fast_learning';
 type WorkflowArchetypeId = 'briefing' | 'research' | 'analysis' | 'ops' | 'general';
-type FolderDropLaneState = 'not_configured' | 'no_library_yet' | 'needs_share' | 'unavailable' | 'active';
+type FolderDropLaneState = 'not_configured' | 'drive_not_connected' | 'no_library_yet' | 'needs_share' | 'unavailable' | 'active';
 
 interface ProviderStatus {
   configured: boolean;
@@ -88,6 +88,8 @@ interface FolderDropStatus {
   readerEmail: string | null;
   rootFolderId: string | null;
   manualShare?: boolean;
+  /** Server-supplied next step for customer-side preconditions (e.g. connect Google Drive). */
+  nextAction?: { label: string; route: string };
 }
 
 async function readFolderDropResponse(response: Response, fallbackMessage: string): Promise<FolderDropStatus> {
@@ -254,6 +256,7 @@ const AUTO_GRADUATION_PROFILES: Array<{
 // state of the lane, not a summary of it.
 const FOLDER_DROP_LANE_COPY: Record<FolderDropLaneState, string> = {
   not_configured: "Folder drop isn't configured on this server yet.",
+  drive_not_connected: 'Connect Google Drive first. Violema creates your Violema Library folder there, and folder drop reads from it.',
   no_library_yet:
     "Your Violema Library folder doesn't exist yet. It's created the first time a mission files something there — run a mission with a library step, then come back.",
   needs_share: 'Share your Violema Library folder with the reader address below, then verify.',
@@ -263,6 +266,7 @@ const FOLDER_DROP_LANE_COPY: Record<FolderDropLaneState, string> = {
 
 const FOLDER_DROP_LANE_LABEL: Record<FolderDropLaneState, string> = {
   not_configured: 'Not configured',
+  drive_not_connected: 'Connect Google Drive',
   no_library_yet: 'Not created yet',
   needs_share: 'Needs share',
   unavailable: 'Unavailable',
@@ -1099,6 +1103,21 @@ export default function SettingsPage() {
               >
                 <Copy className="h-3 w-3" />
                 {folderDropCopied ? 'Copied' : 'Copy reader email'}
+              </button>
+            </div>
+          ) : null}
+
+          {!folderDropLoading && folderDropStatus?.laneState === 'drive_not_connected' && folderDropStatus.nextAction ? (
+            <div className="mt-3 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-cyan-500/18 bg-cyan-500/8 px-3 py-2.5">
+              <p className="text-[11px] leading-relaxed text-cyan-100">
+                Google Drive is not connected for this workspace yet.
+              </p>
+              <button
+                type="button"
+                onClick={() => navigate(folderDropStatus.nextAction!.route)}
+                className="ui-pill shrink-0 px-3 py-1.5 text-[10px] normal-case tracking-normal text-cyan-200"
+              >
+                {folderDropStatus.nextAction.label}
               </button>
             </div>
           ) : null}
