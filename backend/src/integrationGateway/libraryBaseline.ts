@@ -46,6 +46,7 @@ import {
   isLibraryFailure,
   readLibrary,
   type AccountLibraryDeps,
+  type AccountLibrarySnapshot,
 } from './accountLibrary';
 import {
   AUTOMATION_SUMMARY_MAX_BYTES,
@@ -76,6 +77,12 @@ export type UpdateLibraryBaselineResult =
       fileName: string;
       created: boolean;
       generationUsage?: TextGenerationResult['usage'];
+      /**
+       * True when this baseline was bootstrapped for a section that had no
+       * baseline and more history than the recovery window. The baseline
+       * text itself names what was not folded in.
+       */
+      historyTruncated?: boolean;
     }
   | {
       ok: false;
@@ -263,7 +270,14 @@ export async function appendLibraryEntryWithBaseline(
       .slice(0, priorBaselineIndex >= 0 ? priorBaselineIndex : existingSnapshot.data.entries.length)
       .filter((entry) => !isLibraryBaselineFileName(entry.fileName));
 
-    if (pendingEntries.length > 0) {
+    // A section that has never been compacted cannot be repaired memo by
+    // memo: there is no baseline to repair toward, and when its history
+    // exceeds the recovery window no transaction could ever read it
+    // completely. Append, then let the successor merge bootstrap a first
+    // baseline from the readable window and stamp what it left out.
+    const bootstrapping = isBaselineBootstrapCase(existingSnapshot.data);
+
+    if (pendingEntries.length > 0 && !bootstrapping) {
       const unreadablePendingEntry = pendingEntries.find(
         (entry) => entry.truncated || Boolean(entry.contentError) || !entry.content?.trim(),
       );
@@ -398,12 +412,13 @@ async function updateLibraryBaselineLocked(
       && !entry.contentError,
   );
 
+  const bootstrapping = !priorBaseline && isBaselineBootstrapCase(snapshot.data);
   const unreadableSource = snapshot.data.entries.find(
     (entry) =>
       !isLibraryBaselineFileName(entry.fileName)
       && (entry.truncated || Boolean(entry.contentError) || !entry.content?.trim()),
   );
-  if (unreadableSource) {
+  if (unreadableSource && !bootstrapping) {
     return {
       ok: false,
       message:
@@ -411,7 +426,7 @@ async function updateLibraryBaselineLocked(
     };
   }
 
-  if (!priorBaseline && snapshot.data.appEntryHistoryComplete === false) {
+  if (!priorBaseline && snapshot.data.appEntryHistoryComplete === false && !bootstrapping) {
     return {
       ok: false,
       message:
@@ -422,13 +437,23 @@ async function updateLibraryBaselineLocked(
   const priorBaselineIndex = priorBaseline
     ? snapshot.data.entries.findIndex((entry) => entry.fileId === priorBaseline.fileId)
     : snapshot.data.entries.length;
-  const newerFindings = snapshot.data.entries
+  const candidateEntries = snapshot.data.entries
     .slice(0, priorBaselineIndex)
-    .filter((entry) => !isLibraryBaselineFileName(entry.fileName))
+    .filter((entry) => !isLibraryBaselineFileName(entry.fileName));
+  // In the bootstrap case only fully readable memos are folded; the first
+  // memo the window could not read completely marks where the fold stops.
+  const firstUnfolded = bootstrapping
+    ? candidateEntries.find((entry) => entry.truncated || Boolean(entry.contentError) || !entry.content?.trim())
+    : undefined;
+  const newerFindings = candidateEntries
+    .filter((entry) => !(entry.truncated || Boolean(entry.contentError) || !entry.content?.trim()))
     .map((entry) => entry.content?.trim())
     .filter((content): content is string => Boolean(content));
   if (!newerFindings.includes(findings)) newerFindings.push(findings);
   const uniqueNewerFindings = [...new Set(newerFindings)];
+  const bootstrapNotice = bootstrapping
+    ? buildBaselineBootstrapNotice(firstUnfolded?.fileName)
+    : '';
 
   const generationPrompt = buildLibraryBaselineGenerationPrompt({
     section: input.section,
@@ -462,7 +487,7 @@ async function updateLibraryBaselineLocked(
     try {
       merged = requireBoundedAutomationOutput(
         typeof generated === 'string' ? { text: generated } : generated,
-        LIBRARY_BASELINE_MAX_BYTES,
+        LIBRARY_BASELINE_MAX_BYTES - Buffer.byteLength(bootstrapNotice, 'utf8'),
         'baseline',
       );
     } catch (error) {
@@ -478,6 +503,7 @@ async function updateLibraryBaselineLocked(
       message: `The baseline merge failed: ${error instanceof Error ? error.message : 'unknown error'}.`,
     };
   }
+  if (bootstrapNotice) merged = `${merged.trimEnd()}\n\n${bootstrapNotice}`;
   const mergedWords = countAutomationWords(merged);
   if (mergedWords > LIBRARY_BASELINE_WORD_LIMIT) {
     return {
@@ -527,5 +553,29 @@ async function updateLibraryBaselineLocked(
     fileName: appended.fileName,
     created: appended.created,
     ...(generationUsage ? { generationUsage } : {}),
+    ...(bootstrapping ? { historyTruncated: true } : {}),
   };
+}
+
+/**
+ * A section with no baseline anywhere in its listing and more history than
+ * the recovery window. Nothing downstream can ever compact it unless the
+ * write lane bootstraps a first baseline from what it could read.
+ */
+function isBaselineBootstrapCase(
+  snapshot: Pick<AccountLibrarySnapshot, 'appBaselineListed' | 'appEntryHistoryComplete' | 'appHistoryBeyondWindow'>,
+): boolean {
+  return snapshot.appBaselineListed === false
+    && snapshot.appEntryHistoryComplete === false
+    && snapshot.appHistoryBeyondWindow === true;
+}
+
+function buildBaselineBootstrapNotice(firstUnfoldedFileName?: string): string {
+  const boundary = firstUnfoldedFileName
+    ? `"${firstUnfoldedFileName}" and everything older`
+    : 'older findings beyond the read window';
+  return (
+    `_Bootstrapped baseline: this section had no baseline and more history than one read can cover. ` +
+    `${boundary} were not folded in; those files remain in the library folder._`
+  );
 }

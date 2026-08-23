@@ -458,6 +458,108 @@ test('a full listing page without a page token is not treated as complete histor
   assert.match(mergePrompt, /Unbaselined fact 12\./, 'the merge sees every memo, not just the first page');
 });
 
+// NF-3 (2026-08-23 re-review): a legacy section that never received a
+// baseline and holds more memo bytes than the recovery window used to fail
+// every read closed and refuse every append, with no path that could ever
+// create the first baseline. Bootstrapping folds the readable window into a
+// first baseline stamped with what it could not fold, so the section lives
+// again and nothing is silently certified complete.
+test('a legacy section with no baseline and history beyond the window bootstraps a stamped baseline', async () => {
+  const drive = createFakeDrive(
+    Array.from({ length: 4 }, (_, index) => ({
+      id: `legacy-${index + 1}`,
+      name: `2026-08-${String(12 - index).padStart(2, '0')} — Legacy findings ${index + 1}.md`,
+      content: `LEGACY-${index + 1}:`.padEnd(30_000, 'x'),
+    })),
+  );
+  let mergePrompt = '';
+
+  const result = await appendLibraryEntryWithBaseline({
+    workspaceId: 'ws_test',
+    section: SECTION,
+    untrustedRule: RULE,
+    neutralize: NEUTRALIZE,
+    runId: 'bootstrap-run',
+    latestFindingsMarkdown: 'Fresh bootstrap fact.',
+    entry: { title: 'Fresh findings', markdown: 'Fresh bootstrap fact.', versionId: 'bootstrap-run' },
+  }, {
+    execute: drive.execute,
+    fetchText: drive.fetchText,
+    generate: (async (_profile: string, _system: string, messages: Array<{ content: unknown }>) => {
+      mergePrompt = String(messages[0]?.content ?? '');
+      return 'Bootstrapped digest of the readable window.';
+    }) as never,
+  });
+
+  assert.equal(result.libraryResult.ok, true, JSON.stringify(result.libraryResult));
+  assert.equal(result.baselineResult?.ok, true, JSON.stringify(result.baselineResult));
+  if (!result.baselineResult?.ok) return;
+  assert.equal(result.baselineResult.historyTruncated, true, 'the bootstrap says what it could not fold');
+  assert.match(mergePrompt, /LEGACY-1:/, 'the newest readable legacy memo is folded');
+  assert.match(mergePrompt, /LEGACY-2:/, 'the second readable legacy memo is folded');
+  assert.doesNotMatch(mergePrompt, /LEGACY-4:/, 'memos beyond the window are not pretended into the merge');
+  assert.match(mergePrompt, /Fresh bootstrap fact\./);
+
+  const baseline = drive.created.find((file) => isLibraryBaselineFileName(file.name));
+  assert.ok(baseline, 'a first baseline now exists');
+  assert.match(baseline.content, /Bootstrapped digest of the readable window\./);
+  assert.match(baseline.content, /not folded in/i, 'the baseline itself carries the truncation notice');
+  assert.match(baseline.content, /Legacy findings 3/, 'the notice names where the fold stopped');
+
+  const after = await readLibrary(
+    'ws_test',
+    SECTION,
+    {
+      limit: 10,
+      includeOperatorFiles: false,
+      requireCompleteAppHistory: true,
+      maxAppEntryContentBytes: 32_001,
+      maxAppHistoryBytes: MAX_RECOVERABLE_APP_HISTORY_BYTES,
+    },
+    { execute: drive.execute, fetchText: drive.fetchText },
+  );
+  assert.equal(after.ok, true);
+  if (!after.ok) return;
+  assert.equal(after.data.appEntryHistoryComplete, true, 'reads now stop at the bootstrapped baseline');
+});
+
+test('a mission read of a legacy section with no baseline proceeds with a warning instead of stopping the run', async () => {
+  const drive = createFakeDrive(
+    Array.from({ length: 4 }, (_, index) => ({
+      id: `legacy-${index + 1}`,
+      name: `2026-08-${String(12 - index).padStart(2, '0')} — Legacy findings ${index + 1}.md`,
+      content: `LEGACY-${index + 1}:`.padEnd(30_000, 'x'),
+    })),
+  );
+  const snapshot = await readLibrary(
+    'ws_test',
+    SECTION,
+    {
+      limit: 10,
+      includeOperatorFiles: false,
+      requireCompleteAppHistory: true,
+      maxAppEntryContentBytes: 32_001,
+      maxAppHistoryBytes: MAX_RECOVERABLE_APP_HISTORY_BYTES,
+    },
+    { execute: drive.execute, fetchText: drive.fetchText },
+  );
+  assert.equal(snapshot.ok, true);
+  if (!snapshot.ok) return;
+  assert.equal(snapshot.data.appEntryHistoryComplete, false);
+
+  const missionRead = await executeQueryData({
+    workspaceId: 'ws_test',
+    source: ACCOUNT_LIBRARY_SOURCE,
+    queryType: ACCOUNT_LIBRARY_READ_QUERY_TYPE,
+    filters: { section: SECTION },
+    clientOverrides: { accountLibraryRead: async () => snapshot },
+  });
+  assert.equal(missionRead.ok, true, JSON.stringify(missionRead));
+  if (!missionRead.ok) return;
+  const warnings = (missionRead.data as { warnings?: string[] }).warnings ?? [];
+  assert.ok(warnings.some((warning) => /older findings/i.test(warning) && /baseline/i.test(warning)), JSON.stringify(warnings));
+});
+
 test('seeded read-write flow prevents soft refresh failures from growing an unrecoverable backlog', async () => {
   const drive = createFakeDrive([{
     id: 'baseline-seed',

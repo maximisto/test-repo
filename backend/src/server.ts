@@ -6082,8 +6082,11 @@ async function executeAutomationCore(
           const sweepWarnings = isObjectRecord(sweep) && Array.isArray(sweep.warnings)
             ? sweep.warnings.filter((entry): entry is string => typeof entry === 'string')
             : [];
-          if (sweepWarnings.length > 0) {
-            stepExecution.warnings = sweepWarnings;
+          const readWarnings = Array.isArray(payload.data.warnings)
+            ? payload.data.warnings.filter((entry): entry is string => typeof entry === 'string')
+            : [];
+          if (sweepWarnings.length > 0 || readWarnings.length > 0) {
+            stepExecution.warnings = [...sweepWarnings, ...readWarnings];
           }
         }
         stepExecution.dataOrigin = readQueryPayloadDataOrigin(payload);
