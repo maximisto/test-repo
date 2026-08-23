@@ -4405,10 +4405,24 @@ class AutomationEvidenceOverflowError extends Error {
   }
 }
 
-function isFatalAutomationGenerationError(error: unknown): boolean {
-  return error instanceof RuntimeCreditBudgetError
+/**
+ * The fatal generation error inside `error`, or null. The model transport
+ * wraps hook failures (`ModelAttemptHookError`), so a budget refusal raised
+ * inside `beforeAttempt` on a retry arrives with its identity one level down;
+ * callers rethrow the unwrapped error so the step records the real cause.
+ */
+function findFatalAutomationGenerationError(error: unknown, depth = 0): Error | null {
+  if (
+    error instanceof RuntimeCreditBudgetError
     || error instanceof RuntimeGenerationAccountingError
-    || error instanceof AutomationEvidenceOverflowError;
+    || error instanceof AutomationEvidenceOverflowError
+  ) {
+    return error;
+  }
+  if (depth < 4 && error instanceof Error && 'cause' in error && error.cause !== undefined) {
+    return findFatalAutomationGenerationError(error.cause, depth + 1);
+  }
+  return null;
 }
 
 export function projectedAuthorizedStepCredits(step: AutomationStepExecution): number {
@@ -5270,7 +5284,8 @@ async function ensureAutomationSummaryText(
       throw error;
     }
   } catch (error) {
-    if (isFatalAutomationGenerationError(error)) throw error;
+    const fatalGenerationError = findFatalAutomationGenerationError(error);
+    if (fatalGenerationError) throw fatalGenerationError;
     const summaryError = error instanceof Error ? error.message : 'Unknown summary generation error';
     stepErrors.push(boundAutomationExecutionText(`Fallback summary: ${summaryError}`));
     return buildDeterministicAutomationSummary(automation, artifacts, stepExecutions, stepErrors);
@@ -6157,7 +6172,8 @@ async function executeAutomationCore(
               }
             }
           } catch (error) {
-            if (isFatalAutomationGenerationError(error)) throw error;
+            const fatalGenerationError = findFatalAutomationGenerationError(error);
+            if (fatalGenerationError) throw fatalGenerationError;
             if (intelCall?.event.status === 'succeeded') {
               intelCall.event.status = 'rejected';
               intelCall.event.error = error instanceof Error ? error.message : 'Invalid competitive extraction';
@@ -6284,7 +6300,8 @@ async function executeAutomationCore(
             });
             body = requireCompleteAutomationMemoWithLink(memoCall.result, libraryDocLink);
           } catch (error) {
-            if (isFatalAutomationGenerationError(error)) throw error;
+            const fatalGenerationError = findFatalAutomationGenerationError(error);
+            if (fatalGenerationError) throw fatalGenerationError;
             if (memoCall?.event.status === 'succeeded') {
               memoCall.event.status = 'rejected';
               memoCall.event.error = error instanceof Error ? error.message : 'Rejected delivery memo';
