@@ -405,6 +405,42 @@ test('a failed root-folder lookup surfaces as a platform failure, never as onboa
   });
 });
 
+// NF-6 (2026-08-23 re-review): a workspace that never connected Drive (or
+// whose grant was revoked) is a customer-side precondition with a known next
+// action, not a platform incident. It must answer with a lane state and the
+// Connect CTA, never 502 and never onboarding copy.
+test('a not-connected Drive answers a connect-required lane state, not a 502 or onboarding copy', async (t) => {
+  const readerKeyEnvValue = buildTestReaderKeyEnvValue('reader@test.iam');
+
+  await withApiServer({ readerKeyEnvValue }, async ({ baseUrl, sessionToken }) => {
+    if (!accountLibraryModule) throw new Error('accountLibrary module not loaded yet.');
+    for (const code of ['integration_not_connected', 'integration_not_ready'] as const) {
+      t.mock.method(accountLibraryModule, 'findLibraryRootFolderId', async () => ({
+        ok: false as const,
+        failure: accountLibraryModule!.buildLibraryAccessFailure(code),
+      }));
+
+      for (const [route, method] of [
+        ['/api/workspace/library/folder-drop', 'GET'],
+        ['/api/workspace/library/folder-drop/verify', 'POST'],
+        ['/api/workspace/library/folder-drop/share', 'POST'],
+      ] as const) {
+        const response = await fetch(`${baseUrl}${route}`, { method, headers: authHeaders(sessionToken) });
+        const body = await response.json() as Record<string, unknown>;
+        assert.equal(response.status, 200, `${code} ${route}: ${JSON.stringify(body)}`);
+        assert.equal(body.laneState, 'drive_not_connected');
+        assert.notEqual(body.laneState, 'no_library_yet');
+        assert.equal(body.readerEmail, 'reader@test.iam');
+        assert.equal(body.rootFolderId, null);
+        const nextAction = body.nextAction as { label?: string; route?: string } | undefined;
+        assert.equal(nextAction?.label, 'Connect Google Drive');
+        assert.match(String(nextAction?.route), /^\/integrations/);
+      }
+    }
+    assert.equal(readFolderDropShareAuditEvents().length, 0, 'a not-connected lane never audits an enablement.');
+  });
+});
+
 test('a failed programmatic share returns a mapped non-2xx error instead of pretending needs_share', async (t) => {
   const readerKeyEnvValue = buildTestReaderKeyEnvValue('reader@test.iam');
 

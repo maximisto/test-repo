@@ -276,14 +276,18 @@ test('a non-operator asking to run a mission is refused and nothing starts', asy
   );
 }));
 
-test('Slack refuses before acknowledgement when only the forecast fits available credits', async () => withSlackEventsServer(async (context) => {
+// NF-1 (2026-08-23 re-review): the Slack `run` verb reserves the estimate
+// like the dashboard's Run. It refuses synchronously when the workspace
+// cannot afford the estimate, not when it merely cannot afford the hard
+// single-attempt envelope.
+test('Slack refuses before acknowledgement when the workspace cannot afford the estimate', async () => withSlackEventsServer(async (context) => {
   const store = await import('../src/platform/store');
   store.addLedgerEntry({
     workspaceId: context.workspaceId,
     source: 'manual_adjustment',
-    deltaCredits: 100,
+    deltaCredits: 1,
     referenceType: 'manual',
-    referenceId: 'slack_hard_envelope_test',
+    referenceId: 'slack_unaffordable_estimate_test',
   });
   const runsBefore = store.listTaskRuns(context.workspaceId).length;
 
@@ -297,10 +301,10 @@ test('Slack refuses before acknowledgement when only the forecast fits available
 
   const reply = await waitFor(
     () => context.replies().find((text) => /credits/i.test(text) && /available|required/i.test(text)),
-    'the hard-envelope credit refusal',
+    'the credit refusal',
   );
   assert.match(reply, /does not have enough credits/i);
-  assert.match(reply, /100 available, \d+ required/i);
+  assert.match(reply, /1 available, \d+ required/i);
   assert.equal(context.replies().some((text) => text.includes('Started')), false);
   assert.equal(
     store.listTaskRuns(context.workspaceId).length,

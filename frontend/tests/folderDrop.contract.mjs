@@ -106,4 +106,20 @@ assert(
   'A successful URL add reports the added file by name.',
 );
 
+// 7. NF-6 (2026-08-23 re-review): a workspace that has not connected Google
+// Drive is a lane state with a Connect action, rendered inside the card. It
+// must not surface through the error branch that raises a global toast.
+assert(
+  settingsSource.includes("'drive_not_connected'"),
+  'SettingsPage knows the drive_not_connected lane state.',
+);
+assert(
+  settingsSource.includes('drive_not_connected:') && settingsSource.includes('Connect Google Drive'),
+  'The not-connected lane renders its own copy and the Connect Google Drive action.',
+);
+assert(
+  settingsSource.includes('nextAction'),
+  'The card renders the server-supplied next action instead of inventing a route.',
+);
+
 console.log('folderDrop.contract: all assertions passed');

@@ -528,3 +528,106 @@ test('an OpenRouter-only deployment skips an unconfigured Anthropic primary', as
     delete require.cache[require.resolve('../src/models')];
   }
 });
+
+// NF-5 (2026-08-23 re-review): SDK-transport routes (Anthropic, MiniMax) must
+// surface the same route-aware cause the HTTP routes do, and an SDK error
+// that carries an HTTP status is a rejected request with explicit zero usage.
+test('an exhausted Anthropic SDK failure names the provider, model, status, and cause', async () => {
+  const originalLoad = moduleWithLoader._load;
+  const envKeys = [
+    'ANTHROPIC_API_KEY',
+    'OPENAI_API_KEY',
+    'OPENROUTER_API_KEY',
+    'MINIMAX_API_KEY',
+    'ZAI_API_KEY',
+    'MODEL_RETRY_DELAYS_MS',
+    'MODEL_DEFAULT_PROVIDER',
+    'MODEL_DEFAULT_MODEL',
+    'MODEL_DEFAULT_API_KEY_ENV',
+    'MODEL_DEFAULT_BASE_URL',
+    'MODEL_DEFAULT_FALLBACK_PROVIDER',
+    'MODEL_DEFAULT_FALLBACK_MODEL',
+    'MODEL_DEFAULT_FALLBACK_API_KEY_ENV',
+    'MODEL_DEFAULT_FALLBACK_BASE_URL',
+    'MODEL_DEFAULT_FALLBACK_1_PROVIDER',
+    'MODEL_DEFAULT_FALLBACK_1_MODEL',
+    'MODEL_DEFAULT_FALLBACK_1_API_KEY_ENV',
+    'MODEL_DEFAULT_FALLBACK_1_BASE_URL',
+    'MODEL_FALLBACK_API_KEY_ENV',
+    'MODEL_FALLBACK_BASE_URL',
+    'MODEL_FALLBACK_MODEL',
+    'MODEL_FALLBACK_OPENROUTER_MODEL',
+    'MODEL_FALLBACK_PROVIDER',
+  ] as const;
+  const originalEnv = new Map(envKeys.map((key) => [key, process.env[key]] as const));
+  let anthropicCalls = 0;
+  const failedUsages: Array<import('../src/models').TextGenerationUsage | undefined> = [];
+
+  try {
+    for (const key of envKeys) delete process.env[key];
+    process.env.ANTHROPIC_API_KEY = 'test-anthropic-key';
+    process.env.MODEL_RETRY_DELAYS_MS = '0';
+    process.env.MODEL_DEFAULT_PROVIDER = 'anthropic';
+    process.env.MODEL_DEFAULT_MODEL = 'claude-sonnet-5';
+    process.env.MODEL_DEFAULT_API_KEY_ENV = 'ANTHROPIC_API_KEY';
+
+    moduleWithLoader._load = function patchedLoad(request: string, parent: NodeModule | null, isMain: boolean) {
+      if (request === '@anthropic-ai/sdk') {
+        return {
+          default: class FakeAnthropic {
+            messages = {
+              create: async () => {
+                anthropicCalls += 1;
+                throw Object.assign(new Error('Overloaded'), { name: 'InternalServerError', status: 529 });
+              },
+            };
+          },
+        };
+      }
+      return originalLoad.call(this, request, parent, isMain);
+    };
+
+    delete require.cache[require.resolve('../src/models')];
+    const { generateTextDetailed } = require('../src/models') as typeof import('../src/models');
+    await assert.rejects(
+      generateTextDetailed(
+        'default',
+        'Write a concise founder brief.',
+        [{ role: 'user', content: 'Summarize the run.' }],
+        300,
+        'test-workspace',
+        {
+          maxRoutes: 1,
+          onAttemptFailure: (_attempt, _error, usage) => {
+            failedUsages.push(usage);
+          },
+        },
+      ),
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        assert.match(message, /anthropic\/claude-sonnet-5/, 'the route is named');
+        assert.match(message, /529/, 'the status is named');
+        assert.match(message, /Overloaded/, 'the provider cause is kept');
+        return true;
+      },
+    );
+    assert.ok(anthropicCalls >= 2, 'a 529 is retried');
+    assert.equal(failedUsages.length, anthropicCalls);
+    for (const usage of failedUsages) {
+      assert.deepEqual(
+        { input: usage?.inputTokens, output: usage?.outputTokens, total: usage?.totalTokens },
+        { input: 0, output: 0, total: 0 },
+        'a request the SDK reports as rejected generated nothing',
+      );
+      assert.equal(usage?.provider, 'anthropic');
+    }
+  } finally {
+    moduleWithLoader._load = originalLoad;
+    for (const key of envKeys) {
+      const value = originalEnv.get(key);
+      if (typeof value === 'string') process.env[key] = value;
+      else delete process.env[key];
+    }
+    delete require.cache[require.resolve('../src/models')];
+  }
+});

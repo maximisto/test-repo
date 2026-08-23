@@ -428,8 +428,6 @@ const AUTOMATION_STEP_BILLABLE_DURATION_SECONDS = Math.max(
 // unbudgeted holds grow atomically and mission budgets stop before overspend.
 const AUTOMATION_GENERATION_ATTEMPTS_PER_ROUTE = 2;
 const AUTOMATION_GENERATION_ROUTE_LIMIT = 2;
-const MANUAL_GENERATION_ATTEMPTS_PER_ROUTE = 1;
-const MANUAL_GENERATION_ROUTE_LIMIT = 1;
 const AUTOMATION_CREDIT_HOLD_LEASE_MS = Math.max(
   60 * 60 * 1000,
   AUTOMATION_STEP_TIMEOUT_MS * 3,
@@ -4241,9 +4239,23 @@ function hasObservedGenerationUsage(usage: AutomationGenerationCall['usage']): b
     .some((value) => typeof value === 'number' && Number.isFinite(value) && value > 0);
 }
 
+/**
+ * Whether a generation attempt's accounting is settled. A successful
+ * generation needs a non-zero usage tuple. A FAILED attempt whose provider
+ * answered with an HTTP error status reports an explicit all-zero tuple:
+ * nothing was generated, so zero is the truthful figure and the attempt
+ * needs no reconciliation. An attempt with no usage at all stays unknown.
+ */
+function isGenerationCallAccounted(call: Pick<AutomationGenerationCall, 'status' | 'usage'>): boolean {
+  if (hasReliableGenerationUsage(call.usage)) return true;
+  if (call.status !== 'failed' || !call.usage) return false;
+  const { inputTokens, outputTokens, totalTokens } = call.usage;
+  return inputTokens === 0 && outputTokens === 0 && totalTokens === 0;
+}
+
 function findUnreconciledGenerationCalls(stepExecutions: AutomationStepExecution[]) {
   return readAutomationGenerationCalls(stepExecutions)
-    .filter((call) => !hasReliableGenerationUsage(call.usage));
+    .filter((call) => !isGenerationCallAccounted(call));
 }
 
 function hasBlockingAutomationStepFailure(stepExecutions: AutomationStepExecution[]) {
@@ -4405,10 +4417,24 @@ class AutomationEvidenceOverflowError extends Error {
   }
 }
 
-function isFatalAutomationGenerationError(error: unknown): boolean {
-  return error instanceof RuntimeCreditBudgetError
+/**
+ * The fatal generation error inside `error`, or null. The model transport
+ * wraps hook failures (`ModelAttemptHookError`), so a budget refusal raised
+ * inside `beforeAttempt` on a retry arrives with its identity one level down;
+ * callers rethrow the unwrapped error so the step records the real cause.
+ */
+function findFatalAutomationGenerationError(error: unknown, depth = 0): Error | null {
+  if (
+    error instanceof RuntimeCreditBudgetError
     || error instanceof RuntimeGenerationAccountingError
-    || error instanceof AutomationEvidenceOverflowError;
+    || error instanceof AutomationEvidenceOverflowError
+  ) {
+    return error;
+  }
+  if (depth < 4 && error instanceof Error && 'cause' in error && error.cause !== undefined) {
+    return findFatalAutomationGenerationError(error.cause, depth + 1);
+  }
+  return null;
 }
 
 export function projectedAuthorizedStepCredits(step: AutomationStepExecution): number {
@@ -4432,7 +4458,7 @@ export function projectedAuthorizedStepCredits(step: AutomationStepExecution): n
   // usage. Keep its full pre-request authorization committed for the rest of
   // this run; a later retry may start only if both attempts still fit.
   const unreportedAttemptAuthorizations = (step.generationCalls ?? [])
-    .filter((call) => !hasReliableGenerationUsage(call.usage))
+    .filter((call) => !isGenerationCallAccounted(call))
     .reduce((total, call) => total + Math.max(0, Math.trunc(call.authorizedTokenCredits ?? 0)), 0);
   return reportedUsageCharge + unreportedAttemptAuthorizations;
 }
@@ -4445,7 +4471,7 @@ function completedAutomationCredits(
     if (step === currentStep || step.status === 'skipped' || step.status === 'planned') return total;
     const actualCredits = Math.max(0, Math.trunc(step.actualCredits ?? step.charge?.actualCredits ?? 0));
     const hasUnreconciledAttempt = (step.generationCalls ?? [])
-      .some((call) => !hasReliableGenerationUsage(call.usage));
+      .some((call) => !isGenerationCallAccounted(call));
     // A completed step's known minimum is not its maximum when the provider
     // omitted part or all of usage. Keep that attempt's full authorization in
     // the mission envelope so a later step cannot spend the same remainder.
@@ -4474,6 +4500,38 @@ function buildRuntimeCreditBudgetBlock(input: {
       `${input.automationName} paused before ${input.purpose}: the next billable operation could require ` +
       `${input.operationCredits} credits, but only ${remainingCredits} of the ` +
       `${input.budgetCredits}-credit per-run budget remains. Raise the budget or trim the mission, then rerun.`,
+  };
+}
+
+/**
+ * The pause an unbudgeted run takes when the workspace cannot reserve the
+ * next call's maximum. Same shape as the per-run budget block so the run
+ * settles and surfaces identically; only the cause and the next action
+ * differ, because there is no budget to raise.
+ */
+function buildRuntimeWorkspaceCreditBlock(input: {
+  automationName: string;
+  budgetCredits: number;
+  projectedCredits: number;
+  operationCredits: number;
+  purpose: string;
+  reason: string;
+}): RuntimeCreditBudgetBlock {
+  const remainingCredits = Math.max(0, input.budgetCredits - (input.projectedCredits - input.operationCredits));
+  return {
+    code: CREDIT_BUDGET_EXCEEDED_CODE,
+    budgetCredits: input.budgetCredits,
+    projectedCredits: input.projectedCredits,
+    remainingCredits,
+    operationCredits: input.operationCredits,
+    purpose: input.purpose,
+    summary:
+      `${input.automationName} paused before ${input.purpose}: ` +
+      (input.operationCredits > 0
+        ? `the next billable operation could require ${input.operationCredits} credits`
+        : 'its projected charges would exceed the reserved credits') +
+      ` and the workspace could not reserve them (${input.reason.replace(/\.$/, '')}). ` +
+      'Nothing more was spent. Add credits or upgrade the plan, then rerun.',
   };
 }
 
@@ -5270,7 +5328,8 @@ async function ensureAutomationSummaryText(
       throw error;
     }
   } catch (error) {
-    if (isFatalAutomationGenerationError(error)) throw error;
+    const fatalGenerationError = findFatalAutomationGenerationError(error);
+    if (fatalGenerationError) throw fatalGenerationError;
     const summaryError = error instanceof Error ? error.message : 'Unknown summary generation error';
     stepErrors.push(boundAutomationExecutionText(`Fallback summary: ${summaryError}`));
     return buildDeterministicAutomationSummary(automation, artifacts, stepExecutions, stepErrors);
@@ -5386,7 +5445,24 @@ async function executeAutomationCore(
     const projectedCredits = alreadyCommittedCredits + operationCredits;
     if (projectedCredits <= budgetCredits) return;
     if (runContext.extendCreditAuthorization) {
-      budgetCredits = runContext.extendCreditAuthorization(projectedCredits);
+      try {
+        budgetCredits = runContext.extendCreditAuthorization(projectedCredits);
+      } catch (error) {
+        // The workspace balance, not an operator budget, is what ran out.
+        // Pause as an honest credit block so the run settles and the
+        // operator is pointed at credits rather than at a budget knob they
+        // never set.
+        const block = buildRuntimeWorkspaceCreditBlock({
+          automationName: automation.name,
+          budgetCredits,
+          projectedCredits,
+          operationCredits,
+          purpose,
+          reason: error instanceof Error ? error.message : String(error),
+        });
+        creditBudgetBlock = block;
+        throw new RuntimeCreditBudgetError(block);
+      }
       runContext.creditBudgetCredits = budgetCredits;
       if (projectedCredits <= budgetCredits) return;
     }
@@ -5667,7 +5743,7 @@ async function executeAutomationCore(
       const event = succeededEvent;
       if (!event) throw new Error('Generation completed without a successful accounting event.');
       const unresolvedAttemptCount = (input.stepExecution.generationCalls ?? [])
-        .filter((call) => !hasReliableGenerationUsage(call.usage)).length;
+        .filter((call) => !isGenerationCallAccounted(call)).length;
       if (unresolvedAttemptCount > 0) {
         // Do not let a known minimum masquerade as freed mission budget. The
         // provider call may have returned useful text, but without complete
@@ -6006,8 +6082,11 @@ async function executeAutomationCore(
           const sweepWarnings = isObjectRecord(sweep) && Array.isArray(sweep.warnings)
             ? sweep.warnings.filter((entry): entry is string => typeof entry === 'string')
             : [];
-          if (sweepWarnings.length > 0) {
-            stepExecution.warnings = sweepWarnings;
+          const readWarnings = Array.isArray(payload.data.warnings)
+            ? payload.data.warnings.filter((entry): entry is string => typeof entry === 'string')
+            : [];
+          if (sweepWarnings.length > 0 || readWarnings.length > 0) {
+            stepExecution.warnings = [...sweepWarnings, ...readWarnings];
           }
         }
         stepExecution.dataOrigin = readQueryPayloadDataOrigin(payload);
@@ -6157,7 +6236,8 @@ async function executeAutomationCore(
               }
             }
           } catch (error) {
-            if (isFatalAutomationGenerationError(error)) throw error;
+            const fatalGenerationError = findFatalAutomationGenerationError(error);
+            if (fatalGenerationError) throw fatalGenerationError;
             if (intelCall?.event.status === 'succeeded') {
               intelCall.event.status = 'rejected';
               intelCall.event.error = error instanceof Error ? error.message : 'Invalid competitive extraction';
@@ -6284,7 +6364,8 @@ async function executeAutomationCore(
             });
             body = requireCompleteAutomationMemoWithLink(memoCall.result, libraryDocLink);
           } catch (error) {
-            if (isFatalAutomationGenerationError(error)) throw error;
+            const fatalGenerationError = findFatalAutomationGenerationError(error);
+            if (fatalGenerationError) throw fatalGenerationError;
             if (memoCall?.event.status === 'succeeded') {
               memoCall.event.status = 'rejected';
               memoCall.event.error = error instanceof Error ? error.message : 'Rejected delivery memo';
@@ -7060,7 +7141,7 @@ function buildOrphanedAttemptSettlementPending(
   const generationCalls = readAutomationGenerationCalls(steps);
   if (!holdId || !automationId || !Number.isFinite(authorizedCredits)) return null;
 
-  const accountingIncomplete = generationCalls.some((call) => !hasReliableGenerationUsage(call.usage));
+  const accountingIncomplete = generationCalls.some((call) => !isGenerationCallAccounted(call));
   const hasPreparedGenerationAttempt = steps
     .flatMap((step) => step.generationCalls ?? [])
     .some((call) => call.status === 'prepared');
@@ -7129,7 +7210,7 @@ function hasUnresolvedOrphanedGenerationAttempt(
     ? run.metadata.stepExecutions as AutomationStepExecution[]
     : [];
   const calls = readAutomationGenerationCalls(steps);
-  return calls.length > 0 && calls.some((call) => !hasReliableGenerationUsage(call.usage));
+  return calls.length > 0 && calls.some((call) => !isGenerationCallAccounted(call));
 }
 
 function hasOrphanedMutatingToolAttempt(
@@ -7524,15 +7605,13 @@ function acquireManualRunCreditAuthorization(
       }),
     };
   }
-  // An operator-triggered run receives a truthful synchronous answer. Without
-  // an explicit mission ceiling, reserve the hard single-attempt envelope and
-  // constrain the provider to exactly that reachable policy. Background runs
-  // retain bounded retries and extend at exact call boundaries; a budgeted
-  // manual run already reserves the full operator-approved ceiling.
-  const authorizedCredits = perRunBudget ?? Math.max(
-    authorizationCredits,
-    plan.manualAuthorizationCredits,
-  );
+  // An operator-triggered run reserves what a scheduled run reserves: the
+  // estimate-sized authorization, extended at exact call boundaries against
+  // the byte-safe per-call gate. Reserving the hard single-attempt envelope
+  // here instead (6x to 14x the card estimate) refused every trial and Start
+  // workspace while the scheduler ran the same mission fine. A budgeted
+  // manual run still reserves the full operator-approved ceiling.
+  const authorizedCredits = perRunBudget ?? authorizationCredits;
   try {
     const hold = acquireCreditHold({
       workspaceId,
@@ -7550,12 +7629,6 @@ function acquireManualRunCreditAuthorization(
         estimatedCredits,
         authorizedCredits,
         hold,
-        ...(perRunBudget === null
-          ? {
-              generationMaxAttemptsPerRoute: MANUAL_GENERATION_ATTEMPTS_PER_ROUTE,
-              generationMaxRoutes: MANUAL_GENERATION_ROUTE_LIMIT,
-            }
-          : {}),
       },
     };
   } catch (error) {
@@ -8210,7 +8283,9 @@ export async function runAutomation(automation: {
       ...(suppliedGenerationMaxRoutes
         ? { generationMaxRoutes: suppliedGenerationMaxRoutes }
         : {}),
-      ...(perRunBudget === null && !suppliedAuthorizationMatches
+      // A supplied operator authorization is the same estimate-sized hold a
+      // scheduled run acquires, so it extends the same way.
+      ...(perRunBudget === null
         ? {
             extendCreditAuthorization: (requiredCredits: number) => {
               if (!creditHold) throw new Error('Automation credit authorization is unavailable.');
@@ -10436,6 +10511,40 @@ function stampFolderDropEnabledOnFirstActivation(input: {
   });
 }
 
+/**
+ * Lane states the folder-drop API can answer. The sweep's own states cover a
+ * configured reader; `drive_not_connected` is the customer-side precondition
+ * below them: the workspace has no usable Google Drive grant, so the lookup
+ * could not run. That is a known next action, not a platform incident.
+ */
+type FolderDropApiLaneState = FolderDropLaneState | 'drive_not_connected';
+
+function respondFolderDropLookupFailure(
+  res: Response,
+  failure: ReturnType<typeof buildLibraryAccessFailure>,
+  readerEmail: string,
+) {
+  if (failure.code === 'integration_not_connected' || failure.code === 'integration_not_ready') {
+    const laneState: FolderDropApiLaneState = 'drive_not_connected';
+    res.json({
+      laneState,
+      readerEmail,
+      rootFolderId: null,
+      message: failure.message,
+      nextAction: failure.nextAction,
+    });
+    return;
+  }
+  // Anything else is OUR incident, not the operator's onboarding state.
+  // Answering `no_library_yet` here would hide an outage behind "run your
+  // first mission" copy; the settings card renders any non-200 as an honest
+  // "could not load" notice.
+  res.status(502).json({
+    error: 'Your folder-drop status could not be checked right now.',
+    code: 'folder_drop_lookup_failed',
+  });
+}
+
 app.get('/api/workspace/library/folder-drop', async (req: Request, res: Response) => {
   const authUser = getAuthenticatedUser(req);
   if (!authUser) {
@@ -10454,14 +10563,7 @@ app.get('/api/workspace/library/folder-drop', async (req: Request, res: Response
   }
   const rootLookup = await findLibraryRootFolderId(workspaceId);
   if (!rootLookup.ok) {
-    // A failed lookup is OUR incident, not the operator's onboarding state —
-    // answering `no_library_yet` here would hide an outage behind "run your
-    // first mission" copy. The settings card renders any non-200 as an
-    // honest "could not load" notice.
-    res.status(502).json({
-      error: 'Your folder-drop status could not be checked right now.',
-      code: 'folder_drop_lookup_failed',
-    });
+    respondFolderDropLookupFailure(res, rootLookup.failure, readerEmail);
     return;
   }
   const rootFolderId = rootLookup.folderId;
@@ -10483,10 +10585,7 @@ app.post('/api/workspace/library/folder-drop/verify', async (req: Request, res: 
   }
   const rootLookup = await findLibraryRootFolderId(workspaceId);
   if (!rootLookup.ok) {
-    res.status(502).json({
-      error: 'Your folder-drop status could not be checked right now.',
-      code: 'folder_drop_lookup_failed',
-    });
+    respondFolderDropLookupFailure(res, rootLookup.failure, readerEmail);
     return;
   }
   const rootFolderId = rootLookup.folderId;
@@ -10514,10 +10613,7 @@ app.post('/api/workspace/library/folder-drop/share', async (req: Request, res: R
   }
   const rootLookup = await findLibraryRootFolderId(workspaceId);
   if (!rootLookup.ok) {
-    res.status(502).json({
-      error: 'Your folder-drop status could not be checked right now.',
-      code: 'folder_drop_lookup_failed',
-    });
+    respondFolderDropLookupFailure(res, rootLookup.failure, readerEmail);
     return;
   }
   const rootFolderId = rootLookup.folderId;

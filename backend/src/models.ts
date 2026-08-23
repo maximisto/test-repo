@@ -82,6 +82,8 @@ export interface TextGenerationOptions {
 export interface ModelRetryOptions<T> {
   signal?: AbortSignal;
   maxAttempts?: number;
+  /** The route being attempted, so transport-level failures can name it. */
+  route?: ModelRoute;
   beforeAttempt?: (attemptNumber: number) => void | Promise<void>;
   onAttemptStart?: (attemptNumber: number) => void | Promise<void>;
   onAttemptNotStarted?: (attemptNumber: number, error: unknown) => void | Promise<void>;
@@ -147,7 +149,7 @@ function sanitizeModelErrorCause(message: string): string {
   return safe.slice(0, MAX_MODEL_ERROR_MESSAGE_CHARS) || 'provider request failed';
 }
 
-function sanitizeModelAttemptError(error: unknown): Error {
+function sanitizeModelAttemptError(error: unknown, route?: ModelRoute): Error {
   if (error instanceof ModelRequestError || error instanceof ModelResponseReadError) return error;
   const source = error as {
     name?: unknown;
@@ -173,6 +175,20 @@ function sanitizeModelAttemptError(error: unknown): Error {
   if (typeof source.code === 'string') safe.code = source.code;
   if (source.retryable === true || isRetryableModelError(error)) safe.retryable = true;
   if (source.usage && typeof source.usage === 'object') safe.usage = source.usage as TextGenerationUsage;
+  if (!route) return safe;
+
+  // SDK transports (Anthropic, MiniMax) throw their own error classes. Give
+  // them the same route-aware shape the HTTP routes produce, and treat an
+  // error that carries an HTTP status as a rejected request: nothing was
+  // generated, so its usage is an explicit zero rather than unknown.
+  const status = safe.status ?? safe.statusCode;
+  if (typeof status === 'number') {
+    const named = new ModelRequestError(route, status, safe.message, safe.usage ?? rejectedRequestUsage(route));
+    if (safe.code) (named as Error & { code?: string }).code = safe.code;
+    if (safe.retryable) (named as Error & { retryable?: boolean }).retryable = true;
+    return named;
+  }
+  safe.message = `${route.provider}/${route.model} request failed: ${safe.message}`;
   return safe;
 }
 
@@ -498,7 +514,7 @@ export async function withModelRetry<T>(
       }
       const failure = options.signal?.aborted
         ? modelAbortReason(options.signal)
-        : sanitizeModelAttemptError(error);
+        : sanitizeModelAttemptError(error, options.route);
       await runModelAttemptHook(
         'onAttemptFailure',
         () => options.onAttemptFailure?.(attemptNumber, failure),
@@ -1003,6 +1019,7 @@ function generationRetryOptions(
   return {
     signal: options.signal,
     maxAttempts: options.maxAttemptsPerRoute,
+    route,
     beforeAttempt: (attemptNumber) =>
       options.beforeAttempt?.(buildGenerationAttempt(route, routeIndex, attemptNumber)),
     onAttemptStart: (attemptNumber) =>
@@ -1032,6 +1049,25 @@ function openAIUsage(
     inputTokens: usage.prompt_tokens,
     outputTokens: usage.completion_tokens,
     totalTokens: usage.total_tokens,
+    provider: route.provider,
+    model: route.model,
+    baseUrl: route.baseUrl,
+  };
+}
+
+/**
+ * Usage for a request the provider rejected with an HTTP error status and no
+ * usage body. Nothing was generated, so the truthful figure is an explicit
+ * zero, not "unknown": an unknown attempt quarantines the whole automation,
+ * which turned every transient 5xx into a paused mission. Ambiguous failures
+ * (a 200 error envelope, a body dying mid-stream, a timeout) keep reporting
+ * no usage and stay quarantined.
+ */
+function rejectedRequestUsage(route: ModelRoute): TextGenerationUsage {
+  return {
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
     provider: route.provider,
     model: route.model,
     baseUrl: route.baseUrl,
@@ -1096,7 +1132,7 @@ async function generateWithOpenAI(
     });
     if (response.status === 429 || response.status >= 500) {
       const failure = await readBoundedModelError(response, route);
-      throw new ModelRequestError(route, response.status, failure.cause, failure.usage);
+      throw new ModelRequestError(route, response.status, failure.cause, failure.usage ?? rejectedRequestUsage(route));
     }
 
     let data: {
@@ -1115,7 +1151,7 @@ async function generateWithOpenAI(
         route,
         response.status,
         data.error?.message || response.statusText,
-        openAIUsage(route, data.usage),
+        openAIUsage(route, data.usage) ?? rejectedRequestUsage(route),
       );
     }
 

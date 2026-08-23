@@ -349,6 +349,29 @@ export async function executeQueryData(
       },
       { now: () => now, signal: input.signal },
     );
+    if (
+      result.ok
+      && result.data.appEntryHistoryComplete === false
+      && result.data.appBaselineListed === false
+      && result.data.appHistoryBeyondWindow === true
+    ) {
+      // A section that has never been compacted has no baseline to stop at,
+      // so a long history can never read completely and nothing downstream
+      // could ever create the first baseline if this read stopped the run.
+      // Proceed with the readable window and say so; the write step
+      // bootstraps a stamped baseline from the same window.
+      return {
+        ...result,
+        data: {
+          ...result.data,
+          warnings: [
+            ...(result.data.warnings ?? []),
+            'This library section has no current-state baseline yet and holds more older findings than one read can cover. ' +
+              'This run used the most recent findings only; the first baseline it records will say which older findings were not folded in.',
+          ],
+        },
+      };
+    }
     if (result.ok && result.data.appEntryHistoryComplete === false) {
       return {
         ok: false,

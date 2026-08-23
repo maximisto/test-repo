@@ -217,6 +217,39 @@ test('a retryable HTTP error reports provider-supplied usage for every billed at
   );
 });
 
+// NF-9 (2026-08-23 re-review): a provider HTTP error status with no usage in
+// the body is a rejected request, not an unknown generation. Reporting it as
+// explicit zero usage lets the retry that follows it settle instead of
+// quarantining the whole automation.
+test('a retryable HTTP error without a usage body reports explicit zero usage, not unknown', async () => {
+  await withOpenAIRouteReturning(
+    () =>
+      new Response(
+        JSON.stringify({ error: { message: 'upstream hiccup' } }),
+        { headers: { 'content-type': 'application/json' }, status: 502, statusText: 'Bad Gateway' },
+      ),
+    async ({ generate, fetchCalls }) => {
+      const failedUsages: Array<import('../src/models').TextGenerationUsage | undefined> = [];
+      await assert.rejects(generate({
+        onAttemptFailure: (_attempt, _error, usage) => {
+          failedUsages.push(usage);
+        },
+      }), /upstream hiccup/);
+
+      assert.equal(failedUsages.length, fetchCalls());
+      assert.ok(failedUsages.length >= 2, 'the transient failure should retry');
+      for (const usage of failedUsages) {
+        assert.deepEqual(
+          { input: usage?.inputTokens, output: usage?.outputTokens, total: usage?.totalTokens },
+          { input: 0, output: 0, total: 0 },
+          'a rejected request generated nothing',
+        );
+        assert.equal(usage?.provider, 'openai');
+      }
+    },
+  );
+});
+
 test('an oversized retryable error preserves its bounded cause and usage fields', async () => {
   await withOpenAIRouteReturning(
     () =>

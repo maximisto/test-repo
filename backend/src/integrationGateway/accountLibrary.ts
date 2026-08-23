@@ -265,6 +265,27 @@ export interface AccountLibrarySnapshot {
    */
   appEntryHistoryComplete?: boolean;
   /**
+   * Whether any baseline file (readable or not) appeared in the listing this
+   * read walked. False means the section has never been compacted: the
+   * legacy case where an incomplete history has no baseline to stop at and
+   * the write lane may bootstrap one from the readable window.
+   */
+  appBaselineListed?: boolean;
+  /**
+   * True when older Violema-written history exists that this read could
+   * not reach: the listing continued past the page, or the shared history
+   * byte budget ran out before a readable baseline. Distinct from a memo
+   * that is unreadable on its own (oversized, download failed), which no
+   * wider window would fix.
+   */
+  appHistoryBeyondWindow?: boolean;
+  /**
+   * Honest, operator-facing caveats about this read that did not stop it,
+   * e.g. older findings left outside the window of a never-baselined
+   * section. Ride the run's warning pipeline like the sweep's warnings.
+   */
+  warnings?: string[];
+  /**
    * The folder-drop sweep's own verdict for this read: whether the platform
    * reader could see the library folder at all, and any named skips
    * (unsupported file, share problem, cap). Optional and additive.
@@ -1058,7 +1079,9 @@ export async function readLibrary(
     return libraryFailure('integration_query_failed', 'Drive returned an invalid file listing.');
   }
   let files = initialListedFiles.slice(0, limit);
-  let listingHasMore = Boolean(initialNextPage.value) || initialListedFiles.length > limit;
+  // A full page may have history behind it even when the partner omits
+  // Drive's nextPageToken; only a short page proves the listing is complete.
+  let listingHasMore = Boolean(initialNextPage.value) || initialListedFiles.length >= limit;
   const appEntries: AccountLibraryEntry[] = [];
   // App entries fill whatever budget the operator sweep above left behind, so
   // the two origins share one ceiling instead of each getting a full one.
@@ -1066,6 +1089,7 @@ export async function readLibrary(
 
   let unreadableBaselineSeen = false;
   let readableBaselineFound = false;
+  let appHistoryBeyondBudget = false;
   let recoveryListingLoaded = false;
   const loadRecoveryListing = async (): Promise<LibraryFailure | null> => {
     const recoveryListing = await listSectionFiles(MAX_LIBRARY_HISTORY_RECOVERY_FILES);
@@ -1077,7 +1101,7 @@ export async function readLibrary(
     }
     files = recoveryListedFiles.slice(0, MAX_LIBRARY_HISTORY_RECOVERY_FILES);
     listingHasMore = Boolean(recoveryNextPage.value)
-      || recoveryListedFiles.length > MAX_LIBRARY_HISTORY_RECOVERY_FILES;
+      || recoveryListedFiles.length >= MAX_LIBRARY_HISTORY_RECOVERY_FILES;
     recoveryListingLoaded = true;
     return null;
   };
@@ -1170,6 +1194,17 @@ export async function readLibrary(
     if (body.content && knownContent === undefined) {
       remainingBudget -= Buffer.byteLength(body.content, 'utf8');
     }
+    // A memo cut because the shared history budget (not its own size cap)
+    // ran out is history beyond this read's window, which only a baseline
+    // can compact. An oversized memo is unreadable regardless of budget.
+    if (
+      !isBaseline
+      && body.truncated
+      && knownContent === undefined
+      && fileBudget < maxAppEntryContentBytes
+    ) {
+      appHistoryBeyondBudget = true;
+    }
 
     appEntries.push({
       fileId,
@@ -1219,6 +1254,8 @@ export async function readLibrary(
       appEntryHistoryComplete:
         (readableBaselineFound || !listingHasMore)
         && requiredAppSourcesReadable,
+      appBaselineListed: files.some((file) => typeof file.name === 'string' && isLibraryBaselineFileName(file.name)),
+      appHistoryBeyondWindow: !readableBaselineFound && (listingHasMore || appHistoryBeyondBudget),
       sweep,
     },
     now,

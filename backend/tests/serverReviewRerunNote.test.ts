@@ -201,9 +201,13 @@ function seedNotedRun(
   return { task, run };
 }
 
-test('a dry-run is inert and a forecast-only affordable rerun is refused synchronously', async (t) =>
+// NF-1 (2026-08-23 re-review): a rerun reserves the estimate like any other
+// run. The synchronous refusal is for a workspace that cannot afford the
+// estimate, not one that merely cannot afford the hard single-attempt
+// envelope (which refused every trial and Start workspace).
+test('a dry-run is inert and an unaffordable rerun is refused synchronously', async (t) =>
   withRerunServer(t, async ({ baseUrl, sessionToken, automationId, workspaceId, store }) => {
-    const { task, run } = seedNotedRun(store, { workspaceId, automationId, credits: 100 });
+    const { task, run } = seedNotedRun(store, { workspaceId, automationId, credits: 1 });
 
     const response = await fetch(`${baseUrl}/api/automations/${automationId}/reviews/${run.id}/rerun`, {
       method: 'POST',
