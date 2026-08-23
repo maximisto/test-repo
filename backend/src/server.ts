@@ -428,8 +428,6 @@ const AUTOMATION_STEP_BILLABLE_DURATION_SECONDS = Math.max(
 // unbudgeted holds grow atomically and mission budgets stop before overspend.
 const AUTOMATION_GENERATION_ATTEMPTS_PER_ROUTE = 2;
 const AUTOMATION_GENERATION_ROUTE_LIMIT = 2;
-const MANUAL_GENERATION_ATTEMPTS_PER_ROUTE = 1;
-const MANUAL_GENERATION_ROUTE_LIMIT = 1;
 const AUTOMATION_CREDIT_HOLD_LEASE_MS = Math.max(
   60 * 60 * 1000,
   AUTOMATION_STEP_TIMEOUT_MS * 3,
@@ -4505,6 +4503,38 @@ function buildRuntimeCreditBudgetBlock(input: {
   };
 }
 
+/**
+ * The pause an unbudgeted run takes when the workspace cannot reserve the
+ * next call's maximum. Same shape as the per-run budget block so the run
+ * settles and surfaces identically; only the cause and the next action
+ * differ, because there is no budget to raise.
+ */
+function buildRuntimeWorkspaceCreditBlock(input: {
+  automationName: string;
+  budgetCredits: number;
+  projectedCredits: number;
+  operationCredits: number;
+  purpose: string;
+  reason: string;
+}): RuntimeCreditBudgetBlock {
+  const remainingCredits = Math.max(0, input.budgetCredits - (input.projectedCredits - input.operationCredits));
+  return {
+    code: CREDIT_BUDGET_EXCEEDED_CODE,
+    budgetCredits: input.budgetCredits,
+    projectedCredits: input.projectedCredits,
+    remainingCredits,
+    operationCredits: input.operationCredits,
+    purpose: input.purpose,
+    summary:
+      `${input.automationName} paused before ${input.purpose}: ` +
+      (input.operationCredits > 0
+        ? `the next billable operation could require ${input.operationCredits} credits`
+        : 'its projected charges would exceed the reserved credits') +
+      ` and the workspace could not reserve them (${input.reason.replace(/\.$/, '')}). ` +
+      'Nothing more was spent. Add credits or upgrade the plan, then rerun.',
+  };
+}
+
 function ensureAutomationSummaryStep(
   automation: { id: string },
   steps: AutomationStepDefinition[],
@@ -5415,7 +5445,24 @@ async function executeAutomationCore(
     const projectedCredits = alreadyCommittedCredits + operationCredits;
     if (projectedCredits <= budgetCredits) return;
     if (runContext.extendCreditAuthorization) {
-      budgetCredits = runContext.extendCreditAuthorization(projectedCredits);
+      try {
+        budgetCredits = runContext.extendCreditAuthorization(projectedCredits);
+      } catch (error) {
+        // The workspace balance, not an operator budget, is what ran out.
+        // Pause as an honest credit block so the run settles and the
+        // operator is pointed at credits rather than at a budget knob they
+        // never set.
+        const block = buildRuntimeWorkspaceCreditBlock({
+          automationName: automation.name,
+          budgetCredits,
+          projectedCredits,
+          operationCredits,
+          purpose,
+          reason: error instanceof Error ? error.message : String(error),
+        });
+        creditBudgetBlock = block;
+        throw new RuntimeCreditBudgetError(block);
+      }
       runContext.creditBudgetCredits = budgetCredits;
       if (projectedCredits <= budgetCredits) return;
     }
@@ -7555,15 +7602,13 @@ function acquireManualRunCreditAuthorization(
       }),
     };
   }
-  // An operator-triggered run receives a truthful synchronous answer. Without
-  // an explicit mission ceiling, reserve the hard single-attempt envelope and
-  // constrain the provider to exactly that reachable policy. Background runs
-  // retain bounded retries and extend at exact call boundaries; a budgeted
-  // manual run already reserves the full operator-approved ceiling.
-  const authorizedCredits = perRunBudget ?? Math.max(
-    authorizationCredits,
-    plan.manualAuthorizationCredits,
-  );
+  // An operator-triggered run reserves what a scheduled run reserves: the
+  // estimate-sized authorization, extended at exact call boundaries against
+  // the byte-safe per-call gate. Reserving the hard single-attempt envelope
+  // here instead (6x to 14x the card estimate) refused every trial and Start
+  // workspace while the scheduler ran the same mission fine. A budgeted
+  // manual run still reserves the full operator-approved ceiling.
+  const authorizedCredits = perRunBudget ?? authorizationCredits;
   try {
     const hold = acquireCreditHold({
       workspaceId,
@@ -7581,12 +7626,6 @@ function acquireManualRunCreditAuthorization(
         estimatedCredits,
         authorizedCredits,
         hold,
-        ...(perRunBudget === null
-          ? {
-              generationMaxAttemptsPerRoute: MANUAL_GENERATION_ATTEMPTS_PER_ROUTE,
-              generationMaxRoutes: MANUAL_GENERATION_ROUTE_LIMIT,
-            }
-          : {}),
       },
     };
   } catch (error) {
@@ -8241,7 +8280,9 @@ export async function runAutomation(automation: {
       ...(suppliedGenerationMaxRoutes
         ? { generationMaxRoutes: suppliedGenerationMaxRoutes }
         : {}),
-      ...(perRunBudget === null && !suppliedAuthorizationMatches
+      // A supplied operator authorization is the same estimate-sized hold a
+      // scheduled run acquires, so it extends the same way.
+      ...(perRunBudget === null
         ? {
             extendCreditAuthorization: (requiredCredits: number) => {
               if (!creditHold) throw new Error('Automation credit authorization is unavailable.');

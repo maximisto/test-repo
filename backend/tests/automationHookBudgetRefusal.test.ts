@@ -53,9 +53,12 @@ test('a budget refusal inside a retry attempt hook still fails the step as a bud
         }), { headers: { 'content-type': 'application/json' }, status: 200 });
       }
       if (providerCalls === 2) {
-        // The extraction's first physical attempt dies without usage, so its
-        // full authorization stays committed and the retry cannot fit.
-        return new Response(JSON.stringify({ error: { message: 'upstream provider died during generation' } }), {
+        // The extraction's first physical attempt dies after the provider
+        // billed a large prompt, so the retry cannot fit the mission budget.
+        return new Response(JSON.stringify({
+          error: { message: 'upstream provider died during generation' },
+          usage: { prompt_tokens: 30_000, completion_tokens: 0, total_tokens: 30_000 },
+        }), {
           headers: { 'content-type': 'application/json' },
           status: 502,
         });

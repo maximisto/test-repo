@@ -21,6 +21,8 @@ test('manual run returns the mission-budget refusal synchronously and never trig
   const originalDisableScheduler = process.env.VIOLEMA_DISABLE_AUTOMATION_SCHEDULER;
   const originalDemoIds = process.env.DEMO_WORKSPACE_IDS;
   const originalOpenRouter = process.env.OPENROUTER_API_KEY;
+  const originalFetch = global.fetch;
+  const originalRetryDelays = process.env.MODEL_RETRY_DELAYS_MS;
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'violema-mission-budget-route-'));
   let listening: http.Server | null = null;
 
@@ -29,6 +31,7 @@ test('manual run returns the mission-budget refusal synchronously and never trig
     process.env.VIOLEMA_APPROVED_EMAILS = 'budget-qa@example.com';
     process.env.VIOLEMA_DISABLE_AUTOMATION_SCHEDULER = '1';
     process.env.OPENROUTER_API_KEY = 'test-key-route-readiness';
+    process.env.MODEL_RETRY_DELAYS_MS = '1';
 
     const server = await import('../src/server');
     const auth = await import('../src/auth');
@@ -121,6 +124,10 @@ test('manual run returns the mission-budget refusal synchronously and never trig
       'the async runner was never invoked',
     );
 
+    // NF-1 (2026-08-23 re-review): an unbudgeted manual run reserves the
+    // estimate and extends at call boundaries like a scheduled run. It must
+    // not demand the hard single-attempt envelope up front, which refused
+    // every trial (500) and Start (2,000) workspace, and it keeps retries.
     const hardEnvelopeAutomation = scheduler.createAutomation(
       {
         workspaceId: user.defaultWorkspaceId,
@@ -147,9 +154,27 @@ test('manual run returns the mission-budget refusal synchronously and never trig
     );
     const hardPlan = server.buildAutomationExecutionPlan(hardEnvelopeAutomation);
     assert.ok(hardPlan.estimatedCredits < 1_000, 'the forecast fits the workspace balance');
-    assert.ok(hardPlan.manualAuthorizationCredits > 1_000, 'the reachable hard envelope does not');
-    const runsBeforeHardEnvelope = store.listTaskRuns(user.defaultWorkspaceId).length;
+    assert.ok(hardPlan.manualAuthorizationCredits > 1_000, 'the hard single-attempt envelope does not');
 
+    let providerCalls = 0;
+    global.fetch = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+      const url = String(input);
+      if (!url.includes('/chat/completions')) return originalFetch(input, init);
+      providerCalls += 1;
+      if (providerCalls === 1) {
+        // One transient provider failure: a manual run keeps its retry.
+        return new Response(JSON.stringify({ error: { message: 'upstream hiccup' } }), {
+          headers: { 'content-type': 'application/json' },
+          status: 502,
+        });
+      }
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: '# Brief\n\nThe evidence supports one move this week.' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 1_500, completion_tokens: 200, total_tokens: 1_700 },
+      }), { headers: { 'content-type': 'application/json' }, status: 200 });
+    }) as typeof fetch;
+
+    const runsBeforeHardEnvelope = store.listTaskRuns(user.defaultWorkspaceId).length;
     const hardResponse = await fetch(
       `http://127.0.0.1:${address.port}/api/automations/${hardEnvelopeAutomation.id}/run`,
       {
@@ -161,15 +186,34 @@ test('manual run returns the mission-budget refusal synchronously and never trig
       },
     );
     const hardPayload = await hardResponse.json() as Record<string, unknown>;
-    assert.equal(hardResponse.status, 409);
-    assert.equal(hardPayload.code, 'insufficient_credits');
-    assert.ok(Number(hardPayload.requiredCredits) >= hardPlan.manualAuthorizationCredits);
+    assert.equal(hardResponse.status, 200, `expected the run to start, got ${JSON.stringify(hardPayload)}`);
+    assert.equal(hardPayload.ok, true);
     assert.equal(
       store.listTaskRuns(user.defaultWorkspaceId).length,
-      runsBeforeHardEnvelope,
-      'forecast-only affordability never acknowledges or starts the run',
+      runsBeforeHardEnvelope + 1,
+      'the estimate-sized authorization starts the run',
     );
+
+    const findHardRun = () => store.listTaskRuns(user.defaultWorkspaceId)
+      .find((run) => run.metadata?.automationId === hardEnvelopeAutomation.id);
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline && ['running', 'queued', 'pending'].includes(String(findHardRun()?.status))) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    const hardRun = findHardRun();
+    assert.ok(hardRun);
+    assert.equal(hardRun.status, 'succeeded', `run ended ${hardRun.status}: ${hardRun.error ?? ''}`);
+    assert.equal(providerCalls, 3, 'analysis retried once after the 502, then the summary ran');
+    assert.ok(Number(hardRun.actualCredits) < hardPlan.manualAuthorizationCredits);
+    const settlement = store.listLedgerEntries(user.defaultWorkspaceId).find((entry) =>
+      entry.metadata?.holdStatus === 'settled' && entry.referenceId === hardEnvelopeAutomation.id
+    );
+    assert.ok(settlement, 'the operator hold settles at actual usage');
+    assert.ok(Math.abs(settlement.deltaCredits) <= Number(hardRun.actualCredits));
   } finally {
+    global.fetch = originalFetch;
+    if (typeof originalRetryDelays === 'string') process.env.MODEL_RETRY_DELAYS_MS = originalRetryDelays;
+    else delete process.env.MODEL_RETRY_DELAYS_MS;
     await closeServer(listening);
     process.chdir(originalCwd);
     if (typeof originalApproved === 'string') process.env.VIOLEMA_APPROVED_EMAILS = originalApproved;
