@@ -402,6 +402,62 @@ test('baseline recovery widens past the normal window and preserves every unbase
   assert.equal(drive.created.length, 1, 'the complete recovered history may establish a new baseline');
 });
 
+// NF-4 (2026-08-23 re-review): the completeness proof must not rest on the
+// partner echoing Drive's nextPageToken. A full page with no token may still
+// have history behind it.
+test('a full listing page without a page token is not treated as complete history', async () => {
+  const drive = createFakeDrive(
+    Array.from({ length: 12 }, (_, index) => ({
+      id: `memo-${index + 1}`,
+      name: `2026-08-${String(22 - index).padStart(2, '0')} — Findings ${index + 1}.md`,
+      content: `Unbaselined fact ${index + 1}.`,
+    })),
+  );
+  const executeWithoutPageTokens: PartnerComposioExecutor = async (actionName, input, options) => {
+    const result = await drive.execute(actionName, input, options) as {
+      successful?: boolean;
+      data?: Record<string, unknown>;
+    };
+    if (actionName === 'GOOGLEDRIVE_FIND_FILE' && result.successful && result.data) {
+      const { nextPageToken: _dropped, ...rest } = result.data;
+      return { ...result, data: rest };
+    }
+    return result;
+  };
+  let mergePrompt = '';
+
+  const snapshot = await readLibrary(
+    'ws_test',
+    SECTION,
+    { limit: 10, includeOperatorFiles: false },
+    { execute: executeWithoutPageTokens, fetchText: drive.fetchText },
+  );
+  assert.equal(snapshot.ok, true);
+  if (!snapshot.ok) return;
+  assert.equal(snapshot.data.appEntryHistoryComplete, false, 'a full first page cannot certify the history complete');
+
+  const result = await updateLibraryBaseline(
+    {
+      workspaceId: 'ws_test',
+      section: SECTION,
+      latestFindingsMarkdown: 'Unbaselined fact 1.',
+      untrustedRule: RULE,
+      neutralize: NEUTRALIZE,
+    },
+    {
+      execute: executeWithoutPageTokens,
+      fetchText: drive.fetchText,
+      generate: (async (_profile: string, _system: string, messages: Array<{ content: unknown }>) => {
+        mergePrompt = String(messages[0]?.content ?? '');
+        return 'Complete recovered digest.';
+      }) as never,
+    },
+  );
+
+  assert.equal(result.ok, true, `expected recovery success, got: ${JSON.stringify(result)}`);
+  assert.match(mergePrompt, /Unbaselined fact 12\./, 'the merge sees every memo, not just the first page');
+});
+
 test('seeded read-write flow prevents soft refresh failures from growing an unrecoverable backlog', async () => {
   const drive = createFakeDrive([{
     id: 'baseline-seed',

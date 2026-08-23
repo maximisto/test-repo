@@ -1058,7 +1058,9 @@ export async function readLibrary(
     return libraryFailure('integration_query_failed', 'Drive returned an invalid file listing.');
   }
   let files = initialListedFiles.slice(0, limit);
-  let listingHasMore = Boolean(initialNextPage.value) || initialListedFiles.length > limit;
+  // A full page may have history behind it even when the partner omits
+  // Drive's nextPageToken; only a short page proves the listing is complete.
+  let listingHasMore = Boolean(initialNextPage.value) || initialListedFiles.length >= limit;
   const appEntries: AccountLibraryEntry[] = [];
   // App entries fill whatever budget the operator sweep above left behind, so
   // the two origins share one ceiling instead of each getting a full one.
@@ -1077,7 +1079,7 @@ export async function readLibrary(
     }
     files = recoveryListedFiles.slice(0, MAX_LIBRARY_HISTORY_RECOVERY_FILES);
     listingHasMore = Boolean(recoveryNextPage.value)
-      || recoveryListedFiles.length > MAX_LIBRARY_HISTORY_RECOVERY_FILES;
+      || recoveryListedFiles.length >= MAX_LIBRARY_HISTORY_RECOVERY_FILES;
     recoveryListingLoaded = true;
     return null;
   };
