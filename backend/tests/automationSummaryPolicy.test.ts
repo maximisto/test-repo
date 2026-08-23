@@ -223,6 +223,26 @@ test('summary and memo word limits are deterministic across markdown and Unicode
   );
 });
 
+// NF-7 (2026-08-23 re-review): scripts written without spaces must not count
+// as one word. Each CJK character is counted, which overcounts and so fails
+// closed, consistent with the rest of the counter.
+test('unspaced CJK text cannot bypass the word limit', () => {
+  const han = '市场竞争分析'.repeat(400); // 2,400 Han characters, no spaces
+  assert.ok(countAutomationWords(han) >= 2_000, 'each Han character counts, not the whole run as one word');
+  assert.throws(
+    () => requireCompleteAutomationSummary({ text: han, stopReason: 'stop' }),
+    /over the 650-word limit/i,
+  );
+
+  const mixed = '竞争对手 Alpha 提价 10%';
+  assert.equal(countAutomationWords(mixed), 4 + 1 + 2 + 1, 'Han characters, a Latin word, Han characters, a number');
+
+  const kana = 'きょうそうぶんせき'.repeat(100);
+  assert.ok(countAutomationWords(kana) >= 900, 'kana are counted per character too');
+  const hangul = '경쟁분석'.repeat(200);
+  assert.ok(countAutomationWords(hangul) >= 800, 'Hangul syllables are counted per character');
+});
+
 test('the memo validator enforces the 350-word delivery contract', () => {
   const words = (count: number) => Array.from({ length: count }, (_, index) => `memo${index + 1}`).join(' ');
 

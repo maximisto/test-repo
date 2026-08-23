@@ -138,11 +138,24 @@ export function requireBoundedAutomationOutput(
   return text;
 }
 
+/**
+ * Scripts that do not separate words with spaces. Counting each character as
+ * a word overcounts (Chinese averages under two characters per word), which
+ * fails closed like the rest of this counter; the alternative, one "word"
+ * per unbroken run, let a 9,000-character brief pass a 650-word limit.
+ */
+const UNSPACED_SCRIPT_CHARACTER =
+  /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\p{Script=Thai}\p{Script=Lao}\p{Script=Khmer}\p{Script=Myanmar}]/gu;
+
 export function countAutomationWords(text: string): number {
   const visibleMarkdown = text
     .replace(/\[([^\]]+)\]\((?:[^()]|\([^)]*\))+\)/gu, '$1')
     .replace(/https?:\/\/\S+/giu, ' ');
-  return visibleMarkdown.match(/[\p{L}\p{N}]+(?:['’\-][\p{L}\p{N}]+)*/gu)?.length ?? 0;
+  const unspacedCharacters = visibleMarkdown.match(UNSPACED_SCRIPT_CHARACTER)?.length ?? 0;
+  const spacedWords = visibleMarkdown
+    .replace(UNSPACED_SCRIPT_CHARACTER, ' ')
+    .match(/[\p{L}\p{N}]+(?:['’\-][\p{L}\p{N}]+)*/gu)?.length ?? 0;
+  return unspacedCharacters + spacedWords;
 }
 
 /**
