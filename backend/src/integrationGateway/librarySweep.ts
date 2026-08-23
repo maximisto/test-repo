@@ -99,7 +99,12 @@ export const SWEEP_COMPOSIO_MAX_PAGES = 10;
 export const SWEEP_MEMO_MAX_ENTRIES = 50;
 export const SWEEP_MEMO_TTL_MS = 15 * 60 * 1000;
 
-export type FolderDropLaneState = 'not_configured' | 'no_library_yet' | 'needs_share' | 'active';
+export type FolderDropLaneState =
+  | 'not_configured'
+  | 'no_library_yet'
+  | 'needs_share'
+  | 'unavailable'
+  | 'active';
 
 export interface LibrarySweepDeps {
   /** Test seam. Default: built from `readDriveReaderConfig()`; `null` when the lane is unconfigured. */
@@ -107,6 +112,7 @@ export interface LibrarySweepDeps {
   /** Composio executor seam. Default: the real bridge. */
   execute?: PartnerComposioExecutor;
   now?: () => Date;
+  signal?: AbortSignal;
 }
 
 export interface OperatorSourceEntry {
@@ -209,7 +215,7 @@ export async function shareLibraryFolderWithReader(
         email_address: readerEmail,
         send_notification_email: false,
       },
-      { entityId: workspaceId },
+      { entityId: workspaceId, signal: deps.signal },
     );
     if (!isRecord(response) || (response as ComposioEnvelope).successful !== true) {
       const failureDetail = isRecord(response) ? (response as ComposioEnvelope).error : 'share failed';
@@ -224,7 +230,7 @@ export async function shareLibraryFolderWithReader(
 // --- lane state -----------------------------------------------------------------
 
 /**
- * The four buckets, named explicitly.
+ * The five buckets, named explicitly.
  *
  * `needs_share` is the only state that produces an operator-facing
  * instruction ("re-share your Violema Library folder"). Everything that is
@@ -244,8 +250,9 @@ export async function shareLibraryFolderWithReader(
  *       project, the service account suspended, an org-policy change.
  *       `timedFetch` maps every non-ok Drive status to `http_error`, so the
  *       CODE cannot separate these; the STATUS can.
- *     · `timeout` / `too_large` — transient or platform-bound, never
- *       something re-sharing a folder would fix.
+ * - `unavailable`: the configured reader hit a transient/platform-bound
+ *   failure (timeout, response bound, transport failure, rate limit, or
+ *   Drive 5xx). Retrying later is actionable; re-sharing is not.
  * - `no_library_yet`: a reader IS configured, but `rootFolderId` is null —
  *   this workspace's `Violema Library` folder does not exist yet (it is
  *   created lazily on the first library write). Nothing has ever been
@@ -270,9 +277,21 @@ export async function shareLibraryFolderWithReader(
  */
 function laneStateForDriveReaderError(error: DriveReaderError): FolderDropLaneState {
   if (error.code === 'auth_failed') return 'not_configured';
-  if (error.code === 'timeout' || error.code === 'too_large') return 'not_configured';
-  if (error.status === 401 || error.status === 403) return 'not_configured';
-  return 'needs_share';
+  if (error.status === 401) return 'not_configured';
+  if (error.status === 403) {
+    const reason = error.reason || '';
+    if (/rate.?limit|quota|daily.?limit/i.test(reason)) return 'unavailable';
+    if (/insufficientFilePermissions|appNotAuthorizedToFile|notAuthorizedToFile|forbiddenForFile/i.test(reason)) {
+      return 'needs_share';
+    }
+    // Project/API disablement, org policy, and credential-level 403s are
+    // server configuration problems. Unknown 403s stay here rather than
+    // instructing an operator to re-share without evidence that sharing is
+    // actually the failing boundary.
+    return 'not_configured';
+  }
+  if (error.status === 404) return 'needs_share';
+  return 'unavailable';
 }
 
 export async function getFolderDropLaneState(
@@ -294,7 +313,7 @@ export async function getFolderDropLaneState(
     // The access probe, deliberately NOT `listFolderTree`: Drive returns
     // HTTP 200 with an empty file list for a folder the caller cannot see,
     // so a child listing can never tell "empty" apart from "inaccessible."
-    await reader.getFolderMeta(rootFolderId);
+    await reader.getFolderMeta(rootFolderId, deps.signal);
     return 'active';
   } catch (error) {
     if (!(error instanceof DriveReaderError)) throw error;
@@ -325,19 +344,23 @@ function readListingContainer(payload: unknown): Record<string, unknown> | unkno
     : (payload as Record<string, unknown> | unknown[]);
 }
 
-function readListingFiles(payload: unknown): Record<string, unknown>[] {
+function readListingFiles(payload: unknown): Record<string, unknown>[] | null {
   const container = readListingContainer(payload);
   const raw = Array.isArray(container)
     ? container
     : isRecord(container) && Array.isArray(container.files)
       ? container.files
-      : [];
-  return raw.filter(isRecord);
+      : null;
+  if (!raw || raw.some((file) => !isRecord(file) || !asString(file.id))) return null;
+  return raw;
 }
 
-function readListingNextPageToken(payload: unknown): string | undefined {
+function readListingNextPageToken(payload: unknown): { valid: true; value?: string } | { valid: false } {
   const container = readListingContainer(payload);
-  return isRecord(container) ? asString(container.nextPageToken) : undefined;
+  if (!isRecord(container)) return { valid: true };
+  if (!('nextPageToken' in container) || container.nextPageToken === undefined) return { valid: true };
+  const value = asString(container.nextPageToken);
+  return value ? { valid: true, value } : { valid: false };
 }
 
 /** Drive query strings are single-quoted, so quotes and backslashes must escape. */
@@ -381,6 +404,7 @@ async function listComposioVisibleFileIds(
   execute: PartnerComposioExecutor,
   workspaceId: string,
   folderIds: Iterable<string>,
+  signal?: AbortSignal,
 ): Promise<ComposioVisibleListing> {
   const visible = new Set<string>();
   const reconciledFolderIds = new Set<string>();
@@ -414,7 +438,7 @@ async function listComposioVisibleFileIds(
 
       let response: unknown;
       try {
-        response = await execute(FIND_FILE_ACTION, input, { entityId: workspaceId });
+        response = await execute(FIND_FILE_ACTION, input, { entityId: workspaceId, signal });
       } catch {
         throw new LibrarySweepError('Folder drop: the Composio listing failed.');
       }
@@ -424,11 +448,16 @@ async function listComposioVisibleFileIds(
       }
 
       const envelope = response as ComposioEnvelope;
-      for (const file of readListingFiles(envelope.data)) {
+      const files = readListingFiles(envelope.data);
+      const nextPage = readListingNextPageToken(envelope.data);
+      if (!files || !nextPage.valid) {
+        throw new LibrarySweepError('Folder drop: the Composio listing returned an invalid response.');
+      }
+      for (const file of files) {
         const id = asString(file.id);
         if (id) visible.add(id);
       }
-      pageToken = readListingNextPageToken(envelope.data);
+      pageToken = nextPage.value;
     } while (pageToken);
 
     if (completed) reconciledFolderIds.add(folderId);
@@ -496,6 +525,7 @@ async function resolveFileText(
   maxBytes: number,
   isGoogleDoc: boolean,
   nowMs: number,
+  signal?: AbortSignal,
 ): Promise<{ text: string | null; truncated: boolean; contentError?: string }> {
   const key = memoKeyFor(file);
   const cached = readSweepMemo(key, nowMs);
@@ -521,13 +551,13 @@ async function resolveFileText(
   let parsed;
   try {
     if (isGoogleDoc) {
-      const exported = await reader.exportDoc(file.id);
+      const exported = await reader.exportDoc(file.id, signal);
       parsed = await parseSourceBuffer(
         { fileName: file.name, mimeType: 'text/plain', buffer: Buffer.from(exported, 'utf8') },
         maxBytes,
       );
     } else {
-      const buffer = await reader.downloadFile(file.id);
+      const buffer = await reader.downloadFile(file.id, signal);
       parsed = await parseSourceBuffer({ fileName: file.name, mimeType: file.mimeType, buffer }, maxBytes);
     }
   } catch (error) {
@@ -597,7 +627,7 @@ export async function sweepOperatorFiles(
   // failure this module exists to prevent. `getFolderMeta` genuinely
   // 404s/403s when the reader lacks access.
   try {
-    await reader.getFolderMeta(input.rootFolderId);
+    await reader.getFolderMeta(input.rootFolderId, deps.signal);
   } catch (error) {
     if (!(error instanceof DriveReaderError)) throw error;
     return { laneState: laneStateForDriveReaderError(error), entries: [], warnings: [] };
@@ -605,7 +635,7 @@ export async function sweepOperatorFiles(
 
   let tree: DriveFolderTree;
   try {
-    tree = await reader.listFolderTree(input.rootFolderId);
+    tree = await reader.listFolderTree(input.rootFolderId, deps.signal);
   } catch (error) {
     if (!(error instanceof DriveReaderError)) throw error;
     return { laneState: laneStateForDriveReaderError(error), entries: [], warnings: [] };
@@ -625,7 +655,12 @@ export async function sweepOperatorFiles(
   // Throws LibrarySweepError on a rejected or malformed listing. Running out
   // of page budget is NOT that: it reports which folders it managed to
   // reconcile, and classification below is confined to exactly those.
-  const listing = await listComposioVisibleFileIds(execute, input.workspaceId, folderIds);
+  const listing = await listComposioVisibleFileIds(
+    execute,
+    input.workspaceId,
+    folderIds,
+    deps.signal,
+  );
   if (listing.unreconciledFolderIds.length > 0) {
     warnings.push(
       `Folder drop: ${listing.unreconciledFolderIds.length} folder(s) were not read this run (the ${SWEEP_COMPOSIO_MAX_PAGES}-page listing budget ran out); any files inside them were skipped.`,
@@ -659,6 +694,7 @@ export async function sweepOperatorFiles(
   const starvedFileNames: string[] = [];
 
   for (const file of selected) {
+    deps.signal?.throwIfAborted();
     const isGoogleDoc = file.mimeType === GOOGLE_DOC_MIME_TYPE;
 
     // The two free screens first: neither spends budget, and both already
@@ -702,7 +738,14 @@ export async function sweepOperatorFiles(
     // every later file. Same `MAX_ENTRY_CONTENT_BYTES` the app-entry path
     // applies, so neither origin can monopolize the shared ceiling.
     const perFileBudget = Math.min(MAX_ENTRY_CONTENT_BYTES, remainingBudget);
-    const body = await resolveFileText(reader, file, perFileBudget, isGoogleDoc, nowMs);
+    const body = await resolveFileText(
+      reader,
+      file,
+      perFileBudget,
+      isGoogleDoc,
+      nowMs,
+      deps.signal,
+    );
     if (body.text !== null) {
       remainingBudget -= Buffer.byteLength(body.text, 'utf8');
     }

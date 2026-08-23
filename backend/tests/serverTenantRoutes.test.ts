@@ -806,6 +806,171 @@ test('beta auth policy gates Terms and trials before tenant routes', async () =>
   const aliceCreatedPayload = await readJson(aliceCreatedAutomation);
   assert.equal((aliceCreatedPayload.item as { owner_user_id?: string }).owner_user_id, alice.id);
 
+  const tooManySteps = Array.from({ length: 25 }, (_, index) => ({
+    id: `step_${index + 1}`,
+    kind: 'note',
+    objective: `Keep operator-authored step ${index + 1}.`,
+  }));
+  const rejectedStepCreate = await fetch(`${baseUrl}/api/automations`, {
+    method: 'POST',
+    headers: { ...aliceHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      name: 'Must not lose step 25',
+      schedule: 'daily at 12pm',
+      steps: tooManySteps,
+    }),
+  });
+  assert.equal(rejectedStepCreate.status, 400);
+  assert.match(String((await readJson(rejectedStepCreate)).error), /at most 24 workflow steps/i);
+
+  const rejectedActionCreate = await fetch(`${baseUrl}/api/automations`, {
+    method: 'POST',
+    headers: { ...aliceHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      name: 'Must not lose action 25',
+      schedule: 'daily at 12pm',
+      actions: Array.from({ length: 25 }, (_, index) => `Operator action ${index + 1}`),
+    }),
+  });
+  assert.equal(rejectedActionCreate.status, 400);
+  assert.match(String((await readJson(rejectedActionCreate)).error), /at most 24 workflow steps/i);
+
+  const rejectedMultiDeliveryCreate = await fetch(`${baseUrl}/api/automations`, {
+    method: 'POST',
+    headers: { ...aliceHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      name: 'Must not silently close two deliveries',
+      schedule: 'daily at 12pm',
+      actions: ['Send the brief to Slack', 'Email the brief to the board'],
+    }),
+  });
+  assert.equal(rejectedMultiDeliveryCreate.status, 400);
+  assert.match(String((await readJson(rejectedMultiDeliveryCreate)).error), /one delivery step/i);
+
+  const rejectedQueryArgumentsCreate = await fetch(`${baseUrl}/api/automations`, {
+    method: 'POST',
+    headers: { ...aliceHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      name: 'Must reject impossible Stripe query',
+      schedule: 'daily at 12pm',
+      steps: [{
+        id: 'stripe-typo',
+        kind: 'query',
+        objective: 'Read Stripe revenue.',
+        inputs: { source: 'stripe', query_type: 'typo' },
+      }],
+    }),
+  });
+  assert.equal(rejectedQueryArgumentsCreate.status, 400);
+  assert.match(String((await readJson(rejectedQueryArgumentsCreate)).error), /query_type "typo" is not supported/i);
+
+  const rejectedCaptureArgumentsCreate = await fetch(`${baseUrl}/api/automations`, {
+    method: 'POST',
+    headers: { ...aliceHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      name: 'Must reject missing capture URL',
+      schedule: 'daily at 12pm',
+      steps: [{
+        id: 'capture-missing-url',
+        kind: 'capture',
+        objective: 'Capture the pricing page.',
+        inputs: {},
+      }],
+    }),
+  });
+  assert.equal(rejectedCaptureArgumentsCreate.status, 400);
+  assert.match(String((await readJson(rejectedCaptureArgumentsCreate)).error), /needs a public http or https URL/i);
+
+  const rejectedOrderingCreate = await fetch(`${baseUrl}/api/automations`, {
+    method: 'POST',
+    headers: { ...aliceHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      name: 'Must not deliver before evidence',
+      schedule: 'daily at 12pm',
+      steps: [
+        {
+          id: 'deliver-first',
+          kind: 'deliver',
+          objective: 'Deliver the brief.',
+          deliveryTarget: { channel: 'slack', target: '#ops' },
+        },
+        { id: 'search-late', kind: 'search', objective: 'Research the evidence.' },
+      ],
+    }),
+  });
+  assert.equal(rejectedOrderingCreate.status, 400);
+  assert.match(String((await readJson(rejectedOrderingCreate)).error), /workflow step order/i);
+
+  const aliceAutomationId = (aliceCreatedPayload.item as { id: string }).id;
+  const rejectedStepPatch = await fetch(`${baseUrl}/api/automations/${aliceAutomationId}`, {
+    method: 'PATCH',
+    headers: { ...aliceHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ steps: tooManySteps }),
+  });
+  assert.equal(rejectedStepPatch.status, 400);
+  assert.match(String((await readJson(rejectedStepPatch)).error), /at most 24 workflow steps/i);
+  assert.deepEqual(
+    scheduler.getAutomationById(aliceAutomationId)?.actions,
+    ['Summarize Alice-only data'],
+    'a rejected over-limit patch cannot persist a truncated definition',
+  );
+
+  const rejectedMultiDeliveryPatch = await fetch(`${baseUrl}/api/automations/${aliceAutomationId}`, {
+    method: 'PATCH',
+    headers: { ...aliceHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ actions: ['Post the brief to Slack', 'Notify the board by email'] }),
+  });
+  assert.equal(rejectedMultiDeliveryPatch.status, 400);
+  assert.match(String((await readJson(rejectedMultiDeliveryPatch)).error), /one delivery step/i);
+  assert.deepEqual(
+    scheduler.getAutomationById(aliceAutomationId)?.actions,
+    ['Summarize Alice-only data'],
+    'a rejected multi-delivery patch cannot alter the stored mission',
+  );
+
+  const rejectedQueryArgumentsPatch = await fetch(`${baseUrl}/api/automations/${aliceAutomationId}`, {
+    method: 'PATCH',
+    headers: { ...aliceHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      steps: [{
+        id: 'stripe-typo',
+        kind: 'query',
+        objective: 'Read Stripe revenue.',
+        inputs: { source: 'stripe', query_type: 'typo' },
+      }],
+    }),
+  });
+  assert.equal(rejectedQueryArgumentsPatch.status, 400);
+  assert.match(String((await readJson(rejectedQueryArgumentsPatch)).error), /query_type "typo" is not supported/i);
+  assert.deepEqual(
+    scheduler.getAutomationById(aliceAutomationId)?.actions,
+    ['Summarize Alice-only data'],
+    'a rejected argument patch cannot alter the stored mission',
+  );
+
+  const rejectedOrderingPatch = await fetch(`${baseUrl}/api/automations/${aliceAutomationId}`, {
+    method: 'PATCH',
+    headers: { ...aliceHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      steps: [
+        {
+          id: 'write-first',
+          kind: 'query',
+          objective: 'Archive the brief.',
+          inputs: { source: 'account_library', query_type: 'write', section: 'Competitive Intelligence' },
+        },
+        { id: 'search-late', kind: 'search', objective: 'Research the evidence.' },
+      ],
+    }),
+  });
+  assert.equal(rejectedOrderingPatch.status, 400);
+  assert.match(String((await readJson(rejectedOrderingPatch)).error), /workflow step order/i);
+  assert.deepEqual(
+    scheduler.getAutomationById(aliceAutomationId)?.actions,
+    ['Summarize Alice-only data'],
+    'a rejected ordering patch cannot alter the stored mission',
+  );
+
   fs.writeFileSync(path.join(process.cwd(), 'beta-consent-receipts.json'), '{malformed');
   fs.writeFileSync(path.join(process.cwd(), 'admin-access.json'), '{malformed');
   const adminMagicToken = auth.createAdminMagicLoginToken({

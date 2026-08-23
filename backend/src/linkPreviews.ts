@@ -74,12 +74,13 @@ async function fetchOgImage(
   link: BriefLink,
   timeoutMs: number,
   fetchImpl: typeof fetch,
+  parentSignal?: AbortSignal,
 ): Promise<{ link: BriefLink; imageUrl: string } | null> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetchImpl(link.url, {
-      signal: controller.signal,
+      signal: parentSignal ? AbortSignal.any([controller.signal, parentSignal]) : controller.signal,
       headers: {
         Accept: 'text/html',
         // Browser-like UA: many publishers 403 unknown bots, which starves the
@@ -102,7 +103,13 @@ async function fetchOgImage(
 
 export async function collectLinkImageBlocks(
   markdown: string,
-  options?: { limit?: number; timeoutMs?: number; fetchImpl?: typeof fetch; candidates?: BriefLink[] },
+  options?: {
+    limit?: number;
+    timeoutMs?: number;
+    fetchImpl?: typeof fetch;
+    candidates?: BriefLink[];
+    signal?: AbortSignal;
+  },
 ): Promise<SlackBlock[]> {
   const limit = options?.limit ?? 3;
   const timeoutMs = options?.timeoutMs ?? 3500;
@@ -125,7 +132,9 @@ export async function collectLinkImageBlocks(
   }
   if (links.length === 0) return [];
 
-  const results = await Promise.all(links.map((link) => fetchOgImage(link, timeoutMs, fetchImpl)));
+  const results = await Promise.all(
+    links.map((link) => fetchOgImage(link, timeoutMs, fetchImpl, options?.signal)),
+  );
   const candidates = results.filter((result): result is { link: BriefLink; imageUrl: string } => result !== null);
   // Slack downloads image_url server-side at post time; one unfetchable image
   // (signed/expiring CDN, hotlink protection) fails the whole message as
@@ -135,7 +144,10 @@ export async function collectLinkImageBlocks(
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
       try {
-        const response = await fetchImpl(candidate.imageUrl, { signal: controller.signal });
+        const signal = options?.signal
+          ? AbortSignal.any([controller.signal, options.signal])
+          : controller.signal;
+        const response = await fetchImpl(candidate.imageUrl, { signal });
         const contentType = (response.headers.get('content-type') || '').toLowerCase();
         return response.ok && contentType.startsWith('image/') ? candidate : null;
       } catch {

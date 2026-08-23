@@ -421,6 +421,29 @@ test('scope errors become integration_scope_insufficient and Drive may continue 
   assert.doesNotMatch(JSON.stringify(result), /must-not-leak|authorization/);
 });
 
+test('Drive 403 rate limits remain transient query failures instead of reauthorization prompts', async () => {
+  const executor = createExecutor(() => ({
+    successful: false,
+    error: {
+      status: 403,
+      error: { errors: [{ reason: 'userRateLimitExceeded' }] },
+      message: 'User rate limit exceeded.',
+    },
+  }));
+
+  const result = await queryPartnerComposio({
+    workspaceId: 'purpleorangehq',
+    source: 'google_drive',
+    queryType: 'recent_files',
+    execute: executor.execute,
+  });
+
+  assert.equal(result.ok, false);
+  if (result.ok) throw new Error('expected rate-limit failure');
+  assert.equal(result.code, 'integration_query_failed');
+  assert.equal(result.nextAction.label, 'Retry Google Drive');
+});
+
 test('provider exceptions become safe integration_query_failed errors', async () => {
   const executor = createExecutor(() => {
     throw new Error('upstream timeout bearer ghp_must_not_leak');

@@ -218,8 +218,8 @@ export function selectSupersededReviewTasks<T extends SupersedableTask>(
   });
 }
 
-function findReviewArtifact(task: TaskRecord, taskRun: TaskRunRecord) {
-  return readArtifacts(task, taskRun).find((artifact) =>
+function findReviewArtifacts(task: TaskRecord, taskRun: TaskRunRecord) {
+  return readArtifacts(task, taskRun).filter((artifact) =>
     artifact.kind === 'review_gate' &&
     artifact.payload?.approvalRequired &&
     artifact.payload?.markdown &&
@@ -232,12 +232,15 @@ function assertReviewable(task: TaskRecord, taskRun: TaskRunRecord) {
     throw new Error('This mission is not waiting for review.');
   }
 
-  const artifact = findReviewArtifact(task, taskRun);
-  if (!artifact) {
+  const artifacts = findReviewArtifacts(task, taskRun);
+  if (artifacts.length === 0) {
     throw new Error('No prepared review artifact is available for delivery.');
   }
+  if (artifacts.length > 1) {
+    throw new Error('Approval currently supports exactly one delivery step per mission. Split multiple destinations into separate missions.');
+  }
 
-  return artifact;
+  return artifacts[0];
 }
 
 function buildReceipt(input: {
@@ -294,6 +297,96 @@ function markDeliveryStepDelivered(
   });
 }
 
+export interface PreparedAutomationReviewDelivery {
+  body: string;
+  deliveryTarget: string;
+  artifactTitle?: string;
+  runWarnings?: AutomationRunWarning[];
+  sendInput: Parameters<SendReviewMessage>[0];
+}
+
+/** Validate and render the exact outbound request without crossing the send boundary. */
+export function prepareAutomationReviewDelivery(input: {
+  task: TaskRecord;
+  taskRun: TaskRunRecord;
+}): PreparedAutomationReviewDelivery {
+  const artifact = assertReviewable(input.task, input.taskRun);
+  const body = artifact.payload?.markdown || '';
+  const deliveryTarget = artifact.payload?.deliveryTarget || '';
+  return {
+    body,
+    deliveryTarget,
+    artifactTitle: artifact.title,
+    runWarnings: artifact.payload?.runWarnings,
+    sendInput: {
+      to: deliveryTarget,
+      body,
+      subject: artifact.title || input.task.title,
+      channel: deliveryTarget.includes('@') ? 'email' : 'slack',
+      evidenceLinks: Array.isArray(artifact.payload?.sourceLinks) ? artifact.payload.sourceLinks : undefined,
+      chartSpecs: Array.isArray(artifact.payload?.visualArtifacts)
+        ? artifact.payload.visualArtifacts.map((visual) => visual?.payload).filter(Boolean)
+        : undefined,
+    },
+  };
+}
+
+/** Build the durable approval receipt and state patches from a returned send receipt. */
+export function completeAutomationReviewDelivery(input: {
+  task: TaskRecord;
+  taskRun: TaskRunRecord;
+  reviewer: string;
+  prepared: PreparedAutomationReviewDelivery;
+  delivery: Record<string, unknown>;
+  reviewedAt?: string;
+}) {
+  const reviewedAt = input.reviewedAt || new Date().toISOString();
+  const taskStepExecutions = markDeliveryStepDelivered(
+    input.task.metadata?.latestStepExecutions,
+    input.delivery,
+    reviewedAt,
+  );
+  const runStepExecutions = markDeliveryStepDelivered(
+    input.taskRun.metadata?.stepExecutions,
+    input.delivery,
+    reviewedAt,
+  );
+  const receipt = buildReceipt({
+    status: 'delivered',
+    task: input.task,
+    taskRun: input.taskRun,
+    reviewer: input.reviewer,
+    reviewedAt,
+    deliveryTarget: input.prepared.deliveryTarget,
+    artifactTitle: input.prepared.artifactTitle,
+    delivery: input.delivery,
+    runWarnings: input.prepared.runWarnings,
+  });
+
+  return {
+    delivery: { ...input.delivery, body: input.prepared.body },
+    receipt,
+    taskPatch: {
+      status: 'completed' as const,
+      delegationState: 'completed' as const,
+      metadata: {
+        reviewRequired: false,
+        reviewReceipt: receipt,
+        latestDelivery: input.delivery,
+        latestStepExecutions: taskStepExecutions,
+      },
+    },
+    runPatch: {
+      metadata: {
+        reviewRequired: false,
+        reviewReceipt: receipt,
+        delivery: input.delivery,
+        stepExecutions: runStepExecutions,
+      },
+    },
+  };
+}
+
 export async function approveAutomationReview(input: {
   task: TaskRecord;
   taskRun: TaskRunRecord;
@@ -302,55 +395,14 @@ export async function approveAutomationReview(input: {
   send: SendReviewMessage;
 }) {
   const reviewedAt = input.now ? input.now() : new Date().toISOString();
-  const artifact = assertReviewable(input.task, input.taskRun);
-  const body = artifact.payload?.markdown || '';
-  const deliveryTarget = artifact.payload?.deliveryTarget || '';
-  const delivery = await input.send({
-    to: deliveryTarget,
-    body,
-    subject: artifact.title || input.task.title,
-    channel: deliveryTarget.includes('@') ? 'email' : 'slack',
-    evidenceLinks: Array.isArray(artifact.payload?.sourceLinks) ? artifact.payload.sourceLinks : undefined,
-    chartSpecs: Array.isArray(artifact.payload?.visualArtifacts)
-      ? artifact.payload.visualArtifacts.map((visual) => visual?.payload).filter(Boolean)
-      : undefined,
-  });
-  const taskStepExecutions = markDeliveryStepDelivered(input.task.metadata?.latestStepExecutions, delivery, reviewedAt);
-  const runStepExecutions = markDeliveryStepDelivered(input.taskRun.metadata?.stepExecutions, delivery, reviewedAt);
-  const receipt = buildReceipt({
-    status: 'delivered',
-    task: input.task,
-    taskRun: input.taskRun,
-    reviewer: input.reviewer,
-    reviewedAt,
-    deliveryTarget,
-    artifactTitle: artifact.title,
+  const prepared = prepareAutomationReviewDelivery(input);
+  const delivery = await input.send(prepared.sendInput);
+  return completeAutomationReviewDelivery({
+    ...input,
+    prepared,
     delivery,
-    runWarnings: artifact.payload?.runWarnings,
+    reviewedAt,
   });
-
-  return {
-    delivery: { ...delivery, body },
-    receipt,
-    taskPatch: {
-      status: 'completed' as const,
-      delegationState: 'completed' as const,
-      metadata: {
-        reviewRequired: false,
-        reviewReceipt: receipt,
-        latestDelivery: delivery,
-        latestStepExecutions: taskStepExecutions,
-      },
-    },
-    runPatch: {
-      metadata: {
-        reviewRequired: false,
-        reviewReceipt: receipt,
-        delivery,
-        stepExecutions: runStepExecutions,
-      },
-    },
-  };
 }
 
 export function requestAutomationChanges(input: {
@@ -464,6 +516,10 @@ export function validateAutomationDeliveryDraft(input: {
 }): AutomationDeliveryDraftValidation {
   const warnings: AutomationPreflightBlocker[] = [];
   const warningKeys = new Set<string>();
+  const deliverySteps = (input.steps || []).filter((step) => step.kind === 'deliver');
+  if (deliverySteps.length > 1) {
+    throw new Error('A mission can contain only one delivery step. Split multiple destinations into separate missions.');
+  }
 
   for (const item of collectDeliveryTargets(input)) {
     if (item.channel === 'email') {

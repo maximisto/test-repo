@@ -164,10 +164,29 @@ test('non-library artifacts serialize byte-identically', async () => {
 
   const block = server.buildAutomationEvidenceBlock(AUTOMATION, [searchArtifact, captureArtifact], [], []);
 
-  // The exact prior shape: `## <title>\n<JSON.stringify(payload, null, 2)>`.
-  assert.ok(block.includes(`## ${searchArtifact.title}\n${JSON.stringify(searchArtifact.payload, null, 2)}`));
-  assert.ok(block.includes(`## ${captureArtifact.title}\n${JSON.stringify(captureArtifact.payload, null, 2)}`));
+  // Compact serialization is the prompt contract. Pretty-print indentation
+  // can expand deeply nested payloads far beyond the bounded projection.
+  assert.ok(block.includes(`## ${searchArtifact.title}\n${JSON.stringify(searchArtifact.payload)}`));
+  assert.ok(block.includes(`## ${captureArtifact.title}\n${JSON.stringify(captureArtifact.payload)}`));
   assert.ok(!block.includes('untrusted_source'), 'nothing to fence means no marker at all');
+});
+
+test('evidence beyond the prompt ceiling fails closed instead of dropping later artifacts', async () => {
+  const server = await import('../src/server');
+  const tailSentinel = 'FINAL_ARTIFACT_MUST_NOT_DISAPPEAR';
+  const artifacts = Array.from({ length: 16 }, (_, index) => ({
+    kind: 'web_search' as const,
+    title: `Evidence source ${index + 1}`,
+    payload: {
+      snippet: `${'x'.repeat(7_900)}${index === 15 ? tailSentinel : ''}`,
+    },
+  }));
+
+  assert.throws(
+    () => server.buildAutomationEvidenceBlock(AUTOMATION, artifacts, [], []),
+    /evidence.*too large|too large.*evidence/i,
+    'a successful-looking brief may not be generated from a tail-truncated evidence set',
+  );
 });
 
 test('a library read with no untrusted entries is left untouched', async () => {
@@ -184,7 +203,7 @@ test('a library read with no untrusted entries is left untouched', async () => {
   ]);
 
   const block = server.buildAutomationEvidenceBlock(AUTOMATION, [artifact], [], []);
-  assert.ok(block.includes(`## ${artifact.title}\n${JSON.stringify(artifact.payload, null, 2)}`));
+  assert.ok(block.includes(`## ${artifact.title}\n${JSON.stringify(artifact.payload)}`));
   assert.ok(!block.includes('untrusted_source'));
 });
 

@@ -2,9 +2,14 @@ import { isEmailSuppressed } from './emailSuppressions';
 import { buildSlackMessagePayload, chunkSlackBlocks } from './slackBlocks';
 import { collectLinkImageBlocks } from './linkPreviews';
 import { usesInternalDemoRouting } from './platform/tenancy';
-import { sendTenantSlackMessage, type TenantSlackDeps } from './integrationGateway/slackDelivery';
+import {
+  preflightTenantSlackMessage,
+  sendTenantSlackMessage,
+  type TenantSlackDeps,
+} from './integrationGateway/slackDelivery';
+import { sanitizeIntegrationDiagnostic } from './integrationGateway/diagnostics';
 
-interface SendMessageInput {
+export interface SendMessageInput {
   to: string;
   subject?: string;
   body: string;
@@ -27,6 +32,10 @@ interface SendMessageInput {
   workspaceId?: string;
   /** Test seam for the tenant Composio Slack path; never set in production. */
   tenantSlackDeps?: TenantSlackDeps;
+  /** Cancels provider lookup/send requests at the automation step deadline. */
+  signal?: AbortSignal;
+  /** Durable journal hook awaited immediately before each physical send. */
+  onExternalRequestStart?: () => void | Promise<void>;
 }
 
 // Teams stays out of this union until a real connector exists — the enum is
@@ -74,8 +83,36 @@ function getRequiredEnv(name: string): string {
   return value;
 }
 
+async function readBoundedResponseText(response: Response, maxBytes = 4_096): Promise<string> {
+  if (!response.body) return '';
+  const reader = response.body.getReader();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  let truncated = false;
+  try {
+    while (total < maxBytes) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value?.byteLength) continue;
+      const remaining = maxBytes - total;
+      const bounded = value.byteLength > remaining ? value.slice(0, remaining) : value;
+      chunks.push(Buffer.from(bounded));
+      total += bounded.byteLength;
+      if (value.byteLength > remaining) {
+        truncated = true;
+        break;
+      }
+    }
+    if (total >= maxBytes) truncated = true;
+  } finally {
+    if (truncated) await reader.cancel().catch(() => undefined);
+    else reader.releaseLock();
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
 async function parseErrorResponse(response: Response): Promise<string> {
-  const text = await response.text();
+  const text = await readBoundedResponseText(response);
   if (!text) return `HTTP ${response.status}`;
 
   try {
@@ -85,19 +122,21 @@ async function parseErrorResponse(response: Response): Promise<string> {
       errors?: Array<{ message?: string }>;
     };
 
-    if (data.error) return data.error;
-    if (data.detail) return data.detail;
+    if (data.error) return sanitizeIntegrationDiagnostic(data.error);
+    if (data.detail) return sanitizeIntegrationDiagnostic(data.detail);
     if (data.errors?.length) {
-      return data.errors.map((item) => item.message).filter(Boolean).join('; ');
+      return sanitizeIntegrationDiagnostic(
+        data.errors.map((item) => item.message).filter(Boolean).join('; '),
+      );
     }
   } catch {
-    return text;
+    return sanitizeIntegrationDiagnostic(text);
   }
 
-  return text;
+  return sanitizeIntegrationDiagnostic(text);
 }
 
-export async function searchWeb(query: string, numResults = 5) {
+export async function searchWeb(query: string, numResults = 5, signal?: AbortSignal) {
   const apiKey = getRequiredEnv('TAVILY_API_KEY');
   const response = await fetch('https://api.tavily.com/search', {
     method: 'POST',
@@ -114,6 +153,7 @@ export async function searchWeb(query: string, numResults = 5) {
       include_favicon: true,
       max_results: Math.min(Math.max(numResults || 5, 1), 10),
     }),
+    signal,
   });
 
   if (!response.ok) {
@@ -208,7 +248,7 @@ function readSlackAliasMap(workspaceId?: string) {
   }
 }
 
-async function findSlackChannelIdByName(target: string) {
+async function findSlackChannelIdByName(target: string, signal?: AbortSignal) {
   const token = process.env.SLACK_BOT_TOKEN?.trim();
   const targetName = normalizeSlackChannelName(target);
   if (!token || !targetName) return null;
@@ -226,6 +266,7 @@ async function findSlackChannelIdByName(target: string) {
       headers: {
         Authorization: `Bearer ${token}`,
       },
+      signal,
     });
     const payload = await response.json().catch(() => null) as SlackConversationListResponse | null;
 
@@ -253,7 +294,7 @@ async function findSlackChannelIdByName(target: string) {
   return null;
 }
 
-async function resolveSlackTarget(target: string, workspaceId?: string) {
+async function resolveSlackTarget(target: string, workspaceId?: string, signal?: AbortSignal) {
   const normalizedTarget = target.trim();
   if (!normalizedTarget) {
     throw new Error('Slack target is required.');
@@ -271,7 +312,7 @@ async function resolveSlackTarget(target: string, workspaceId?: string) {
       return mappedTarget;
     }
 
-    const resolvedMappedChannelId = await findSlackChannelIdByName(mappedTarget);
+    const resolvedMappedChannelId = await findSlackChannelIdByName(mappedTarget, signal);
     if (resolvedMappedChannelId) {
       return resolvedMappedChannelId;
     }
@@ -282,7 +323,7 @@ async function resolveSlackTarget(target: string, workspaceId?: string) {
     return aliasEnv.trim();
   }
 
-  const resolvedChannelId = await findSlackChannelIdByName(normalizedTarget);
+  const resolvedChannelId = await findSlackChannelIdByName(normalizedTarget, signal);
   if (resolvedChannelId) {
     return resolvedChannelId;
   }
@@ -297,6 +338,7 @@ export async function validateMessageTarget(input: {
   to: string;
   channel?: string;
   workspaceId?: string;
+  signal?: AbortSignal;
 }) {
   const channel = inferMessageChannel({ ...input, body: '' });
   const target = input.to.trim();
@@ -306,7 +348,7 @@ export async function validateMessageTarget(input: {
   }
 
   if (channel === 'email') {
-    if (!target.includes('@')) {
+    if (!/^[^\s@/]+@[^\s@/]+\.[^\s@/]+$/.test(target)) {
       throw new Error('Email target must be a valid email address.');
     }
 
@@ -321,7 +363,7 @@ export async function validateMessageTarget(input: {
     return {
       channel,
       target,
-      normalizedTarget: await resolveSlackTarget(target, input.workspaceId),
+      normalizedTarget: await resolveSlackTarget(target, input.workspaceId, input.signal),
     } satisfies ValidatedMessageTarget;
   }
 
@@ -346,6 +388,7 @@ async function sendSlackMessage(input: SendMessageInput) {
     const articleBlocks = await collectLinkImageBlocks(input.body, {
       candidates: input.evidenceLinks,
       limit: chartBlocks.length > 0 ? 1 : 3,
+      signal: input.signal,
     });
     const extraBlocks = [...chartBlocks, ...articleBlocks];
     if (extraBlocks.length > 0) {
@@ -356,9 +399,11 @@ async function sendSlackMessage(input: SendMessageInput) {
     to: input.to,
     channel: 'slack',
     workspaceId: input.workspaceId,
+    signal: input.signal,
   });
 
   const post = async (body: Record<string, unknown>) => {
+    await input.onExternalRequestStart?.();
     const response = await fetch('https://slack.com/api/chat.postMessage', {
       method: 'POST',
       headers: {
@@ -366,6 +411,7 @@ async function sendSlackMessage(input: SendMessageInput) {
         Authorization: `Bearer ${token}`,
       },
       body: JSON.stringify(body),
+      signal: input.signal,
     });
     const data = await response.json() as {
       ok?: boolean;
@@ -418,14 +464,14 @@ export function formatEmailFrom(fromEmail: string): string {
   return `Violema <${trimmed}>`;
 }
 
-async function sendEmailMessage(input: SendMessageInput) {
+function readEmailDeliveryConfig(target: string) {
   // The promise made to Postmark at account approval: bounced and complained
   // addresses stop receiving mail. Checked before any provider call so a
   // suppressed recipient fails honestly instead of burning sender reputation.
-  const suppression = isEmailSuppressed(input.to);
+  const suppression = isEmailSuppressed(target);
   if (suppression) {
     throw new Error(
-      `Email to ${input.to} is blocked: the address ${
+      `Email to ${target} is blocked: the address ${
         suppression.reason === 'spam_complaint' ? 'marked our mail as spam' : 'hard-bounced'
       } on ${suppression.suppressedAt.slice(0, 10)}. Remove it from email-suppressions.json only if the mailbox is confirmed working again.`,
     );
@@ -433,7 +479,13 @@ async function sendEmailMessage(input: SendMessageInput) {
 
   const apiKey = getRequiredEnv('POSTMARK_API_KEY');
   const fromEmail = getRequiredEnv('POSTMARK_FROM_EMAIL');
+  return { apiKey, fromEmail };
+}
 
+async function sendEmailMessage(input: SendMessageInput) {
+  const { apiKey, fromEmail } = readEmailDeliveryConfig(input.to);
+
+  await input.onExternalRequestStart?.();
   const response = await fetch('https://api.postmarkapp.com/email', {
     method: 'POST',
     headers: {
@@ -447,6 +499,7 @@ async function sendEmailMessage(input: SendMessageInput) {
       Subject: input.subject || 'Message from Violema',
       TextBody: input.body,
     }),
+    signal: input.signal,
   });
 
   if (!response.ok) {
@@ -462,6 +515,37 @@ async function sendEmailMessage(input: SendMessageInput) {
     sent_at: new Date().toISOString(),
     provider: 'postmark',
   };
+}
+
+/** Validate the exact route without crossing a message-send boundary. */
+export async function preflightMessageDelivery(input: SendMessageInput) {
+  const channel = inferMessageChannel(input);
+  if (channel === 'slack') {
+    if (!usesInternalDemoRouting(input.workspaceId)) {
+      await preflightTenantSlackMessage({
+        workspaceId: input.workspaceId as string,
+        to: input.to,
+        body: input.body,
+        subject: input.subject,
+        signal: input.signal,
+      }, input.tenantSlackDeps ?? {});
+      return;
+    }
+    getRequiredEnv('SLACK_BOT_TOKEN');
+    await validateMessageTarget({
+      to: input.to,
+      channel: 'slack',
+      workspaceId: input.workspaceId,
+      signal: input.signal,
+    });
+    return;
+  }
+  if (channel === 'email') {
+    await validateMessageTarget({ to: input.to, channel: 'email', workspaceId: input.workspaceId });
+    readEmailDeliveryConfig(input.to);
+    return;
+  }
+  throw new Error(`Unsupported delivery channel: ${channel}`);
 }
 
 export async function sendMessage(input: SendMessageInput) {
@@ -481,6 +565,8 @@ export async function sendMessage(input: SendMessageInput) {
           body: input.body,
           subject: input.subject,
           threadTs: input.threadTs,
+          signal: input.signal,
+          onExternalRequestStart: input.onExternalRequestStart,
         },
         input.tenantSlackDeps ?? {},
       );

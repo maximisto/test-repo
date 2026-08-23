@@ -122,7 +122,7 @@ test('the competitor seed is blocked on Google Drive until the library is reacha
   assert.equal(blocked.allowed, false, 'The library mission must not run without its memory.');
   assert.deepEqual(
     blocked.blockers.map((blocker) => blocker.key),
-    ['business_context_missing', 'google_drive'],
+    ['business_context_missing', 'google_drive', 'tavily', 'slack'],
   );
   assert.equal(blocked.blockers[1].label, 'Connect Google Drive');
 
@@ -131,7 +131,11 @@ test('the competitor seed is blocked on Google Drive until the library is reacha
     workspaceId: 'ws_tenant',
     isDemoWorkspace: false,
     steps: competitor.steps,
-    runtimeStatus: { google_drive: { ready: true } },
+    runtimeStatus: {
+      google_drive: { ready: true },
+      tavily: { ready: true },
+      slack: { ready: true },
+    },
     businessContextSet: true,
   });
   assert.equal(ready.allowed, true);

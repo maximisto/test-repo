@@ -109,6 +109,60 @@ test('approveAutomationReview delivers waiting review content and records a run 
   assert.equal(runDeliveryStep?.output?.status, 'delivered');
 });
 
+test('approval fails closed when a persisted mission contains more than one delivery gate', async () => {
+  const secondArtifact = {
+    kind: 'review_gate',
+    title: 'Ready for review: customer update',
+    payload: {
+      markdown: '## Customer update\nA different brief for a different destination.',
+      deliveryTarget: '#customers',
+      approvalRequired: true,
+    },
+  };
+  const multiTask = {
+    ...task,
+    metadata: {
+      ...task.metadata,
+      latestArtifacts: [...task.metadata.latestArtifacts, secondArtifact],
+      latestStepExecutions: [
+        ...task.metadata.latestStepExecutions,
+        {
+          stepId: 'step_deliver_customers',
+          kind: 'deliver',
+          title: 'Deliver to customers',
+          assignedRole: 'messenger',
+          status: 'succeeded',
+          output: { status: 'waiting_review', to: '#customers', channel: 'slack' },
+          artifactKind: 'review_gate',
+        },
+      ],
+    },
+  } satisfies TaskRecord;
+  const multiRun = {
+    ...run,
+    metadata: {
+      ...run.metadata,
+      artifacts: multiTask.metadata.latestArtifacts,
+      stepExecutions: multiTask.metadata.latestStepExecutions,
+    },
+  } satisfies TaskRunRecord;
+  let sends = 0;
+
+  await assert.rejects(
+    approveAutomationReview({
+      task: multiTask,
+      taskRun: multiRun,
+      reviewer: 'max@purpleorange.io',
+      send: async () => {
+        sends += 1;
+        return { status: 'delivered' };
+      },
+    }),
+    /one delivery step/i,
+  );
+  assert.equal(sends, 0);
+});
+
 test('an approved run that was not archived says so on its receipt', async () => {
   // The competitor-monitor incident, at the approval surface: the library write
   // failed, the memo is still fully evidenced, and the founder approves it. The
@@ -263,6 +317,15 @@ test('validateAutomationDeliveryDraft allows Slack names at save time but valida
   assert.throws(
     () => validateAutomationDeliveryDraft({ notify: 'not-an-email', steps: [{ id: 'deliver', kind: 'deliver', objective: 'Email result.', deliveryTarget: { channel: 'email', target: 'not-an-email' } }] }),
     /valid email/i,
+  );
+  assert.throws(
+    () => validateAutomationDeliveryDraft({
+      steps: [
+        { id: 'deliver-a', kind: 'deliver', objective: 'Send A.', deliveryTarget: { channel: 'slack', target: '#a' } },
+        { id: 'deliver-b', kind: 'deliver', objective: 'Send B.', deliveryTarget: { channel: 'slack', target: '#b' } },
+      ],
+    }),
+    /one delivery step/i,
   );
 });
 

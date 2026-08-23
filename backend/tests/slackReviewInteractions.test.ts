@@ -155,6 +155,14 @@ async function withSlackReviewServer(
       acceptedEducation: true,
     });
     const session = auth.createAuthSession(user.id);
+    store.addLedgerEntry({
+      workspaceId: user.defaultWorkspaceId,
+      source: 'manual_adjustment',
+      deltaCredits: 100,
+      referenceType: 'manual',
+      referenceId: 'slack_review_approval_test',
+      note: 'Fund the real approval-delivery tool charge exercised by this fixture.',
+    });
 
     const automation = scheduler.createAutomation({
       workspaceId: user.defaultWorkspaceId,

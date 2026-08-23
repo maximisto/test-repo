@@ -21,6 +21,8 @@ const SECTION_FOLDER_ID = 'section-1';
 const FOLDER_MIME = 'application/vnd.google-apps.folder';
 const NEEDS_SHARE_WARNING =
   "Folder drop is enabled but Violema's reader can no longer see your Violema Library folder — re-share it to include your dropped files.";
+const UNAVAILABLE_WARNING =
+  'Folder drop could not be read because Google Drive or the Violema reader is temporarily unavailable — retry later; re-sharing the folder will not fix this incident.';
 
 // --- fake Drive executor (root/section folder lookups + app entry files) -----
 
@@ -177,6 +179,24 @@ test('not_configured never adds a sweep warning', async () => {
   assert.equal(result.ok, true);
   if (!result.ok) return;
   assert.deepEqual(result.data.sweep?.warnings, []);
+});
+
+test('unavailable names a platform incident and never asks the operator to re-share', async () => {
+  setLibrarySweepOverridesForTests({ laneState: 'unavailable' });
+  const drive = createFakeDrive({ appFiles: [] });
+
+  const result = await readLibrary(
+    'ws_test',
+    SECTION,
+    {},
+    { execute: drive.execute, fetchText: drive.fetchText },
+  );
+
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.data.sweep?.laneState, 'unavailable');
+  assert.deepEqual(result.data.sweep?.warnings, [UNAVAILABLE_WARNING]);
+  assert.match(result.data.sweep?.warnings.join(' '), /re-sharing the folder will not fix/i);
 });
 
 test('no_library_yet never adds a sweep warning either — nothing is wrong, the library simply has not been created', async () => {

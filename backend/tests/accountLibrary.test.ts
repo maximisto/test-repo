@@ -13,6 +13,7 @@ import {
   buildLibraryEntryFileName,
   ensureLibraryFolder,
   findLibraryRootFolderId,
+  hasUnknownLibraryMutationOutcome,
   isLibraryFailure,
   readLibrary,
   renderLibraryContextMarkdown,
@@ -84,6 +85,7 @@ function createDriveFake(seed: { folders?: FakeFolder[]; files?: FakeFile[] } = 
             modifiedTime: '2026-08-01T00:00:00.000Z',
             webViewLink: `https://drive.example/${file.id}`,
           })),
+          ...(matched.length > pageSize ? { nextPageToken: `after-${pageSize}` } : {}),
         },
       };
     }
@@ -235,6 +237,7 @@ test('readLibrary is bounded, newest-first, and stamped with live Google Drive p
   const snapshot = result.data as AccountLibrarySnapshot;
   assert.equal(snapshot.libraryInitialized, true);
   assert.equal(snapshot.entryCount, 2, 'The limit must bound how many entries come back.');
+  assert.equal(snapshot.appEntryHistoryComplete, false, 'the snapshot must disclose older unbaselined entries');
   assert.deepEqual(
     snapshot.entries.map((entry) => entry.content),
     ['newest', 'newer'],
@@ -358,6 +361,33 @@ test('appendLibraryEntry writes inside the library folder and only there', async
   assert.equal(root?.name, LIBRARY_ROOT_FOLDER_NAME);
 });
 
+test('a lost Drive response after file creation preserves the unknown mutation outcome', async () => {
+  const drive = createDriveFake({
+    folders: [
+      { id: 'root', name: LIBRARY_ROOT_FOLDER_NAME },
+      { id: 'section', name: COMPETITIVE_INTELLIGENCE_SECTION, parent: 'root' },
+    ],
+  });
+  const execute: PartnerComposioExecutor = async (actionName, input, ctx) => {
+    if (actionName !== 'GOOGLEDRIVE_CREATE_FILE_FROM_TEXT') {
+      return drive.execute(actionName, input, ctx);
+    }
+    await drive.execute(actionName, input, ctx);
+    throw new Error('response lost after Google accepted the create');
+  };
+
+  const result = await appendLibraryEntry(
+    'ws_acme',
+    COMPETITIVE_INTELLIGENCE_SECTION,
+    { title: 'Competitor snapshot', markdown: 'new evidence' },
+    { execute, fetchText: drive.fetchText, now },
+  );
+
+  assert.ok(isLibraryFailure(result));
+  assert.equal(hasUnknownLibraryMutationOutcome(result), true);
+  assert.equal(drive.files.length, 1, 'the remote file exists even though the response was lost');
+});
+
 test('appendLibraryEntry refuses to record an empty draft', async () => {
   const drive = createDriveFake();
   const result = await appendLibraryEntry(
@@ -369,6 +399,27 @@ test('appendLibraryEntry refuses to record an empty draft', async () => {
 
   assert.ok(isLibraryFailure(result), 'An empty entry would poison later delta context.');
   assert.equal(countCalls(drive.calls, 'GOOGLEDRIVE_CREATE_FILE_FROM_TEXT'), 0);
+});
+
+test('ordinary entries cannot use the rolling-baseline title namespace', async () => {
+  const drive = createDriveFake();
+  const result = await appendLibraryEntry(
+    'ws_acme',
+    COMPETITIVE_INTELLIGENCE_SECTION,
+    {
+      title: 'Current state (rolling baseline) notes',
+      markdown: 'This is an ordinary operator-authored memo.',
+    },
+    { execute: drive.execute, fetchText: drive.fetchText, now },
+  );
+
+  assert.ok(isLibraryFailure(result));
+  assert.match(result.message, /reserved/i);
+  assert.equal(
+    countCalls(drive.calls, 'GOOGLEDRIVE_CREATE_FILE_FROM_TEXT'),
+    0,
+    'a poisoned title must be rejected before any Drive write',
+  );
 });
 
 test('the append result carries ids and names only, never the entry body', async () => {
@@ -466,6 +517,7 @@ test('executeQueryData routes account_library reads and refuses writes', async (
             folderId: null,
             entryCount: 0,
             entries: [],
+            appEntryHistoryComplete: true,
           },
           fetched_at: FIXED_NOW.toISOString(),
           latency_ms: 1,
@@ -514,7 +566,7 @@ test('the run readiness gate blocks a library mission on Google Drive by name', 
     workspaceId: 'ws_acme',
     isDemoWorkspace: false,
     steps,
-    runtimeStatus: {},
+    runtimeStatus: { tavily: { ready: true } },
   });
 
   assert.equal(blocked.allowed, false);
@@ -530,7 +582,7 @@ test('the run readiness gate blocks a library mission on Google Drive by name', 
     workspaceId: 'ws_acme',
     isDemoWorkspace: false,
     steps,
-    runtimeStatus: { google_drive: { ready: true } },
+    runtimeStatus: { google_drive: { ready: true }, tavily: { ready: true } },
   });
   assert.equal(ready.allowed, true, 'A connected Drive unblocks the library mission.');
 });
@@ -591,23 +643,72 @@ test('a Composio outage on the root lookup reports lookup failure, never a fresh
   assert.equal(result.failure.code, 'integration_query_failed');
 });
 
-test('a workspace with no Drive connection still reads as confirmed absence, not an outage', async () => {
-  // No connected account means no app-created library can exist — that is a
-  // genuine "no library yet", and the settings card should keep saying so.
+test('a Drive 403 rate limit on the Composio root lookup is unavailable, not a scope failure', async () => {
+  const execute: PartnerComposioExecutor = async () => ({
+    successful: false,
+    error: {
+      status: 403,
+      error: { errors: [{ reason: 'rateLimitExceeded' }] },
+      message: 'User rate limit exceeded.',
+    },
+  });
+  const result = await findLibraryRootFolderId('ws_test', { execute });
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.equal(result.failure.code, 'integration_query_failed');
+  assert.match(result.failure.message, /could not reach .*Google Drive/i);
+  assert.match(result.failure.nextAction.label, /Retry/i);
+});
+
+test('a malformed successful root listing is a lookup failure, never confirmed absence', async () => {
+  for (const data of [{}, { files: [{}] }]) {
+    const execute: PartnerComposioExecutor = async () => ({ successful: true, data });
+    const result = await findLibraryRootFolderId('ws_test', { execute });
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.failure.code, 'integration_query_failed');
+  }
+});
+
+test('a malformed successful section listing cannot certify complete baseline history', async () => {
+  const drive = createDriveFake({
+    folders: [
+      { id: 'root-malformed', name: LIBRARY_ROOT_FOLDER_NAME },
+      { id: 'section-malformed', name: COMPETITIVE_INTELLIGENCE_SECTION, parent: 'root-malformed' },
+    ],
+  });
+  for (const malformedData of [{}, { files: [{ id: 'real-file-without-name' }] }]) {
+    const execute: PartnerComposioExecutor = async (actionName, input, context) => {
+      const query = String(input.q ?? '');
+      if (actionName === 'GOOGLEDRIVE_FIND_FILE' && !query.includes('google-apps.folder')) {
+        return { successful: true, data: malformedData };
+      }
+      return drive.execute(actionName, input, context);
+    };
+
+    const result = await readLibrary(
+      'ws_test',
+      COMPETITIVE_INTELLIGENCE_SECTION,
+      {},
+      { execute, fetchText: drive.fetchText, now },
+    );
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.code, 'integration_query_failed');
+  }
+});
+
+test('a lost Drive connection never proves a previously created library is absent', async () => {
   const noConnection: PartnerComposioExecutor = async () => {
     throw new Error('connected account not found for entity');
   };
-  assert.deepEqual(await findLibraryRootFolderId('ws_test', { execute: noConnection }), {
-    ok: true,
-    folderId: null,
-  });
+  const disconnected = await findLibraryRootFolderId('ws_test', { execute: noConnection });
+  assert.equal(disconnected.ok, false);
+  if (!disconnected.ok) assert.equal(disconnected.failure.code, 'integration_not_ready');
 
-  // Same for a server whose Composio bridge is off entirely (dev/test).
+  // A disabled bridge likewise proves only that the query could not run.
   const bridgeOff: PartnerComposioExecutor = async () => {
     throw new Error('Composio is not configured. Set COMPOSIO_API_KEY to enable.');
   };
-  assert.deepEqual(await findLibraryRootFolderId('ws_test', { execute: bridgeOff }), {
-    ok: true,
-    folderId: null,
-  });
+  const unavailable = await findLibraryRootFolderId('ws_test', { execute: bridgeOff });
+  assert.equal(unavailable.ok, false);
+  if (!unavailable.ok) assert.equal(unavailable.failure.code, 'integration_not_ready');
 });

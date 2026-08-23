@@ -1,6 +1,7 @@
 import path from 'path';
 import { readJsonFile, writeJsonFile } from '../platform/jsonStore';
 import type { WorkflowLedgerEvent, WorkflowLedgerEventType } from './types';
+import { sanitizeIntegrationDiagnostic } from './diagnostics';
 
 const WORKFLOW_LEDGER_FILE = path.join(process.cwd(), 'workflow-ledger-events.json');
 
@@ -82,7 +83,7 @@ export function appendIntegrationQueryLedgerEvent(
   input: AppendIntegrationQueryLedgerEventInput,
 ) {
   const label = labelizeSource(input.source);
-  const failureMessage = input.message?.trim() || 'integration unavailable';
+  const failureMessage = sanitizeIntegrationDiagnostic(input.message?.trim() || 'integration unavailable');
   return appendWorkflowLedgerEvent({
     workspaceId: input.workspaceId,
     workflowId: input.workflowId,

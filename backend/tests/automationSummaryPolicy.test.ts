@@ -2,12 +2,20 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   AUTOMATION_MEMO_MAX_TOKENS,
+  AUTOMATION_MEMO_MAX_BYTES,
+  AUTOMATION_MEMO_BODY_WORD_LIMIT,
   AUTOMATION_MEMO_WORD_LIMIT,
   AUTOMATION_SUMMARY_BASE_TOKENS,
   AUTOMATION_SUMMARY_TOKEN_CEILING,
+  AUTOMATION_SUMMARY_MAX_BYTES,
   AUTOMATION_SUMMARY_WORD_LIMIT,
   appendFullAnalysisLink,
+  buildBoundedAutomationSummaryFallback,
+  buildDeterministicAutomationMemo,
+  countAutomationWords,
   automationSummaryTokenBudget,
+  requireCompleteAutomationMemo,
+  requireCompleteAutomationMemoWithLink,
   requireCompleteAutomationSummary,
 } from '../src/platform/automationSummaryPolicy';
 
@@ -79,6 +87,34 @@ test('appendFullAnalysisLink points the memo at the persisted document', () => {
   );
 });
 
+test('the final rendered memo keeps its library footer inside the 350-word limit', () => {
+  const words = Array.from(
+    { length: AUTOMATION_MEMO_BODY_WORD_LIMIT },
+    (_, index) => `word${index + 1}`,
+  ).join(' ');
+  const linked = requireCompleteAutomationMemoWithLink(
+    { text: words, stopReason: 'stop' },
+    'https://drive.google.com/file/d/abc123/view',
+  );
+  assert.equal(countAutomationWords(linked), AUTOMATION_MEMO_WORD_LIMIT);
+  assert.throws(
+    () => requireCompleteAutomationMemo({ text: `${words} overflow`, stopReason: 'stop' }),
+    new RegExp(`${AUTOMATION_MEMO_BODY_WORD_LIMIT}-word limit`, 'i'),
+  );
+});
+
+test('an invalid model memo falls back to a deterministic bounded slice of the full brief', () => {
+  const fullBrief = Array.from({ length: 500 }, (_, index) => `fact${index + 1}`).join(' ');
+  const memo = buildDeterministicAutomationMemo(
+    fullBrief,
+    'https://drive.google.com/file/d/abc123/view',
+  );
+  assert.equal(countAutomationWords(memo), AUTOMATION_MEMO_WORD_LIMIT);
+  assert.match(memo, /fact1/);
+  assert.doesNotMatch(memo, /fact500/);
+  assert.match(memo, /Full analysis/);
+});
+
 test('requireCompleteAutomationSummary accepts and trims completed drafts', () => {
   assert.equal(
     requireCompleteAutomationSummary({
@@ -87,4 +123,138 @@ test('requireCompleteAutomationSummary accepts and trims completed drafts', () =
     }),
     '# Weekly Founder Update\n\n## Next actions\n- Ship.',
   );
+});
+
+test('generated outputs accept only complete provider terminal reasons', () => {
+  for (const stopReason of ['stop', 'end_turn', 'stop_sequence']) {
+    assert.equal(
+      requireCompleteAutomationSummary({ text: 'Complete founder brief.', stopReason }),
+      'Complete founder brief.',
+      `${stopReason} is a complete text-generation terminal`,
+    );
+  }
+
+  for (const stopReason of ['content_filter', 'tool_calls', 'function_call']) {
+    assert.throws(
+      () => requireCompleteAutomationSummary({
+        text: 'A nonempty but incomplete provider draft.',
+        stopReason,
+      }),
+      /incomplete provider stop reason/i,
+      `${stopReason} cannot be mistaken for a finished brief`,
+    );
+    assert.throws(
+      () => requireCompleteAutomationMemo({
+        text: 'A nonempty but incomplete delivery memo.',
+        stopReason,
+      }),
+      /incomplete provider stop reason/i,
+      `${stopReason} cannot be mistaken for a finished memo`,
+    );
+  }
+});
+
+test('a deterministic fallback stays bounded when a full prior brief is followed by step errors', () => {
+  const priorBrief = Array.from(
+    { length: AUTOMATION_SUMMARY_WORD_LIMIT },
+    (_, index) => `résultat${index + 1}`,
+  ).join('\u2003');
+  const stepLines = Array.from(
+    { length: 24 },
+    (_, index) => `FAILED step ${index + 1}: provider detail ${index + 1}`,
+  ).join('\n');
+  const bounded = buildBoundedAutomationSummaryFallback(`${priorBrief}\n\n${stepLines}`);
+
+  assert.equal(countAutomationWords(bounded), AUTOMATION_SUMMARY_WORD_LIMIT);
+  assert.match(bounded, /résultat1/);
+  assert.doesNotMatch(bounded, /FAILED/);
+});
+
+test('summary and memo word limits are deterministic across markdown and Unicode whitespace', () => {
+  const validateWithLimit = requireCompleteAutomationSummary;
+  const words = (count: number) => Array.from({ length: count }, (_, index) => `word${index + 1}`).join(' ');
+
+  assert.equal(
+    validateWithLimit({ text: words(AUTOMATION_SUMMARY_WORD_LIMIT), stopReason: 'stop' }, AUTOMATION_SUMMARY_WORD_LIMIT),
+    words(AUTOMATION_SUMMARY_WORD_LIMIT),
+    'an exact-limit full brief is accepted',
+  );
+  assert.throws(
+    () => validateWithLimit(
+      { text: words(AUTOMATION_SUMMARY_WORD_LIMIT + 1), stopReason: 'stop' },
+      AUTOMATION_SUMMARY_WORD_LIMIT,
+    ),
+    /650-word limit/i,
+  );
+
+  assert.equal(
+    validateWithLimit({ text: words(AUTOMATION_MEMO_WORD_LIMIT), stopReason: 'stop' }, AUTOMATION_MEMO_WORD_LIMIT),
+    words(AUTOMATION_MEMO_WORD_LIMIT),
+    'an exact-limit memo is accepted',
+  );
+  assert.throws(
+    () => validateWithLimit(
+      { text: words(AUTOMATION_MEMO_WORD_LIMIT + 1), stopReason: 'stop' },
+      AUTOMATION_MEMO_WORD_LIMIT,
+    ),
+    /350-word limit/i,
+  );
+
+  const linked = `${words(648)} [Purple Orange](https://example.com/source)`;
+  assert.equal(
+    validateWithLimit({ text: linked, stopReason: 'stop' }, AUTOMATION_SUMMARY_WORD_LIMIT),
+    linked,
+    'a markdown link counts its visible label, not its URL',
+  );
+
+  const table = `${words(646)}\n| Rival | Move |\n| --- | --- |\n| Alpha | Launched |`;
+  assert.equal(
+    validateWithLimit({ text: table, stopReason: 'stop' }, AUTOMATION_SUMMARY_WORD_LIMIT),
+    table,
+    'table delimiters and separator dashes are not words',
+  );
+
+  const unicodeWhitespace = Array.from({ length: AUTOMATION_MEMO_WORD_LIMIT }, (_, index) => `u${index + 1}`)
+    .join('\u2003');
+  assert.equal(
+    validateWithLimit({ text: unicodeWhitespace, stopReason: 'stop' }, AUTOMATION_MEMO_WORD_LIMIT),
+    unicodeWhitespace,
+    'Unicode whitespace separates words consistently',
+  );
+});
+
+test('the memo validator enforces the 350-word delivery contract', () => {
+  const words = (count: number) => Array.from({ length: count }, (_, index) => `memo${index + 1}`).join(' ');
+
+  assert.equal(
+    requireCompleteAutomationMemo({ text: words(AUTOMATION_MEMO_BODY_WORD_LIMIT), stopReason: 'stop' }),
+    words(AUTOMATION_MEMO_BODY_WORD_LIMIT),
+  );
+  assert.throws(
+    () => requireCompleteAutomationMemo({ text: words(AUTOMATION_MEMO_BODY_WORD_LIMIT + 1), stopReason: 'stop' }),
+    new RegExp(`${AUTOMATION_MEMO_BODY_WORD_LIMIT}-word limit`, 'i'),
+  );
+});
+
+test('long URLs and giant tokens cannot bypass generated-output byte ceilings', () => {
+  const longSummaryUrl = `https://example.com/${'a'.repeat(AUTOMATION_SUMMARY_MAX_BYTES)}`;
+  assert.throws(
+    () => requireCompleteAutomationSummary({
+      text: `One visible fact [source](${longSummaryUrl})`,
+      stopReason: 'stop',
+    }),
+    new RegExp(`${AUTOMATION_SUMMARY_MAX_BYTES}-byte limit`, 'i'),
+  );
+
+  const longMemoUrl = `https://example.com/${'b'.repeat(AUTOMATION_MEMO_MAX_BYTES)}`;
+  assert.throws(
+    () => requireCompleteAutomationMemo({
+      text: `One visible fact [source](${longMemoUrl})`,
+      stopReason: 'stop',
+    }),
+    new RegExp(`${AUTOMATION_MEMO_MAX_BYTES}-byte limit`, 'i'),
+  );
+
+  const fallback = buildBoundedAutomationSummaryFallback('ü'.repeat(AUTOMATION_SUMMARY_MAX_BYTES));
+  assert.ok(Buffer.byteLength(fallback, 'utf8') <= AUTOMATION_SUMMARY_MAX_BYTES);
 });

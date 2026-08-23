@@ -250,12 +250,17 @@ export function sweepOrphanedTaskRuns(bootTime: Date) {
   updateJsonFile<TaskRunRecord[]>(TASK_RUNS_FILE, [], (taskRuns) => taskRuns.map((run) => {
     if (run.status !== 'running' && run.status !== 'retrying') return run;
     if (new Date(run.startedAt).getTime() >= bootTime.getTime()) return run;
+    const reconciliationRequired = run.metadata?.settlementReconciliationRequired === true;
+    const reconciliationError = typeof run.metadata?.settlementRecoveryError === 'string'
+      ? run.metadata.settlementRecoveryError
+      : undefined;
     const updated: TaskRunRecord = {
       ...run,
       status: 'failed',
       finishedAt: new Date().toISOString(),
-      error:
-        'This run never finished: the backend found it still marked in progress at startup. Its actual failure cause was not recorded. Safe to rerun.',
+      error: reconciliationRequired
+        ? reconciliationError || 'Provider accounting is incomplete. Manual reconciliation is required before rerunning.'
+        : 'This run never finished: the backend found it still marked in progress at startup. Its actual failure cause was not recorded. Safe to rerun.',
       metadata: {
         ...run.metadata,
         orphanSweptAtBoot: bootTime.toISOString(),
@@ -511,6 +516,103 @@ export function releaseCreditHold(
 
   if (!releasedEntryRef.value) throw new Error(`Could not release credit hold: ${holdId}`);
   return releasedEntryRef.value;
+}
+
+/**
+ * Extend an active hold before the next billable boundary.
+ *
+ * Expired leases cannot be resurrected: once other work may legitimately have
+ * reserved that balance, the caller must stop before spending again. Updating
+ * the original hold entry keeps reservation math at exactly one active hold.
+ */
+export function renewCreditHold(
+  holdId: string,
+  input: { workspaceId: string; ttlMs: number; now?: Date },
+) {
+  const now = input.now || new Date();
+  const ttlMs = Math.max(1, Math.trunc(input.ttlMs));
+  let renewedExpiresAt: string | null = null;
+
+  updateJsonFile<CreditLedgerEntry[]>(LEDGER_FILE, [], (entries) => {
+    const workspaceEntries = entries.filter((entry) => entry.workspaceId === input.workspaceId);
+    const hold = findCreditHold(workspaceEntries, holdId);
+    assertCreditHoldOpen(workspaceEntries, holdId);
+    const currentExpiry = readCreditHoldExpiresAt(hold);
+    if (!Number.isFinite(currentExpiry) || currentExpiry <= now.getTime()) {
+      throw new Error(`Credit hold ${holdId} expired before the next billable operation.`);
+    }
+    renewedExpiresAt = new Date(now.getTime() + ttlMs).toISOString();
+    return entries.map((entry) => entry.id === hold.id
+      ? {
+          ...entry,
+          metadata: {
+            ...(entry.metadata || {}),
+            expiresAt: renewedExpiresAt,
+            renewedAt: now.toISOString(),
+          },
+        }
+      : entry);
+  });
+
+  if (!renewedExpiresAt) throw new Error(`Could not renew credit hold: ${holdId}`);
+  return { holdId, expiresAt: renewedExpiresAt };
+}
+
+/**
+ * Atomically increase an active hold before an unbudgeted run retries or
+ * discovers a larger exact prompt. The workspace reserve is re-checked while
+ * the ledger file is locked, excluding this hold's current amount, so two
+ * concurrent runs cannot both claim the same remaining credits.
+ */
+export function extendCreditHold(
+  holdId: string,
+  input: { workspaceId: string; amountCredits: number; ttlMs?: number; now?: Date },
+) {
+  const now = input.now || new Date();
+  const requestedCredits = Math.max(0, normalizeCreditDelta(input.amountCredits));
+  const resultRef: { value?: { holdId: string; heldCredits: number; expiresAt: string } } = {};
+
+  updateJsonFile<CreditLedgerEntry[]>(LEDGER_FILE, [], (entries) => {
+    const workspaceEntries = entries.filter((entry) => entry.workspaceId === input.workspaceId);
+    const hold = findCreditHold(workspaceEntries, holdId);
+    assertCreditHoldOpen(workspaceEntries, holdId);
+    const currentExpiry = readCreditHoldExpiresAt(hold);
+    if (!Number.isFinite(currentExpiry) || currentExpiry <= now.getTime()) {
+      throw new Error(`Credit hold ${holdId} expired before it could be extended.`);
+    }
+
+    const currentCredits = readCreditHoldCredits(hold);
+    const nextCredits = Math.max(currentCredits, requestedCredits);
+    const summary = summarizeCreditLedger(workspaceEntries);
+    const reservedForOtherHolds = listActiveHoldEntries(workspaceEntries, now)
+      .filter((entry) => readCreditHoldId(entry) !== holdId)
+      .reduce((total, entry) => total + readCreditHoldCredits(entry), 0);
+    const availableForThisHold = Math.max(0, summary.balanceCredits - reservedForOtherHolds);
+    if (nextCredits > availableForThisHold) {
+      throw new Error(
+        `Insufficient credits. ${availableForThisHold} available, ${nextCredits} required.`,
+      );
+    }
+
+    const expiresAt = input.ttlMs
+      ? new Date(now.getTime() + Math.max(1, Math.trunc(input.ttlMs))).toISOString()
+      : new Date(currentExpiry).toISOString();
+    resultRef.value = { holdId, heldCredits: nextCredits, expiresAt };
+    return entries.map((entry) => entry.id === hold.id
+      ? {
+          ...entry,
+          metadata: {
+            ...(entry.metadata || {}),
+            heldCredits: nextCredits,
+            expiresAt,
+            extendedAt: now.toISOString(),
+          },
+        }
+      : entry);
+  });
+
+  if (!resultRef.value) throw new Error(`Could not extend credit hold: ${holdId}`);
+  return resultRef.value;
 }
 
 export function settleCreditHold(

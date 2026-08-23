@@ -93,6 +93,10 @@ export interface RunReadinessStepLike {
   kind?: string;
   title?: string;
   inputs?: Record<string, unknown> | null;
+  deliveryTarget?: {
+    channel?: 'slack' | 'email';
+    target?: string;
+  } | null;
 }
 
 export interface RunReadinessDecision {
@@ -132,12 +136,14 @@ function summarizeBlockers(blockers: WorkflowReadinessBlocker[]): string {
 }
 
 /**
- * Tier 3: readiness derived from the automation's own query steps.
- * Non-query steps never block, and an automation with no query steps reads
- * nothing external, so it passes.
+ * Tier 3: readiness derived from the automation's executable steps.
+ * Query, search, and delivery boundaries all need to be ready before a run can
+ * be acknowledged; otherwise the operator receives a false-success response
+ * and pays for upstream work before the inevitable refusal.
  */
 export function evaluateStepSourceReadiness(input: {
   steps?: RunReadinessStepLike[];
+  deliveryTarget?: string | null;
   settingsView?: WorkspaceSettingsView | MinimalSettingsView;
   runtimeStatus?: Record<string, WorkflowRuntimeIntegrationStatus>;
   /**
@@ -147,7 +153,8 @@ export function evaluateStepSourceReadiness(input: {
    */
   workspaceId?: string;
 }): WorkflowReadinessBlocker[] {
-  const querySteps = (input.steps || []).filter((step) => step.kind === 'query');
+  const steps = input.steps || [];
+  const querySteps = steps.filter((step) => step.kind === 'query');
   const blockers: WorkflowReadinessBlocker[] = [];
   const seen = new Set<string>();
 
@@ -258,6 +265,42 @@ export function evaluateStepSourceReadiness(input: {
     });
   }
 
+  if (steps.some((step) => step.kind === 'search') && !input.runtimeStatus?.tavily?.ready) {
+    blockers.push({
+      key: 'tavily',
+      label: 'Connect Web search',
+      detail: input.runtimeStatus?.tavily?.detail || 'Web search is not configured on the server.',
+      route: connectRoute('tavily'),
+    });
+  }
+
+  for (const step of steps.filter((candidate) => candidate.kind === 'deliver')) {
+    const target = step.deliveryTarget?.target?.trim() || input.deliveryTarget?.trim() || '';
+    if (!target) {
+      if (!blockers.some((blocker) => blocker.key === 'delivery_target')) {
+        blockers.push({
+          key: 'delivery_target',
+          label: 'Add a delivery destination',
+          detail: 'This automation has a delivery step but nowhere to send it.',
+          route: '/automations',
+        });
+      }
+      continue;
+    }
+
+    const channel = step.deliveryTarget?.channel || (target.includes('@') ? 'email' : 'slack');
+    const integrationId = channel === 'email' ? 'postmark' : 'slack';
+    if (input.runtimeStatus?.[integrationId]?.ready) continue;
+    if (blockers.some((blocker) => blocker.key === integrationId)) continue;
+    const label = labelIntegrationId(integrationId);
+    blockers.push({
+      key: integrationId,
+      label: `Connect ${label}`,
+      detail: input.runtimeStatus?.[integrationId]?.detail || `${label} delivery is not ready.`,
+      route: connectRoute(integrationId),
+    });
+  }
+
   return blockers;
 }
 
@@ -315,16 +358,28 @@ export function evaluateRunReadiness(input: {
       runtimeStatus: input.runtimeStatus,
     });
 
+    const executionBlockers = evaluateStepSourceReadiness({
+      steps: input.steps,
+      deliveryTarget: input.deliveryTarget,
+      settingsView: input.settingsView,
+      runtimeStatus: input.runtimeStatus,
+      workspaceId: input.workspaceId,
+    });
+    const blockers = [...report.blockers];
+    for (const blocker of executionBlockers) {
+      if (!blockers.some((existing) => existing.key === blocker.key)) blockers.push(blocker);
+    }
     decision = {
-      allowed: report.ready,
+      allowed: blockers.length === 0,
       tier: 'supported_workflow',
       workflowId: input.workflowId,
-      summary: report.ready ? report.summary : summarizeBlockers(report.blockers),
-      blockers: report.blockers,
+      summary: blockers.length === 0 ? report.summary : summarizeBlockers(blockers),
+      blockers,
     };
   } else {
     const blockers = evaluateStepSourceReadiness({
       steps: input.steps,
+      deliveryTarget: input.deliveryTarget,
       settingsView: input.settingsView,
       runtimeStatus: input.runtimeStatus,
       workspaceId: input.workspaceId,

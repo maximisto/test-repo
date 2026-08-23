@@ -68,6 +68,7 @@ async function withSlackEventsServer(run: (context: EventsTestContext) => Promis
   process.env.SLACK_SIGNING_SECRET = SIGNING_SECRET;
   process.env.SLACK_OPERATOR_USER_IDS = OPERATOR_ID;
   process.env.SLACK_BOT_TOKEN = 'xoxb-test-token';
+  process.env.OPENROUTER_API_KEY = 'test-key-route-readiness';
 
   const posts: Array<Record<string, unknown>> = [];
   let server: http.Server | null = null;
@@ -272,6 +273,39 @@ test('a non-operator asking to run a mission is refused and nothing starts', asy
     context.replies().some((text) => text.includes('Started')),
     false,
     'a non-operator must not be able to start a mission',
+  );
+}));
+
+test('Slack refuses before acknowledgement when only the forecast fits available credits', async () => withSlackEventsServer(async (context) => {
+  const store = await import('../src/platform/store');
+  store.addLedgerEntry({
+    workspaceId: context.workspaceId,
+    source: 'manual_adjustment',
+    deltaCredits: 100,
+    referenceType: 'manual',
+    referenceId: 'slack_hard_envelope_test',
+  });
+  const runsBefore = store.listTaskRuns(context.workspaceId).length;
+
+  await postEvent(context, {
+    type: 'app_mention',
+    channel: REVIEW_CHANNEL,
+    user: OPERATOR_ID,
+    text: '<@U_BOT> run QA founder update',
+    ts: '1712345601.500100',
+  });
+
+  const reply = await waitFor(
+    () => context.replies().find((text) => /credits/i.test(text) && /available|required/i.test(text)),
+    'the hard-envelope credit refusal',
+  );
+  assert.match(reply, /does not have enough credits/i);
+  assert.match(reply, /100 available, \d+ required/i);
+  assert.equal(context.replies().some((text) => text.includes('Started')), false);
+  assert.equal(
+    store.listTaskRuns(context.workspaceId).length,
+    runsBefore,
+    'the Slack acknowledgement never outruns the authoritative credit gate',
   );
 }));
 

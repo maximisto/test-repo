@@ -5,6 +5,7 @@ import {
   queryStripeRevenue,
   type StripeLikeClient,
 } from '../src/integrationGateway/adapters/nativeStripe';
+import { executeQueryData } from '../src/integrationGateway/queryData';
 
 const now = new Date('2026-06-29T12:00:00.000Z');
 
@@ -441,6 +442,49 @@ test('queryStripeRevenue returns integration_query_failed when Stripe pagination
   assert.equal(result.code, 'integration_query_failed');
   assert.match(result.message, /cursor did not advance/i);
   assert.equal(subscriptionCalls, 2);
+});
+
+test('an automation query abort stops hung Stripe pages and supplies bounded SDK request options', async () => {
+  const controller = new AbortController();
+  const requestOptions: Array<{ timeout?: number; maxNetworkRetries?: number } | undefined> = [];
+  let enteredCount = 0;
+  let allEntered!: () => void;
+  const allEnteredPromise = new Promise<void>((resolve) => { allEntered = resolve; });
+  const hungList = async (
+    _params: Record<string, unknown>,
+    options?: { timeout?: number; maxNetworkRetries?: number },
+  ): Promise<never> => {
+    requestOptions.push(options);
+    enteredCount += 1;
+    if (enteredCount === 3) allEntered();
+    return new Promise<never>(() => undefined);
+  };
+  const client: StripeLikeClient = {
+    subscriptions: { list: hungList },
+    invoices: { list: hungList },
+    charges: { list: hungList },
+  };
+
+  const query = executeQueryData({
+    workspaceId: 'workspace_stripe_abort',
+    source: 'stripe',
+    queryType: 'revenue_summary',
+    signal: controller.signal,
+    clientOverrides: { stripe: client },
+  });
+  await allEnteredPromise;
+  controller.abort(new Error('stripe step deadline expired'));
+  const result = await query;
+
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.equal(result.code, 'integration_query_failed');
+  assert.match(result.message, /stripe step deadline expired/i);
+  assert.equal(requestOptions.length, 3);
+  for (const options of requestOptions) {
+    assert.equal(options?.timeout, 30_000);
+    assert.equal(options?.maxNetworkRetries, 0);
+  }
 });
 
 test('queryStripeRevenue excludes failed charges linked to already-counted failed invoices', async () => {

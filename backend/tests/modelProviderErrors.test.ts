@@ -39,7 +39,10 @@ const ENV_KEYS = [
  */
 async function withOpenAIRouteReturning(
   makeResponse: () => Response,
-  run: (context: { generate: () => Promise<unknown>; fetchCalls: () => number }) => Promise<void>,
+  run: (context: {
+    generate: (options?: import('../src/models').TextGenerationOptions) => Promise<unknown>;
+    fetchCalls: () => number;
+  }) => Promise<void>,
 ) {
   const originalFetch = global.fetch;
   const originalWarn = console.warn;
@@ -61,13 +64,14 @@ async function withOpenAIRouteReturning(
     const { generateTextDetailed } = require('../src/models') as typeof import('../src/models');
 
     await run({
-      generate: () =>
+      generate: (options) =>
         generateTextDetailed(
           'micro',
           'Write a concise founder brief.',
           [{ role: 'user', content: 'Summarize the run.' }],
           300,
           'test-workspace',
+          options,
         ),
       fetchCalls: () => fetchCalls,
     });
@@ -132,9 +136,205 @@ test("a finish_reason of 'error' with no content surfaces the failure instead of
         { headers: { 'content-type': 'application/json' }, status: 200 },
       ),
     async ({ generate }) => {
-      await assert.rejects(generate(), (error: Error) => {
+      const failedUsages: Array<import('../src/models').TextGenerationUsage | undefined> = [];
+      await assert.rejects(generate({
+        onAttemptFailure: (_attempt, _error, usage) => {
+          failedUsages.push(usage);
+        },
+      }), (error: Error) => {
         assert.match(error.message, /openai\/gpt-4\.1-mini/);
         assert.match(error.message, /error finish/i);
+        return true;
+      });
+      assert.ok(failedUsages.length >= 2, 'the retryable finish error should report each billed attempt');
+      assert.ok(failedUsages.every((usage) => usage?.totalTokens === 10));
+    },
+  );
+});
+
+test('a nonempty provider response without a terminal finish reason is never accepted as complete', async () => {
+  await withOpenAIRouteReturning(
+    () =>
+      new Response(
+        JSON.stringify({
+          choices: [{ message: { content: 'A partial body with no terminal reason.' } }],
+          usage: { prompt_tokens: 10, completion_tokens: 7, total_tokens: 17 },
+        }),
+        { headers: { 'content-type': 'application/json' }, status: 200 },
+      ),
+    async ({ generate }) => {
+      const failedUsages: Array<import('../src/models').TextGenerationUsage | undefined> = [];
+      await assert.rejects(generate({
+        onAttemptFailure: (_attempt, _error, usage) => { failedUsages.push(usage); },
+      }), /terminal finish reason/i);
+      assert.ok(failedUsages.length >= 2, 'the malformed provider response remains visible per physical attempt');
+      assert.ok(failedUsages.every((usage) => usage?.totalTokens === 17));
+    },
+  );
+});
+
+test('a retryable HTTP 502 preserves the structured provider cause and route identity', async () => {
+  await withOpenAIRouteReturning(
+    () =>
+      new Response(
+        JSON.stringify({ error: { message: 'Upstream provider died during generation' } }),
+        { headers: { 'content-type': 'application/json' }, status: 502, statusText: 'Bad Gateway' },
+      ),
+    async ({ generate, fetchCalls }) => {
+      await assert.rejects(generate(), (error: Error) => {
+        assert.match(error.message, /openai\/gpt-4\.1-mini request failed \(502\)/);
+        assert.match(error.message, /Upstream provider died during generation/);
+        return true;
+      });
+      assert.ok(fetchCalls() >= 2, `expected a retry, saw ${fetchCalls()} call(s)`);
+    },
+  );
+});
+
+test('a retryable HTTP error reports provider-supplied usage for every billed attempt', async () => {
+  await withOpenAIRouteReturning(
+    () =>
+      new Response(
+        JSON.stringify({
+          error: { message: 'Upstream billed the failed generation' },
+          usage: { prompt_tokens: 19, completion_tokens: 2, total_tokens: 21 },
+        }),
+        { headers: { 'content-type': 'application/json' }, status: 502, statusText: 'Bad Gateway' },
+      ),
+    async ({ generate, fetchCalls }) => {
+      const failedUsages: Array<import('../src/models').TextGenerationUsage | undefined> = [];
+      await assert.rejects(generate({
+        onAttemptFailure: (_attempt, _error, usage) => {
+          failedUsages.push(usage);
+        },
+      }), /Upstream billed the failed generation/);
+
+      assert.equal(failedUsages.length, fetchCalls());
+      assert.ok(failedUsages.length >= 2, 'the transient failure should retry');
+      assert.ok(failedUsages.every((usage) => usage?.totalTokens === 21));
+      assert.ok(failedUsages.every((usage) => usage?.provider === 'openai'));
+    },
+  );
+});
+
+test('an oversized retryable error preserves its bounded cause and usage fields', async () => {
+  await withOpenAIRouteReturning(
+    () =>
+      new Response(
+        JSON.stringify({
+          error: {
+            message: 'Upstream billed then failed',
+            details: 'x'.repeat(5_000),
+          },
+          usage: { prompt_tokens: 19, completion_tokens: 2, total_tokens: 21 },
+        }),
+        { headers: { 'content-type': 'application/json' }, status: 502, statusText: 'Bad Gateway' },
+      ),
+    async ({ generate, fetchCalls }) => {
+      const failedUsages: Array<import('../src/models').TextGenerationUsage | undefined> = [];
+      await assert.rejects(generate({
+        onAttemptFailure: (_attempt, _error, usage) => {
+          failedUsages.push(usage);
+        },
+      }), /Upstream billed then failed/);
+      assert.equal(failedUsages.length, fetchCalls());
+      assert.ok(failedUsages.length >= 2);
+      assert.ok(failedUsages.every((usage) => usage?.totalTokens === 21));
+    },
+  );
+});
+
+test('provider causes preserve the category while redacting credentials and echoed customer text', async () => {
+  await withOpenAIRouteReturning(
+    () => new Response(JSON.stringify({
+      error: {
+        message:
+          'Upstream authentication proxy failed. Authorization: Bearer sk-live-1234567890 prompt: CUSTOMER_SENTINEL_PRIVATE_PLAN',
+      },
+    }), { headers: { 'content-type': 'application/json' }, status: 502, statusText: 'Bad Gateway' }),
+    async ({ generate }) => {
+      await assert.rejects(generate(), (error: Error) => {
+        assert.match(error.message, /authentication proxy failed/i);
+        assert.doesNotMatch(error.message, /sk-live|1234567890|CUSTOMER_SENTINEL_PRIVATE_PLAN/);
+        assert.match(error.message, /redacted/i);
+        return true;
+      });
+    },
+  );
+
+  await withOpenAIRouteReturning(
+    () => new Response(
+      'raw proxy dump Authorization: Bearer sk-raw-123456789 CUSTOMER_RAW_SENTINEL',
+      { status: 502, statusText: 'Bad Gateway' },
+    ),
+    async ({ generate }) => {
+      await assert.rejects(generate(), (error: Error) => {
+        assert.match(error.message, /Bad Gateway|provider request failed/i);
+        assert.doesNotMatch(error.message, /sk-raw|CUSTOMER_RAW_SENTINEL|raw proxy dump/);
+        return true;
+      });
+    },
+  );
+});
+
+test('quoted JSON request payloads are stripped from structured provider errors', async () => {
+  await withOpenAIRouteReturning(
+    () => new Response(JSON.stringify({
+      error: {
+        message:
+          'Validation failed upstream: {"messages":[{"content":"CUSTOMER_SENTINEL_PRIVATE_PLAN"}]}',
+      },
+    }), { headers: { 'content-type': 'application/json' }, status: 502, statusText: 'Bad Gateway' }),
+    async ({ generate }) => {
+      await assert.rejects(generate(), (error: Error) => {
+        assert.match(error.message, /Validation failed upstream/i);
+        assert.match(error.message, /redacted customer content/i);
+        assert.doesNotMatch(error.message, /CUSTOMER_SENTINEL_PRIVATE_PLAN|"content"/);
+        return true;
+      });
+    },
+  );
+});
+
+test('provider-specific request key variants cannot leak echoed customer payloads', async () => {
+  await withOpenAIRouteReturning(
+    () => new Response(JSON.stringify({
+      error: {
+        message:
+          'Validation failed upstream: {"input_text":"CUSTOMER_INPUT_SENTINEL","request_body":{"messages":["CUSTOMER_BODY_SENTINEL"]}}',
+      },
+    }), { headers: { 'content-type': 'application/json' }, status: 502, statusText: 'Bad Gateway' }),
+    async ({ generate }) => {
+      await assert.rejects(generate(), (error: Error) => {
+        assert.match(error.message, /Validation failed upstream/i);
+        assert.match(error.message, /redacted customer content/i);
+        assert.doesNotMatch(
+          error.message,
+          /CUSTOMER_INPUT_SENTINEL|CUSTOMER_BODY_SENTINEL|input_text|request_body/,
+        );
+        return true;
+      });
+    },
+  );
+});
+
+test('response-read failures sanitize provider-derived parser text', async () => {
+  await withOpenAIRouteReturning(
+    () => ({
+      status: 200,
+      statusText: 'OK',
+      ok: true,
+      json: async () => {
+        throw new Error(
+          'Malformed response near "prompt":"CUSTOMER_RESPONSE_READ_SENTINEL" Authorization: Bearer sk-private-123456789',
+        );
+      },
+    } as unknown as Response),
+    async ({ generate }) => {
+      await assert.rejects(generate(), (error: Error) => {
+        assert.match(error.message, /response could not be read/i);
+        assert.match(error.message, /redacted/i);
+        assert.doesNotMatch(error.message, /CUSTOMER_RESPONSE_READ_SENTINEL|sk-private|123456789/);
         return true;
       });
     },

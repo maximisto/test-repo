@@ -171,10 +171,11 @@ test('manual run endpoint answers 409 workflow_not_ready and never triggers the 
     assert.equal(payload.message, payload.error);
 
     const blockers = payload.blockers as Array<Record<string, unknown>>;
-    assert.equal(blockers.length, 1);
-    assert.equal(blockers[0].key, 'stripe');
+    assert.deepEqual(blockers.map((blocker) => blocker.key), ['stripe', 'slack']);
     assert.equal(blockers[0].label, 'Connect Stripe');
     assert.match(String(blockers[0].route), /^\/integrations\?provider=stripe/);
+    assert.equal(blockers[1].label, 'Connect Slack');
+    assert.match(String(blockers[1].route), /^\/integrations\?provider=slack/);
 
     // Blocked before triggering: no run record, so nothing was even attempted.
     assert.equal(store.listTaskRuns(workspaceId).length, runsBefore);
@@ -187,7 +188,17 @@ test('rerun endpoint answers 409 workflow_not_ready without starting a fresh run
       title: 'QA revenue watch',
       kind: 'automation',
       priority: 'medium',
-      metadata: { automationId },
+      delegationState: 'review',
+      metadata: {
+        automationId,
+        reviewRequired: true,
+        reviewRequest: {
+          status: 'changes_requested',
+          note: 'Try again.',
+          reviewer: 'QA Operator',
+          requestedAt: '2026-08-22T12:00:00.000Z',
+        },
+      },
     });
     const taskRun = store.createTaskRun({
       workspaceId,
@@ -195,8 +206,19 @@ test('rerun endpoint answers 409 workflow_not_ready without starting a fresh run
       agentRole: 'analyst',
       modelTier: 'default',
       estimatedCredits: 10,
-      metadata: { automationId, artifacts: [] },
+      metadata: {
+        automationId,
+        artifacts: [],
+        reviewRequired: true,
+        reviewRequest: {
+          status: 'changes_requested',
+          note: 'Try again.',
+          reviewer: 'QA Operator',
+          requestedAt: '2026-08-22T12:00:00.000Z',
+        },
+      },
     });
+    store.updateTask(task.id, { status: 'blocked', delegationState: 'review' });
     const runsBefore = store.listTaskRuns(workspaceId).length;
 
     const response = await fetch(

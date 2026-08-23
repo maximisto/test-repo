@@ -23,6 +23,7 @@ test('generateTextDetailed falls back to OpenAI after retryable Anthropic failur
   };
   let anthropicCalls = 0;
   let fetchCalls = 0;
+  const attemptEvents: string[] = [];
 
   try {
     process.env.ANTHROPIC_API_KEY = 'test-anthropic-key';
@@ -76,6 +77,17 @@ test('generateTextDetailed falls back to OpenAI after retryable Anthropic failur
       [{ role: 'user', content: 'Summarize the run.' }],
       300,
       'test-workspace',
+      {
+        beforeAttempt: (attempt) => {
+          attemptEvents.push(`before:${attempt.provider}:${attempt.attemptNumber}`);
+        },
+        onAttemptFailure: (attempt) => {
+          attemptEvents.push(`failed:${attempt.provider}:${attempt.attemptNumber}`);
+        },
+        onAttemptSuccess: (attempt) => {
+          attemptEvents.push(`succeeded:${attempt.provider}:${attempt.attemptNumber}`);
+        },
+      },
     );
 
     assert.equal(result.text, 'Fallback founder brief');
@@ -83,6 +95,14 @@ test('generateTextDetailed falls back to OpenAI after retryable Anthropic failur
     assert.equal(result.usage?.totalTokens, 18);
     assert.equal(anthropicCalls, 2);
     assert.equal(fetchCalls, 1);
+    assert.deepEqual(attemptEvents, [
+      'before:anthropic:1',
+      'failed:anthropic:1',
+      'before:anthropic:2',
+      'failed:anthropic:2',
+      'before:openai:1',
+      'succeeded:openai:1',
+    ]);
   } finally {
     moduleWithLoader._load = originalLoad;
     global.fetch = originalFetch;
@@ -108,6 +128,75 @@ test('generateTextDetailed falls back to OpenAI after retryable Anthropic failur
     else delete process.env.MODEL_FALLBACK_OPENROUTER_MODEL;
     if (typeof originalEnv.openrouter === 'string') process.env.OPENROUTER_API_KEY = originalEnv.openrouter;
     else delete process.env.OPENROUTER_API_KEY;
+    delete require.cache[require.resolve('../src/models')];
+  }
+});
+
+test('a successful provider response is not replayed when its accounting hook fails', async () => {
+  const originalFetch = global.fetch;
+  const originalWarn = console.warn;
+  const envKeys = [
+    'OPENAI_API_KEY',
+    'OPENROUTER_API_KEY',
+    'MODEL_RETRY_DELAYS_MS',
+    'MODEL_DEFAULT_PROVIDER',
+    'MODEL_DEFAULT_MODEL',
+    'MODEL_DEFAULT_API_KEY_ENV',
+    'MODEL_DEFAULT_BASE_URL',
+    'MODEL_DEFAULT_FALLBACK_1_PROVIDER',
+    'MODEL_DEFAULT_FALLBACK_1_MODEL',
+    'MODEL_DEFAULT_FALLBACK_1_API_KEY_ENV',
+    'MODEL_DEFAULT_FALLBACK_1_BASE_URL',
+  ] as const;
+  const originalEnv = new Map(envKeys.map((key) => [key, process.env[key]] as const));
+  const urls: string[] = [];
+
+  try {
+    console.warn = () => {};
+    process.env.OPENAI_API_KEY = 'test-openai-key';
+    process.env.OPENROUTER_API_KEY = 'test-openrouter-key';
+    process.env.MODEL_RETRY_DELAYS_MS = '0';
+    process.env.MODEL_DEFAULT_PROVIDER = 'openai';
+    process.env.MODEL_DEFAULT_MODEL = 'test-primary';
+    process.env.MODEL_DEFAULT_API_KEY_ENV = 'OPENAI_API_KEY';
+    process.env.MODEL_DEFAULT_BASE_URL = 'https://primary.invalid/v1';
+    process.env.MODEL_DEFAULT_FALLBACK_1_PROVIDER = 'openrouter';
+    process.env.MODEL_DEFAULT_FALLBACK_1_MODEL = 'test-fallback';
+    process.env.MODEL_DEFAULT_FALLBACK_1_API_KEY_ENV = 'OPENROUTER_API_KEY';
+    process.env.MODEL_DEFAULT_FALLBACK_1_BASE_URL = 'https://fallback.invalid/v1';
+
+    global.fetch = async (input) => {
+      urls.push(String(input));
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: 'Already billed once' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 7, completion_tokens: 4, total_tokens: 11 },
+      }), { headers: { 'content-type': 'application/json' }, status: 200 });
+    };
+
+    delete require.cache[require.resolve('../src/models')];
+    const { generateTextDetailed } = require('../src/models') as typeof import('../src/models');
+    const hookFailure = Object.assign(new Error('journal unavailable'), { status: 503 });
+    await assert.rejects(
+      generateTextDetailed(
+        'default',
+        'system',
+        [{ role: 'user', content: 'user' }],
+        50,
+        'workspace-hook-failure',
+        { onAttemptSuccess: () => { throw hookFailure; } },
+      ),
+      /onAttemptSuccess hook failed: journal unavailable/,
+    );
+
+    assert.deepEqual(urls, ['https://primary.invalid/v1/chat/completions']);
+  } finally {
+    global.fetch = originalFetch;
+    console.warn = originalWarn;
+    for (const key of envKeys) {
+      const value = originalEnv.get(key);
+      if (typeof value === 'string') process.env[key] = value;
+      else delete process.env[key];
+    }
     delete require.cache[require.resolve('../src/models')];
   }
 });
@@ -177,7 +266,7 @@ test('generateTextDetailed keeps walking backup route chain when the first fallb
         assert.equal(body.model, 'z-ai/glm-5.2');
         assert.deepEqual(body.reasoning, { enabled: false });
         return new Response(JSON.stringify({
-          choices: [{ message: { content: 'GLM fallback founder brief' } }],
+          choices: [{ message: { content: 'GLM fallback founder brief' }, finish_reason: 'stop' }],
           usage: { prompt_tokens: 13, completion_tokens: 8, total_tokens: 21 },
         }), {
           headers: { 'content-type': 'application/json' },
@@ -282,6 +371,7 @@ test('generateTextDetailed supports Anthropic fallback after GLM primary and Ope
                 assert.equal(body.model, 'claude-sonnet-4-6');
                 return {
                   content: [{ type: 'text', text: 'Anthropic backup founder brief' }],
+                  stop_reason: 'end_turn',
                   usage: { input_tokens: 17, output_tokens: 9 },
                 };
               },
@@ -362,6 +452,79 @@ test('generateTextDetailed supports Anthropic fallback after GLM primary and Ope
     else delete process.env.MODEL_DEFAULT_FALLBACK_2_MODEL;
     if (typeof originalEnv.fallback2ApiKeyEnv === 'string') process.env.MODEL_DEFAULT_FALLBACK_2_API_KEY_ENV = originalEnv.fallback2ApiKeyEnv;
     else delete process.env.MODEL_DEFAULT_FALLBACK_2_API_KEY_ENV;
+    delete require.cache[require.resolve('../src/models')];
+  }
+});
+
+test('an OpenRouter-only deployment skips an unconfigured Anthropic primary', async () => {
+  const originalFetch = global.fetch;
+  const envKeys = [
+    'ANTHROPIC_API_KEY',
+    'OPENAI_API_KEY',
+    'OPENROUTER_API_KEY',
+    'MINIMAX_API_KEY',
+    'ZAI_API_KEY',
+    'MODEL_DEFAULT_PROVIDER',
+    'MODEL_DEFAULT_MODEL',
+    'MODEL_DEFAULT_API_KEY_ENV',
+    'MODEL_DEFAULT_BASE_URL',
+    'MODEL_DEFAULT_FALLBACK_PROVIDER',
+    'MODEL_DEFAULT_FALLBACK_MODEL',
+    'MODEL_DEFAULT_FALLBACK_API_KEY_ENV',
+    'MODEL_DEFAULT_FALLBACK_BASE_URL',
+    'MODEL_DEFAULT_FALLBACK_1_PROVIDER',
+    'MODEL_DEFAULT_FALLBACK_1_MODEL',
+    'MODEL_DEFAULT_FALLBACK_1_API_KEY_ENV',
+    'MODEL_DEFAULT_FALLBACK_1_BASE_URL',
+  ] as const;
+  const originalEnv = new Map(envKeys.map((key) => [key, process.env[key]] as const));
+  const urls: string[] = [];
+
+  try {
+    for (const key of envKeys) delete process.env[key];
+    process.env.OPENROUTER_API_KEY = 'test-openrouter-only-key';
+    process.env.MODEL_DEFAULT_PROVIDER = 'anthropic';
+    process.env.MODEL_DEFAULT_MODEL = 'claude-sonnet-5';
+    process.env.MODEL_DEFAULT_API_KEY_ENV = 'ANTHROPIC_API_KEY';
+    process.env.MODEL_DEFAULT_FALLBACK_1_PROVIDER = 'openrouter';
+    process.env.MODEL_DEFAULT_FALLBACK_1_MODEL = 'z-ai/glm-5.2';
+    process.env.MODEL_DEFAULT_FALLBACK_1_API_KEY_ENV = 'OPENROUTER_API_KEY';
+    process.env.MODEL_DEFAULT_FALLBACK_1_BASE_URL = 'https://openrouter.ai/api/v1';
+
+    global.fetch = async (input) => {
+      urls.push(String(input));
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: 'OpenRouter-only founder brief' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 12, completion_tokens: 6, total_tokens: 18 },
+      }), { headers: { 'content-type': 'application/json' }, status: 200 });
+    };
+
+    delete require.cache[require.resolve('../src/models')];
+    const { generateTextDetailed, getModelRoutingStatus } = require('../src/models') as typeof import('../src/models');
+    const routing = getModelRoutingStatus('workspace-openrouter-only') as {
+      default: { configured: boolean; fallbacks: Array<{ provider: string; configured: boolean }> };
+    };
+    assert.equal(routing.default.configured, false);
+    assert.ok(routing.default.fallbacks.some((route) => route.provider === 'openrouter' && route.configured));
+
+    const result = await generateTextDetailed(
+      'default',
+      'Write a concise founder brief.',
+      [{ role: 'user', content: 'Summarize the run.' }],
+      300,
+      'workspace-openrouter-only',
+    );
+
+    assert.equal(result.text, 'OpenRouter-only founder brief');
+    assert.equal(result.usage?.provider, 'openrouter');
+    assert.deepEqual(urls, ['https://openrouter.ai/api/v1/chat/completions']);
+  } finally {
+    global.fetch = originalFetch;
+    for (const key of envKeys) {
+      const value = originalEnv.get(key);
+      if (typeof value === 'string') process.env[key] = value;
+      else delete process.env[key];
+    }
     delete require.cache[require.resolve('../src/models')];
   }
 });
