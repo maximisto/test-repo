@@ -22,7 +22,7 @@ type Profile = 'micro' | 'default' | 'hard' | 'critical' | 'ops' | 'memory_text'
 type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
 type AutoGraduationProfileId = 'cautious' | 'balanced' | 'fast_learning';
 type WorkflowArchetypeId = 'briefing' | 'research' | 'analysis' | 'ops' | 'general';
-type FolderDropLaneState = 'not_configured' | 'no_library_yet' | 'needs_share' | 'active';
+type FolderDropLaneState = 'not_configured' | 'no_library_yet' | 'needs_share' | 'unavailable' | 'active';
 
 interface ProviderStatus {
   configured: boolean;
@@ -88,6 +88,26 @@ interface FolderDropStatus {
   readerEmail: string | null;
   rootFolderId: string | null;
   manualShare?: boolean;
+}
+
+async function readFolderDropResponse(response: Response, fallbackMessage: string): Promise<FolderDropStatus> {
+  let payload: (Partial<FolderDropStatus> & { error?: string }) | null = null;
+  try {
+    payload = await response.json() as Partial<FolderDropStatus> & { error?: string };
+  } catch {
+    // The status code still controls the branch; use the bounded local copy.
+  }
+  if (!response.ok) {
+    // A manual-share-required 409 is an expected, actionable lane state. Keep
+    // the reader address and folder id so the callout can render instead of
+    // throwing them away with a generic error.
+    if (payload?.manualShare && payload.laneState === 'needs_share') {
+      return payload as FolderDropStatus;
+    }
+    throw new Error(payload?.error || fallbackMessage);
+  }
+  if (!payload?.laneState) throw new Error(fallbackMessage);
+  return payload as FolderDropStatus;
 }
 
 interface ProviderTestState {
@@ -237,6 +257,7 @@ const FOLDER_DROP_LANE_COPY: Record<FolderDropLaneState, string> = {
   no_library_yet:
     "Your Violema Library folder doesn't exist yet. It's created the first time a mission files something there — run a mission with a library step, then come back.",
   needs_share: 'Share your Violema Library folder with the reader address below, then verify.',
+  unavailable: 'Google Drive or the Violema reader is temporarily unavailable. Retry later; re-sharing the folder will not fix this incident.',
   active: 'Violema can see files you drop in your Violema Library folder.',
 };
 
@@ -244,6 +265,7 @@ const FOLDER_DROP_LANE_LABEL: Record<FolderDropLaneState, string> = {
   not_configured: 'Not configured',
   no_library_yet: 'Not created yet',
   needs_share: 'Needs share',
+  unavailable: 'Unavailable',
   active: 'Active',
 };
 
@@ -327,6 +349,7 @@ export default function SettingsPage() {
   // derived from the reader-email or URL inputs below.
   const [folderDropLoading, setFolderDropLoading] = useState(true);
   const [folderDropStatus, setFolderDropStatus] = useState<FolderDropStatus | null>(null);
+  const [folderDropError, setFolderDropError] = useState<string | null>(null);
   const [folderDropVerifying, setFolderDropVerifying] = useState(false);
   const [folderDropSharing, setFolderDropSharing] = useState(false);
   const [folderDropNotice, setFolderDropNotice] = useState<{ tone: 'success' | 'error'; message: string } | null>(null);
@@ -456,6 +479,8 @@ export default function SettingsPage() {
 
   async function loadFolderDropStatus() {
     setFolderDropLoading(true);
+    setFolderDropStatus(null);
+    setFolderDropError(null);
     try {
       const response = await fetch(`/api/workspace/library/folder-drop?workspace_id=${encodeURIComponent(workspace.workspaceId)}&workspace_name=${encodeURIComponent(workspace.workspaceName)}`, {
         headers: {
@@ -463,11 +488,13 @@ export default function SettingsPage() {
           'X-Workspace-Name': workspace.workspaceName,
         },
       });
-      if (!response.ok) throw new Error('Could not load your folder-drop status');
-      const payload = await response.json() as FolderDropStatus;
+      const payload = await readFolderDropResponse(response, 'Could not load your folder-drop status.');
       setFolderDropStatus(payload);
     } catch (error) {
-      setNotice({ tone: 'error', message: error instanceof Error ? error.message : 'Could not load your folder-drop status.' });
+      const message = error instanceof Error ? error.message : 'Could not load your folder-drop status.';
+      setFolderDropStatus(null);
+      setFolderDropError(message);
+      setNotice({ tone: 'error', message });
     } finally {
       setFolderDropLoading(false);
     }
@@ -624,6 +651,7 @@ export default function SettingsPage() {
   async function handleFolderDropVerify() {
     setFolderDropVerifying(true);
     setFolderDropNotice(null);
+    setFolderDropError(null);
     try {
       const response = await fetch('/api/workspace/library/folder-drop/verify', {
         method: 'POST',
@@ -634,8 +662,7 @@ export default function SettingsPage() {
         },
         body: JSON.stringify({ workspaceId: workspace.workspaceId, workspaceName: workspace.workspaceName }),
       });
-      if (!response.ok) throw new Error('Could not verify your folder-drop lane');
-      const payload = await response.json() as FolderDropStatus;
+      const payload = await readFolderDropResponse(response, 'Could not verify your folder-drop lane.');
       setFolderDropStatus(payload);
       setFolderDropNotice(
         payload.laneState === 'active'
@@ -643,7 +670,10 @@ export default function SettingsPage() {
           : { tone: 'error', message: FOLDER_DROP_LANE_COPY[payload.laneState] },
       );
     } catch (error) {
-      setFolderDropNotice({ tone: 'error', message: error instanceof Error ? error.message : 'Could not verify your folder-drop lane.' });
+      const message = error instanceof Error ? error.message : 'Could not verify your folder-drop lane.';
+      setFolderDropStatus(null);
+      setFolderDropError(message);
+      setFolderDropNotice({ tone: 'error', message });
     } finally {
       setFolderDropVerifying(false);
     }
@@ -652,6 +682,7 @@ export default function SettingsPage() {
   async function handleFolderDropShare() {
     setFolderDropSharing(true);
     setFolderDropNotice(null);
+    setFolderDropError(null);
     try {
       const response = await fetch('/api/workspace/library/folder-drop/share', {
         method: 'POST',
@@ -662,14 +693,16 @@ export default function SettingsPage() {
         },
         body: JSON.stringify({ workspaceId: workspace.workspaceId, workspaceName: workspace.workspaceName }),
       });
-      if (!response.ok) throw new Error('Could not share your library folder');
-      const payload = await response.json() as FolderDropStatus;
+      const payload = await readFolderDropResponse(response, 'Could not share your library folder.');
       setFolderDropStatus(payload);
       if (!payload.manualShare && payload.laneState !== 'active') {
         setFolderDropNotice({ tone: 'error', message: FOLDER_DROP_LANE_COPY[payload.laneState] });
       }
     } catch (error) {
-      setFolderDropNotice({ tone: 'error', message: error instanceof Error ? error.message : 'Could not share your library folder.' });
+      const message = error instanceof Error ? error.message : 'Could not share your library folder.';
+      setFolderDropStatus(null);
+      setFolderDropError(message);
+      setFolderDropNotice({ tone: 'error', message });
     } finally {
       setFolderDropSharing(false);
     }
@@ -1025,18 +1058,32 @@ export default function SettingsPage() {
             <span className={`shrink-0 rounded-full border px-2 py-0.5 text-[10px] font-medium ${
               folderDropLoading
                 ? 'border-navy-700 bg-navy-900 text-slate-400'
+                : folderDropError
+                  ? 'border-red-500/18 bg-red-500/8 text-red-200'
                 : folderDropStatus?.laneState === 'active'
                   ? 'border-green-500/18 bg-green-500/8 text-green-200'
                   : folderDropStatus?.laneState === 'needs_share'
                     ? 'border-amber-500/18 bg-amber-500/8 text-amber-200'
                     : 'border-navy-700 bg-navy-900 text-slate-400'
             }`}>
-              {folderDropLoading ? 'Checking…' : FOLDER_DROP_LANE_LABEL[folderDropStatus?.laneState ?? 'not_configured']}
+              {folderDropLoading
+                ? 'Checking…'
+                : folderDropError
+                  ? 'Unavailable'
+                  : folderDropStatus
+                    ? FOLDER_DROP_LANE_LABEL[folderDropStatus.laneState]
+                    : 'Status unknown'}
             </span>
           </div>
 
           <div className="mt-4 rounded-xl border border-white/6 bg-white/[0.03] px-3 py-2.5 text-[12px] leading-relaxed text-slate-300">
-            {folderDropLoading ? 'Checking your folder-drop status…' : FOLDER_DROP_LANE_COPY[folderDropStatus?.laneState ?? 'not_configured']}
+            {folderDropLoading
+              ? 'Checking your folder-drop status…'
+              : folderDropError
+                ? folderDropError
+                : folderDropStatus
+                  ? FOLDER_DROP_LANE_COPY[folderDropStatus.laneState]
+                  : 'Folder-drop status is unavailable. Verify again to retry.'}
           </div>
 
           {!folderDropLoading && folderDropStatus?.readerEmail ? (
@@ -1077,7 +1124,7 @@ export default function SettingsPage() {
               Once this lane is active, files dropped into your Violema Library folder become available to missions automatically.
             </p>
             <div className="flex shrink-0 items-center gap-2">
-              {folderDropStatus?.laneState !== 'active' ? (
+              {folderDropStatus?.laneState === 'needs_share' ? (
                 <button
                   type="button"
                   onClick={() => void handleFolderDropShare()}

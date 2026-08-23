@@ -158,6 +158,40 @@ test('an unreachable Composio is reported as unverifiable, not as disconnected',
   assert.equal(composio.calls.length, 0);
 });
 
+test('an aborted identity-capability lookup stops before any tenant Slack send', async () => {
+  const composio = fakeComposio({ apps: ['slackbot'] });
+  const { sendTenantSlackMessage } = await import('../src/integrationGateway/slackDelivery');
+  const controller = new AbortController();
+  let entered!: () => void;
+  const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
+  let observedSignal = false;
+
+  const delivery = sendTenantSlackMessage(
+    {
+      workspaceId: TENANT_WORKSPACE,
+      to: '#founders',
+      body: 'This must never be sent after the run deadline.',
+      signal: controller.signal,
+    },
+    {
+      ...composio.deps,
+      readIdentityCapability: async (_workspaceId, signal) => {
+        observedSignal = signal === controller.signal;
+        entered();
+        return new Promise<'yes'>((_, reject) => {
+          signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+        });
+      },
+    },
+  );
+
+  await enteredPromise;
+  controller.abort(new Error('delivery deadline expired'));
+  await assert.rejects(delivery, /delivery deadline expired/);
+  assert.equal(observedSignal, true, 'the automation deadline reaches the capability lookup');
+  assert.equal(composio.calls.length, 0, 'no Slack action starts after cancellation');
+});
+
 test('a failed Composio send surfaces the provider error instead of reporting success', async () => {
   const composio = fakeComposio({
     apps: ['slackbot'],
@@ -173,6 +207,70 @@ test('a failed Composio send surfaces the provider error instead of reporting su
       ),
     /channel_not_found/,
   );
+});
+
+test('a failed Composio envelope never echoes request bodies or credentials', async () => {
+  const privateSentinel = 'CUSTOMER_PRIVATE_APPROVAL_BRIEF';
+  const credentialSentinel = 'sk_live_private_token';
+  const composio = fakeComposio({
+    apps: ['slackbot'],
+    envelope: {
+      successful: false,
+      error: {
+        message:
+          `Validation failed Authorization: Bearer ${credentialSentinel} `
+          + `request_body={"markdown_text":"${privateSentinel}"}${'x'.repeat(2_000)}`,
+      },
+    },
+  });
+  const { sendTenantSlackMessage } = await import('../src/integrationGateway/slackDelivery');
+
+  await assert.rejects(
+    () => sendTenantSlackMessage(
+      { workspaceId: TENANT_WORKSPACE, to: '#missing', body: privateSentinel },
+      composio.deps,
+    ),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.doesNotMatch(error.message, new RegExp(privateSentinel));
+      assert.doesNotMatch(error.message, new RegExp(credentialSentinel));
+      assert.ok(Buffer.byteLength(error.message, 'utf8') <= 600);
+      assert.match(error.message, /redacted|provider rejected/i);
+      return true;
+    },
+  );
+});
+
+test('tenant Slack preflight refuses a missing connection without executing a send', async () => {
+  const composio = fakeComposio({ apps: [] });
+  const { preflightMessageDelivery } = await import('../src/integrations');
+  await assert.rejects(
+    () => preflightMessageDelivery({
+      to: '#founders',
+      body: 'Approved brief.',
+      channel: 'slack',
+      workspaceId: TENANT_WORKSPACE,
+      tenantSlackDeps: composio.deps,
+    }),
+    /Connect Slack/,
+  );
+  assert.equal(composio.calls.length, 0);
+});
+
+test('tenant Slack preflight rejects an invalid exact target before executing a send', async () => {
+  const composio = fakeComposio({ apps: ['slackbot'] });
+  const { preflightMessageDelivery } = await import('../src/integrations');
+  await assert.rejects(
+    () => preflightMessageDelivery({
+      to: '#not a channel',
+      body: 'Approved brief.',
+      channel: 'slack',
+      workspaceId: TENANT_WORKSPACE,
+      tenantSlackDeps: composio.deps,
+    }),
+    /channel name|channel ID/i,
+  );
+  assert.equal(composio.calls.length, 0);
 });
 
 test('a long tenant brief continues in a thread rather than being truncated', async () => {
@@ -199,6 +297,27 @@ test('a long tenant brief continues in a thread rather than being truncated', as
   const delivered = composio.calls.map((call) => String(call.input.markdown_text)).join('\n');
   assert.match(delivered, /Line 0 of the operating brief/);
   assert.match(delivered, /Line 399 of the operating brief/);
+});
+
+test('a tenant Slack brief larger than the delivery ceiling is rejected before the first send', async () => {
+  const composio = fakeComposio({ apps: ['slackbot'] });
+  const { sendTenantSlackMessage } = await import('../src/integrationGateway/slackDelivery');
+  const tailMarker = 'TAIL_MUST_NOT_BE_DROPPED';
+  const body = `${'x'.repeat(3500 * 12)}\n${tailMarker}`;
+
+  await assert.rejects(
+    () => sendTenantSlackMessage(
+      { workspaceId: TENANT_WORKSPACE, to: '#founders', body },
+      composio.deps,
+    ),
+    /too long.*Slack|Slack.*too long/i,
+  );
+
+  assert.equal(
+    composio.calls.length,
+    0,
+    'an oversized brief is never partially sent and reported as delivered',
+  );
 });
 
 test('sendMessage routes a tenant Slack target through Composio', async () => {

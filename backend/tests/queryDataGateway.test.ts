@@ -178,6 +178,35 @@ test('applyQueryStepPayloadToExecution marks readiness errors as failed automati
   ]);
 });
 
+test('query failure diagnostics are byte-bounded and redact credentials before step persistence', () => {
+  const stepExecution = makeQueryStepExecution();
+  const stepErrors: string[] = [];
+  const privateToken = 'sk_live_PRIVATE_QUERY_TOKEN';
+  const privateCustomerText = 'CUSTOMER_SENTINEL_PRIVATE_PLAN';
+
+  applyQueryStepPayloadToExecution({
+    stepTitle: 'Check Stripe revenue',
+    payload: {
+      ok: false,
+      code: 'integration_query_failed',
+      source: 'stripe',
+      message: `Authorization: Bearer ${privateToken} request_body={"input_text":"${privateCustomerText}"} ${'\\'.repeat(100_000)}`,
+      raw_provider_response: { request_body: privateCustomerText },
+    },
+    stepExecution,
+    stepErrors,
+    artifactCount: 1,
+  });
+
+  assert.equal(stepExecution.status, 'failed');
+  assert.ok(Buffer.byteLength(stepExecution.error || '', 'utf8') <= 500);
+  assert.doesNotMatch(stepExecution.error || '', /PRIVATE_QUERY_TOKEN/);
+  assert.doesNotMatch(stepExecution.error || '', /CUSTOMER_SENTINEL/);
+  assert.doesNotMatch(stepErrors.join('\n'), /PRIVATE_QUERY_TOKEN/);
+  assert.doesNotMatch(JSON.stringify(stepExecution.output), /PRIVATE_QUERY_TOKEN|CUSTOMER_SENTINEL|raw_provider_response/);
+  assert.ok(Buffer.byteLength(JSON.stringify(stepExecution.output), 'utf8') <= 1_000);
+});
+
 test('applyQueryStepPayloadToExecution keeps successful live query payloads successful', () => {
   const stepExecution = makeQueryStepExecution();
   const stepErrors: string[] = [];

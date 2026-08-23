@@ -29,11 +29,15 @@ async function withReviewServer(run: (context: TestServerContext) => Promise<voi
   const originalCwd = process.cwd();
   const originalApproved = process.env.VIOLEMA_APPROVED_EMAILS;
   const originalDisableScheduler = process.env.VIOLEMA_DISABLE_AUTOMATION_SCHEDULER;
+  const originalPostmarkKey = process.env.POSTMARK_API_KEY;
+  const originalPostmarkFrom = process.env.POSTMARK_FROM_EMAIL;
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'violema-review-dry-run-'));
 
   process.chdir(tempDir);
   process.env.VIOLEMA_APPROVED_EMAILS = 'qa@example.com';
   process.env.VIOLEMA_DISABLE_AUTOMATION_SCHEDULER = '1';
+  process.env.POSTMARK_API_KEY = 'test-postmark-key';
+  process.env.POSTMARK_FROM_EMAIL = 'violema@example.com';
 
   let server: http.Server | null = null;
 
@@ -73,7 +77,6 @@ async function withReviewServer(run: (context: TestServerContext) => Promise<voi
       name: 'QA founder update',
       schedule: 'every monday at 9am',
       actions: ['Draft QA review'],
-      notify: '#all-purple-orange',
     }, async () => ({ ok: true }));
 
     const reviewArtifact = {
@@ -81,7 +84,7 @@ async function withReviewServer(run: (context: TestServerContext) => Promise<voi
       title: 'Ready for review: QA founder update',
       payload: {
         markdown: '## QA founder update\nNothing should be sent during dry-run.',
-        deliveryTarget: '#all-purple-orange',
+        deliveryTarget: 'qa@example.com',
         approvalRequired: true,
       },
     };
@@ -141,6 +144,10 @@ async function withReviewServer(run: (context: TestServerContext) => Promise<voi
     else delete process.env.VIOLEMA_APPROVED_EMAILS;
     if (typeof originalDisableScheduler === 'string') process.env.VIOLEMA_DISABLE_AUTOMATION_SCHEDULER = originalDisableScheduler;
     else delete process.env.VIOLEMA_DISABLE_AUTOMATION_SCHEDULER;
+    if (typeof originalPostmarkKey === 'string') process.env.POSTMARK_API_KEY = originalPostmarkKey;
+    else delete process.env.POSTMARK_API_KEY;
+    if (typeof originalPostmarkFrom === 'string') process.env.POSTMARK_FROM_EMAIL = originalPostmarkFrom;
+    else delete process.env.POSTMARK_FROM_EMAIL;
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 }
@@ -249,6 +256,13 @@ test('automation review dry-run rerun validates without triggering a fresh run',
   taskId,
   runId,
 }) => {
+  const changeResponse = await fetch(`${baseUrl}/api/automations/${automationId}/reviews/${runId}/request-changes`, {
+    method: 'POST',
+    headers: authHeaders(sessionToken),
+    body: JSON.stringify({ reviewer: 'QA Operator', note: 'Try a fresh version.' }),
+  });
+  assert.equal(changeResponse.status, 200, 'a rerun is valid only from an unresolved change request');
+  const ledgerBefore = await readWorkflowLedger(baseUrl, sessionToken, runId);
   const runsBefore = await fetch(`${baseUrl}/api/platform/task-runs`, { headers: authHeaders(sessionToken) })
     .then(readJson)
     .then((payload) => (payload.items as TaskRunRecord[]).length);
@@ -272,7 +286,12 @@ test('automation review dry-run rerun validates without triggering a fresh run',
     .then((nextPayload) => (nextPayload.items as TaskRunRecord[]).length);
   const task = await readTask(baseUrl, sessionToken, taskId);
   assert.equal(runsAfter, runsBefore);
-  assert.equal(task?.status, 'waiting_review');
+  assert.equal(task?.status, 'blocked');
+  assert.equal((task?.metadata?.reviewRequest as Record<string, unknown>)?.status, 'changes_requested');
   assert.equal(task?.metadata?.reviewRerun, undefined);
-  assert.deepEqual(await readWorkflowLedger(baseUrl, sessionToken, runId), []);
+  assert.deepEqual(
+    await readWorkflowLedger(baseUrl, sessionToken, runId),
+    ledgerBefore,
+    'the dry-run adds nothing beyond the already-recorded change request',
+  );
 }));

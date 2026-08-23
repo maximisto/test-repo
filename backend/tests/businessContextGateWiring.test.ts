@@ -20,11 +20,11 @@ const WORKSPACE_ID = 'workspace_gate_wiring';
 
 const CONTEXT_STEPS = [
   {
-    id: 'step_competitor_search',
-    kind: 'search' as const,
-    title: 'Search competitor moves',
-    objective: 'Find pricing, launch, and positioning changes from key competitors.',
-    inputs: { use_business_context: true, query_suffix: 'competitor pricing launches positioning', num_results: 8 },
+    id: 'step_contextual_summary',
+    kind: 'summarize' as const,
+    title: 'Summarize against company context',
+    objective: 'Interpret the findings against this workspace business context.',
+    inputs: { use_business_context: true },
   },
 ];
 
@@ -38,7 +38,6 @@ test('the run gate reads business-context state from the real workspace store', 
     workspaceId: WORKSPACE_ID,
     workflowId: 'competitor-monitor',
     steps: CONTEXT_STEPS,
-    deliveryTarget: '#violema-demo',
   });
   assert.equal(blocked.allowed, false, 'a flagged step with no context cannot run');
   assert.ok(
@@ -57,7 +56,6 @@ test('the run gate reads business-context state from the real workspace store', 
     workspaceId: WORKSPACE_ID,
     workflowId: 'competitor-monitor',
     steps: CONTEXT_STEPS,
-    deliveryTarget: '#violema-demo',
   });
   assert.ok(
     !unblocked.blockers.some((blocker) => blocker.key === 'business_context_missing'),

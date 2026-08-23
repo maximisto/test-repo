@@ -36,6 +36,7 @@ import {
   hasCapability,
   PARTNER_CAPABILITIES,
 } from './partnerCapability';
+import { sanitizeIntegrationDiagnostic } from './diagnostics';
 
 /**
  * Composio ships two Slack toolkits and both can send. They differ only in
@@ -97,14 +98,14 @@ export class TenantSlackUnroutedError extends Error {
 }
 
 export interface TenantSlackDeps {
-  listConnectedApps?: (ctx: { entityId: string }) => Promise<{ apps: string[]; ok: boolean }>;
+  listConnectedApps?: (ctx: { entityId: string; signal?: AbortSignal }) => Promise<{ apps: string[]; ok: boolean }>;
   execute?: (
     actionName: string,
     input: Record<string, unknown>,
-    ctx: { entityId: string },
+    ctx: { entityId: string; signal?: AbortSignal },
   ) => Promise<unknown>;
   /** Injected in tests. Defaults to the cached Composio inventory read. */
-  readIdentityCapability?: (workspaceId: string) => Promise<'yes' | 'no' | 'unknown'>;
+  readIdentityCapability?: (workspaceId: string, signal?: AbortSignal) => Promise<'yes' | 'no' | 'unknown'>;
   /** Injected in tests. Defaults to `resolveSlackIconUrl()`. */
   iconUrl?: string;
 }
@@ -161,8 +162,11 @@ export function resolveSlackIconUrl(raw = process.env.VIOLEMA_SLACK_ICON_URL): s
  * branded send and fall back if Slack objects. Guessing "no" would silently
  * strip Violema's identity from every such workspace.
  */
-async function readIdentityCapability(workspaceId: string): Promise<'yes' | 'no' | 'unknown'> {
-  const inventory = await readConnectionInventory({ entityId: workspaceId });
+async function readIdentityCapability(
+  workspaceId: string,
+  signal?: AbortSignal,
+): Promise<'yes' | 'no' | 'unknown'> {
+  const inventory = await readConnectionInventory({ entityId: workspaceId, signal });
   if (!inventory.ok) return 'unknown';
 
   const report = buildPartnerCapabilityReport(inventory.connections);
@@ -210,9 +214,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 export async function resolveTenantSlackConnection(
   workspaceId: string,
   deps: TenantSlackDeps = {},
+  signal?: AbortSignal,
 ): Promise<TenantSlackConnection> {
   const read = deps.listConnectedApps ?? listConnectedAppsDetailed;
-  const result = await read({ entityId: workspaceId });
+  const result = await read({ entityId: workspaceId, signal });
 
   if (!result.ok) return { status: 'unavailable' };
 
@@ -300,12 +305,63 @@ function readEnvelope(response: unknown, actionName: string): Record<string, unk
   }
 
   if (response.successful !== true) {
-    const detail = response.error ?? 'no detail provided';
-    const text = typeof detail === 'string' ? detail : JSON.stringify(detail);
+    const detail = response.error;
+    const text = typeof detail === 'string'
+      ? sanitizeIntegrationDiagnostic(detail)
+      : isRecord(detail)
+        ? sanitizeIntegrationDiagnostic(
+            [detail.code, detail.error, detail.message, detail.detail]
+              .find((value): value is string => typeof value === 'string' && Boolean(value.trim()))
+              || 'provider rejected the Slack request',
+          )
+        : 'provider rejected the Slack request';
     throw new Error(`Slack send failed via Composio (${actionName}): ${text}`);
   }
 
   return isRecord(response.data) ? response.data : {};
+}
+
+export async function preflightTenantSlackMessage(
+  input: {
+    workspaceId: string;
+    to: string;
+    body: string;
+    subject?: string;
+    signal?: AbortSignal;
+  },
+  deps: TenantSlackDeps = {},
+) {
+  const connection = await resolveTenantSlackConnection(input.workspaceId, deps, input.signal);
+  if (connection.status !== 'connected' || !connection.actionName || !connection.toolkit) {
+    throw unroutedError(input.workspaceId, connection.status);
+  }
+
+  const channel = input.to.trim().replace(/^#/, '');
+  if (!channel) throw new Error('Slack target is required.');
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/.test(channel)) {
+    throw new Error(
+      'Slack target must be a channel name such as #project-nexus or a Slack channel ID.',
+    );
+  }
+  const chunks = chunkSlackText(
+    composeTenantSlackText({ subject: input.subject, body: input.body }),
+  );
+  if (chunks.length > MAX_MESSAGES_PER_DELIVERY) {
+    throw new Error(
+      `Slack delivery is too long (${chunks.length} parts; maximum ${MAX_MESSAGES_PER_DELIVERY}). `
+      + 'Shorten the brief before sending it so no content is silently dropped.',
+    );
+  }
+
+  return {
+    connection: {
+      status: 'connected' as const,
+      toolkit: connection.toolkit,
+      actionName: connection.actionName,
+    },
+    channel,
+    chunks,
+  };
 }
 
 function readTimestamp(data: Record<string, unknown>): string | null {
@@ -327,31 +383,26 @@ export async function sendTenantSlackMessage(
     body: string;
     subject?: string;
     threadTs?: string;
+    signal?: AbortSignal;
+    onExternalRequestStart?: () => void | Promise<void>;
   },
   deps: TenantSlackDeps = {},
 ) {
-  const connection = await resolveTenantSlackConnection(input.workspaceId, deps);
-  if (connection.status !== 'connected' || !connection.actionName || !connection.toolkit) {
-    throw unroutedError(input.workspaceId, connection.status);
-  }
-
-  const channel = input.to.trim().replace(/^#/, '');
-  if (!channel) {
-    throw new Error('Slack target is required.');
-  }
-
+  const { connection, channel, chunks } = await preflightTenantSlackMessage(input, deps);
   const execute = deps.execute ?? executeComposioAction;
-  const chunks = chunkSlackText(
-    composeTenantSlackText({ subject: input.subject, body: input.body }),
-  ).slice(0, MAX_MESSAGES_PER_DELIVERY);
 
   // Decided once per delivery, not per chunk: a multi-part brief must not
   // change identity halfway through.
   const readCapability = deps.readIdentityCapability ?? readIdentityCapability;
   let identityVerdict: 'yes' | 'no' | 'unknown';
   try {
-    identityVerdict = await readCapability(input.workspaceId);
-  } catch {
+    identityVerdict = await readCapability(input.workspaceId, input.signal);
+  } catch (error) {
+    if (input.signal?.aborted) {
+      throw input.signal.reason instanceof Error
+        ? input.signal.reason
+        : new Error('Slack delivery was aborted.');
+    }
     // Capability is a nicety; delivery is not. An unreadable verdict behaves
     // like `unknown` — attempt branding, fall back if Slack objects.
     identityVerdict = 'unknown';
@@ -380,7 +431,11 @@ export async function sendTenantSlackMessage(
 
     let response: unknown;
     try {
-      response = await execute(connection.actionName, payload(), { entityId: input.workspaceId });
+      await input.onExternalRequestStart?.();
+      response = await execute(connection.actionName, payload(), {
+        entityId: input.workspaceId,
+        signal: input.signal,
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       // The one retry we allow, and only for a scope rejection Slack raises
@@ -388,7 +443,11 @@ export async function sendTenantSlackMessage(
       if (!applyIdentity || !isIdentityScopeRejection(message)) throw error;
       applyIdentity = false;
       identityDowngraded = true;
-      response = await execute(connection.actionName, payload(), { entityId: input.workspaceId });
+      await input.onExternalRequestStart?.();
+      response = await execute(connection.actionName, payload(), {
+        entityId: input.workspaceId,
+        signal: input.signal,
+      });
     }
 
     let data: Record<string, unknown>;
@@ -399,7 +458,11 @@ export async function sendTenantSlackMessage(
       if (!applyIdentity || !isIdentityScopeRejection(message)) throw error;
       applyIdentity = false;
       identityDowngraded = true;
-      const retry = await execute(connection.actionName, payload(), { entityId: input.workspaceId });
+      await input.onExternalRequestStart?.();
+      const retry = await execute(connection.actionName, payload(), {
+        entityId: input.workspaceId,
+        signal: input.signal,
+      });
       data = readEnvelope(retry, connection.actionName);
     }
 

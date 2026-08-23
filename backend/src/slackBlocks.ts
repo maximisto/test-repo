@@ -17,11 +17,9 @@ export type SlackBlock =
   | { type: 'context'; elements: SlackTextObject[] };
 
 // Slack hard limits: 3000 chars per section text, 150 per header, 50 blocks
-// per message. Longer briefs are split across threaded messages at send time;
-// MAX_CONTENT_BLOCKS is only a runaway backstop.
+// per message. Longer briefs are split across threaded messages at send time.
 const SECTION_TEXT_LIMIT = 2900;
 const HEADER_TEXT_LIMIT = 148;
-const MAX_CONTENT_BLOCKS = 130;
 export const SLACK_BLOCKS_PER_MESSAGE = 45;
 
 function escapeSlackText(value: string): string {
@@ -51,13 +49,29 @@ export function toSlackMrkdwn(value: string): string {
   return text;
 }
 
-function truncateForSection(text: string): string {
-  if (text.length <= SECTION_TEXT_LIMIT) return text;
-  return `${text.slice(0, SECTION_TEXT_LIMIT - 2)}…`;
+function splitSlackSectionText(text: string): string[] {
+  const parts: string[] = [];
+  let remaining = text;
+  while (remaining.length > SECTION_TEXT_LIMIT) {
+    const window = remaining.slice(0, SECTION_TEXT_LIMIT + 1);
+    const newlineBreak = window.lastIndexOf('\n');
+    const spaceBreak = window.lastIndexOf(' ');
+    const preferredBreak = Math.max(newlineBreak, spaceBreak);
+    const splitAt = preferredBreak >= Math.floor(SECTION_TEXT_LIMIT / 2)
+      ? preferredBreak
+      : SECTION_TEXT_LIMIT;
+    parts.push(remaining.slice(0, splitAt).trimEnd());
+    remaining = remaining.slice(splitAt).trimStart();
+  }
+  if (remaining || parts.length === 0) parts.push(remaining);
+  return parts;
 }
 
-function sectionBlock(text: string): SlackBlock {
-  return { type: 'section', text: { type: 'mrkdwn', text: truncateForSection(text) } };
+function sectionBlocks(text: string): SlackBlock[] {
+  return splitSlackSectionText(text).map((part) => ({
+    type: 'section' as const,
+    text: { type: 'mrkdwn' as const, text: part },
+  }));
 }
 
 function headerBlock(text: string): SlackBlock {
@@ -103,7 +117,7 @@ export function markdownToSlackBlocks(markdown: string): SlackBlock[] {
 
   const flushParagraph = () => {
     if (paragraph.length === 0) return;
-    blocks.push(sectionBlock(paragraph.join('\n')));
+    blocks.push(...sectionBlocks(paragraph.join('\n')));
     paragraph = [];
   };
 
@@ -122,7 +136,7 @@ export function markdownToSlackBlocks(markdown: string): SlackBlock[] {
       if (heading[1].length === 1) {
         blocks.push(headerBlock(heading[2]));
       } else {
-        blocks.push(sectionBlock(`*${toSlackMrkdwn(stripInlineMarkdown(heading[2]))}*`));
+        blocks.push(...sectionBlocks(`*${toSlackMrkdwn(stripInlineMarkdown(heading[2]))}*`));
       }
       continue;
     }
@@ -150,7 +164,7 @@ export function markdownToSlackBlocks(markdown: string): SlackBlock[] {
         j += 1;
       }
       const tableText = tableToText(headerCells, rows);
-      if (tableText) blocks.push(sectionBlock(tableText));
+      if (tableText) blocks.push(...sectionBlocks(tableText));
       i = j - 1;
       continue;
     }
@@ -165,15 +179,6 @@ export function markdownToSlackBlocks(markdown: string): SlackBlock[] {
   }
 
   flushParagraph();
-
-  if (blocks.length > MAX_CONTENT_BLOCKS) {
-    const kept = blocks.slice(0, MAX_CONTENT_BLOCKS);
-    kept.push({
-      type: 'context',
-      elements: [{ type: 'mrkdwn', text: '_Brief truncated for Slack — open the run in Violema for the full version._' }],
-    });
-    return kept;
-  }
 
   return blocks;
 }

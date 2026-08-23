@@ -260,6 +260,34 @@ test('Composio listing paginates to completeness; failure mid-listing throws Lib
   );
 });
 
+test('a malformed Composio success envelope never authorizes the operator/app set difference', async () => {
+  const fake = createFakeReader({
+    tree: [{
+      id: 'possible-app-file',
+      name: 'possible-app-file.md',
+      mimeType: 'text/markdown',
+      size: 20,
+      parentFolderId: ROOT_ID,
+    }],
+    fileContents: { 'possible-app-file': Buffer.from('must not be ingested') },
+  });
+  for (const data of [{}, { files: [{ name: 'missing-id.md' }] }]) {
+    const execute: PartnerComposioExecutor = async () => ({ successful: true, data });
+    await assert.rejects(
+      sweepOperatorFiles(
+        {
+          workspaceId: `ws-malformed-composio-${JSON.stringify(data).length}`,
+          rootFolderId: ROOT_ID,
+          budgetBytes: 1_000_000,
+        },
+        { reader: fake.reader, execute },
+      ),
+      (error: unknown) => error instanceof LibrarySweepError && /invalid response/i.test(error.message),
+    );
+  }
+  assert.deepEqual(fake.downloadCalls, [], 'classification must stop before any possible app file is read');
+});
+
 // --- unsupported / oversized skips -----------------------------------------------
 
 test('unsupported and oversized files are skipped with warnings naming the file', async () => {
@@ -733,6 +761,51 @@ test('a download stream that dies mid-read yields contentError, and never throws
   assert.match(String(healthy?.content), /healthy operator note/);
 });
 
+test('an outer abort stops a multi-file folder sweep during the first slow body', async () => {
+  const controller = new AbortController();
+  const downloadCalls: string[] = [];
+  let firstDownloadEntered!: () => void;
+  const firstDownloadEnteredPromise = new Promise<void>((resolve) => { firstDownloadEntered = resolve; });
+  const tree: DriveFileMeta[] = Array.from({ length: 3 }, (_, index) => ({
+    id: `slow-${index + 1}`,
+    name: `slow-${index + 1}.md`,
+    mimeType: 'text/markdown',
+    size: 100,
+    modifiedTime: `2026-08-0${3 - index}T00:00:00.000Z`,
+  }));
+  const reader: DriveReader = {
+    async getFolderMeta(folderId, signal) {
+      assert.equal(signal, controller.signal);
+      return { id: folderId, name: 'Violema Library', mimeType: FOLDER_MIME };
+    },
+    async listFolderTree(_folderId, signal) {
+      assert.equal(signal, controller.signal);
+      return { files: tree, truncated: false };
+    },
+    async downloadFile(fileId, signal) {
+      downloadCalls.push(fileId);
+      assert.equal(signal, controller.signal);
+      firstDownloadEntered();
+      return new Promise<Buffer>((_, reject) => {
+        signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
+    },
+    async exportDoc() {
+      throw new Error('unused');
+    },
+  };
+  const { execute } = createComposioFake({ [ROOT_ID]: [{ files: [] }] });
+
+  const sweep = sweepOperatorFiles(
+    { workspaceId: 'ws_test', rootFolderId: ROOT_ID, budgetBytes: 24_000 },
+    { reader, execute, signal: controller.signal },
+  );
+  await firstDownloadEnteredPromise;
+  controller.abort(new Error('library step deadline expired'));
+  await assert.rejects(sweep, /library step deadline expired/);
+  assert.deepEqual(downloadCalls, ['slow-1'], 'no later file starts after the outer deadline');
+});
+
 // --- lane state ---------------------------------------------------------------------
 
 test('lane state: null reader → not_configured; reader configured but no root folder yet → no_library_yet; reader 404 on folder-meta probe → needs_share; probe ok → active', async () => {
@@ -854,6 +927,26 @@ const laneStateCases: Array<{ label: string; error: DriveReaderError; expected: 
     expected: 'not_configured',
   },
   {
+    label: '403 rateLimitExceeded (transient Google quota pressure)',
+    error: new DriveReaderError(
+      'http_error',
+      'Drive files.list request failed with status 403 (rateLimitExceeded)',
+      403,
+      'rateLimitExceeded',
+    ),
+    expected: 'unavailable',
+  },
+  {
+    label: '403 insufficientFilePermissions (folder needs to be shared)',
+    error: new DriveReaderError(
+      'http_error',
+      'Drive files.get request failed with status 403 (insufficientFilePermissions)',
+      403,
+      'insufficientFilePermissions',
+    ),
+    expected: 'needs_share',
+  },
+  {
     label: '401 from files.list (revoked platform credential)',
     error: new DriveReaderError('http_error', 'Drive files.list request failed with status 401', 401),
     expected: 'not_configured',
@@ -866,12 +959,27 @@ const laneStateCases: Array<{ label: string; error: DriveReaderError; expected: 
   {
     label: 'timeout (transient platform/network, not an operator action)',
     error: new DriveReaderError('timeout', 'Drive files.list request timed out after 10000ms'),
-    expected: 'not_configured',
+    expected: 'unavailable',
   },
   {
     label: 'too_large (a platform bound, not an operator action)',
     error: new DriveReaderError('too_large', 'response exceeded the byte limit'),
-    expected: 'not_configured',
+    expected: 'unavailable',
+  },
+  {
+    label: '429 from files.list (Drive rate limit)',
+    error: new DriveReaderError('http_error', 'Drive files.list request failed with status 429', 429),
+    expected: 'unavailable',
+  },
+  {
+    label: '500 from files.list (Drive platform outage)',
+    error: new DriveReaderError('http_error', 'Drive files.list request failed with status 500', 500),
+    expected: 'unavailable',
+  },
+  {
+    label: 'network failure with no HTTP status',
+    error: new DriveReaderError('http_error', 'Drive request failed: socket closed'),
+    expected: 'unavailable',
   },
 ];
 
@@ -946,6 +1054,33 @@ test('DriveReaderError.status is actually populated on both the files.list AND t
 
   assert.equal(await getFolderDropLaneState(ROOT_ID, { reader }), 'not_configured');
 });
+
+for (const tokenOutage of [
+  { label: '429 rate limit', response: () => new Response('rate limited', { status: 429 }) },
+  { label: '503 outage', response: () => new Response('unavailable', { status: 503 }) },
+  { label: 'network failure', response: () => { throw new TypeError('fetch failed: socket closed'); } },
+]) {
+  test(`token-service ${tokenOutage.label} maps end to end to unavailable`, async () => {
+    const { privateKey } = crypto.generateKeyPairSync('rsa', {
+      modulusLength: 2048,
+      publicKeyEncoding: { type: 'spki', format: 'pem' },
+      privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+    });
+    const fetchImpl: DriveReaderFetch = async (input) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url !== 'https://oauth2.googleapis.com/token') {
+        throw new Error(`Drive request must not start after token failure: ${url}`);
+      }
+      return tokenOutage.response();
+    };
+    const reader = createDriveReader(
+      { clientEmail: `token-outage-${crypto.randomUUID()}@test.iam.gserviceaccount.com`, privateKey },
+      fetchImpl,
+    );
+
+    assert.equal(await getFolderDropLaneState(ROOT_ID, { reader }), 'unavailable');
+  });
+}
 
 test('auth_failed is a platform-side problem, not a share problem: it maps to not_configured', async () => {
   const authFailedReader: DriveReader = {

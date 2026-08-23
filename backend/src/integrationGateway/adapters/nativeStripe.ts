@@ -51,13 +51,22 @@ interface StripeListResponse<T extends { id: string }> {
 
 export interface StripeLikeClient {
   subscriptions: {
-    list(params: Record<string, unknown>): Promise<StripeListResponse<StripeLikeSubscription>>;
+    list(
+      params: Record<string, unknown>,
+      options?: { timeout?: number; maxNetworkRetries?: number },
+    ): Promise<StripeListResponse<StripeLikeSubscription>>;
   };
   invoices: {
-    list(params: Record<string, unknown>): Promise<StripeListResponse<StripeLikeInvoice>>;
+    list(
+      params: Record<string, unknown>,
+      options?: { timeout?: number; maxNetworkRetries?: number },
+    ): Promise<StripeListResponse<StripeLikeInvoice>>;
   };
   charges: {
-    list(params: Record<string, unknown>): Promise<StripeListResponse<StripeLikeCharge>>;
+    list(
+      params: Record<string, unknown>,
+      options?: { timeout?: number; maxNetworkRetries?: number },
+    ): Promise<StripeListResponse<StripeLikeCharge>>;
   };
 }
 
@@ -88,6 +97,35 @@ export interface QueryStripeRevenueInput {
   now?: Date;
   client?: StripeLikeClient;
   secretKey?: string;
+  signal?: AbortSignal;
+}
+
+const STRIPE_PAGE_TIMEOUT_MS = 30_000;
+export const STRIPE_REVENUE_QUERY_TYPES = [
+  'revenue_summary',
+  'monthly_revenue',
+  'failed_payments',
+] as const;
+
+async function awaitStripePage<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  signal.throwIfAborted();
+  return await new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason instanceof Error
+      ? signal.reason
+      : new DOMException('Stripe read aborted.', 'AbortError'));
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      },
+    );
+  });
 }
 
 function readinessError(): IntegrationReadinessError {
@@ -147,19 +185,33 @@ function createStripeClient(secretKey: string): StripeLikeClient {
 }
 
 async function listAllPages<T extends { id: string }>(
-  list: (params: Record<string, unknown>) => Promise<StripeListResponse<T>>,
+  list: (
+    params: Record<string, unknown>,
+    options?: { timeout?: number; maxNetworkRetries?: number },
+  ) => Promise<StripeListResponse<T>>,
   baseParams: Record<string, unknown>,
+  signal?: AbortSignal,
 ): Promise<T[]> {
   const results: T[] = [];
   let startingAfter: string | undefined;
   let pageCount = 0;
 
   while (true) {
+    signal?.throwIfAborted();
     pageCount += 1;
-    const page = await list({
-      ...baseParams,
-      ...(startingAfter ? { starting_after: startingAfter } : {}),
-    });
+    const page = await awaitStripePage(
+      list({
+        ...baseParams,
+        ...(startingAfter ? { starting_after: startingAfter } : {}),
+      }, {
+        timeout: STRIPE_PAGE_TIMEOUT_MS,
+        // One automation step owns the retry/deadline policy. Hidden SDK
+        // retries would outlive that accounting envelope.
+        maxNetworkRetries: 0,
+      }),
+      signal,
+    );
+    signal?.throwIfAborted();
 
     results.push(...page.data);
 
@@ -194,7 +246,7 @@ function chargeInvoiceId(charge: StripeLikeCharge) {
 export async function queryStripeRevenue(
   input: QueryStripeRevenueInput,
 ): Promise<IntegrationQueryResult<StripeRevenueSummary>> {
-  if (!['revenue_summary', 'monthly_revenue', 'failed_payments'].includes(input.queryType)) {
+  if (!(STRIPE_REVENUE_QUERY_TYPES as readonly string[]).includes(input.queryType)) {
     return unsupportedQuery(input.queryType);
   }
 
@@ -219,15 +271,15 @@ export async function queryStripeRevenue(
         limit,
         status: 'all',
         expand: ['data.items.data.price'],
-      }),
+      }, input.signal),
       listAllPages(client.invoices.list.bind(client.invoices), {
         limit,
         created: { gte: windowStartSeconds },
-      }),
+      }, input.signal),
       listAllPages(client.charges.list.bind(client.charges), {
         limit,
         created: { gte: windowStartSeconds },
-      }),
+      }, input.signal),
     ]);
 
     const activeStatuses = new Set(['active', 'trialing', 'past_due']);

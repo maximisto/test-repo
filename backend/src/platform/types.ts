@@ -217,6 +217,64 @@ export interface AutomationStepDefinition {
   stepSeverity?: AutomationStepSeverity;
 }
 
+export interface AutomationGenerationCall {
+  id: string;
+  stepId: string;
+  purpose: string;
+  modelTier: ModelTier;
+  /** Physical route/retry identity; absent on records written before attempt accounting. */
+  routeIndex?: number;
+  attemptNumber?: number;
+  provider?: string;
+  model?: string;
+  baseUrl?: string;
+  /** Maximum token credits authorized immediately before this provider request. */
+  authorizedTokenCredits?: number;
+  /** `prepared` is authorized and durable, but no provider request began. */
+  status: 'prepared' | 'running' | 'succeeded' | 'rejected' | 'failed';
+  maxOutputTokens: number;
+  promptBytes: number;
+  usage?: {
+    inputTokens?: number;
+    outputTokens?: number;
+    totalTokens?: number;
+    provider?: string;
+    model?: string;
+    baseUrl?: string;
+  };
+  error?: string;
+}
+
+export interface AutomationGenerationProjection {
+  stepId: string;
+  purpose: string;
+  modelTier: ModelTier;
+  /** Byte-safe authorization bound. */
+  promptBytes: number;
+  /** Hard provider output allowance. */
+  maxOutputTokens: number;
+  /** Expected serialized envelope used by the forecast, never by the guard. */
+  estimatedPromptBytes?: number;
+  estimatedMaxOutputTokens?: number;
+  includeInEstimate?: boolean;
+}
+
+export interface AutomationToolAttempt {
+  id: string;
+  operation: string;
+  mutating: boolean;
+  /**
+   * `prepared` is a durable authorization intent recorded before a mutating
+   * provider request begins. The sender promotes it to `started` at the exact
+   * external boundary, so crash recovery can distinguish a safe pre-send
+   * journal from a request whose remote outcome may be unknown.
+   */
+  status: 'prepared' | 'started' | 'succeeded' | 'failed' | 'outcome_unknown';
+  startedAt: string;
+  finishedAt?: string;
+  error?: string;
+}
+
 export interface AutomationStepExecution {
   stepId: string;
   kind: AutomationStepKind;
@@ -250,6 +308,10 @@ export interface AutomationStepExecution {
     model?: string;
     baseUrl?: string;
   };
+  /** Every provider generation owned by this step, including rejected output. */
+  generationCalls?: AutomationGenerationCall[];
+  /** Durable boundary journal for non-model integrations and outward actions. */
+  toolAttempts?: AutomationToolAttempt[];
   charge?: {
     actualCredits: number;
     tokenCredits: number;
@@ -293,7 +355,18 @@ export interface AutomationExecutionPlan {
   suggestedModelTier: ModelTier;
   complexity: 'low' | 'medium' | 'high';
   estimatedToolCalls: number;
+  /** Expected-utilization forecast shown to operators. */
   estimatedCredits: number;
+  /** Initial hold envelope. Unbudgeted runs extend it at exact call boundaries. */
+  authorizationCredits: number;
+  /**
+   * Single-route, single-attempt hard envelope used by operator-triggered runs.
+   * Reserving it before acknowledging the request makes the synchronous
+   * response authoritative without multiplying every call by the background
+   * retry/fallback policy.
+   */
+  manualAuthorizationCredits: number;
+  generationProjections: AutomationGenerationProjection[];
   steps: AutomationStepDefinition[];
   topology: WorkerTopologySnapshot;
 }

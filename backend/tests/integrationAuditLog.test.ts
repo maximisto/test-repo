@@ -95,6 +95,20 @@ test('integration query ledger events support every live source without storing 
       live: false,
     });
     assert.doesNotMatch(JSON.stringify([success, failure]), /private provider data/);
+
+    const privateToken = 'sk_live_PRIVATE_LEDGER_TOKEN';
+    const hostileFailure = audit.appendIntegrationQueryLedgerEvent({
+      workspaceId: 'purpleorangehq',
+      workflowId: 'weekly-founder-update',
+      taskRunId: 'run_weekly_hostile',
+      source: 'stripe',
+      queryType: 'revenue_summary',
+      ok: false,
+      message: `Authorization: Bearer ${privateToken} request_body={"input_text":"CUSTOMER_SENTINEL_PRIVATE_PLAN"} ${'\\'.repeat(100_000)}`,
+      now: () => '2026-07-19T12:02:00.000Z',
+    });
+    assert.doesNotMatch(hostileFailure.summary, /PRIVATE_LEDGER_TOKEN|CUSTOMER_SENTINEL/);
+    assert.ok(Buffer.byteLength(hostileFailure.summary, 'utf8') <= 600);
   } finally {
     process.chdir(originalCwd);
     fs.rmSync(tempDir, { recursive: true, force: true });

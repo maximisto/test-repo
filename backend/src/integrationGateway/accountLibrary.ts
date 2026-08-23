@@ -140,10 +140,29 @@ const DOWNLOAD_FILE_ACTION = 'GOOGLEDRIVE_DOWNLOAD_FILE';
 
 export const DEFAULT_LIBRARY_READ_LIMIT = 3;
 export const MAX_LIBRARY_READ_LIMIT = 10;
+/**
+ * Internal recovery lane: enough metadata to find a predecessor after many
+ * failed refreshes, while keeping Drive reads and prompt material bounded.
+ */
+export const MAX_LIBRARY_HISTORY_RECOVERY_FILES = 100;
 
 /** Per-entry and whole-response ceilings on extracted text. */
 export const MAX_ENTRY_CONTENT_BYTES = 8_000;
 export const MAX_TOTAL_CONTENT_BYTES = 24_000;
+/**
+ * Internal baseline-recovery lane for Violema-authored app entries. A full
+ * accepted brief may be larger than the ordinary 8 KB mission preview, so a
+ * failed auxiliary merge must be able to re-read that owned file on the next
+ * transaction instead of deadlocking compaction forever. Both ceilings stay
+ * bounded and are never used for operator-dropped files.
+ */
+export const MAX_RECOVERABLE_APP_ENTRY_CONTENT_BYTES = 32_001;
+// Two legacy maximum-size missed refreshes plus the predecessor baseline and
+// each reader's one-byte truncation sentinel. New transactions repair any
+// outstanding delta before appending another memo, so this bounded window is
+// also an invariant: the backlog cannot keep growing after this release.
+export const MAX_RECOVERABLE_APP_HISTORY_BYTES =
+  (MAX_RECOVERABLE_APP_ENTRY_CONTENT_BYTES * 2) + MAX_ENTRY_CONTENT_BYTES;
 
 /** Upper bound on a single appended entry, well under Drive's 10MB text limit. */
 export const MAX_ENTRY_MARKDOWN_BYTES = 200_000;
@@ -160,8 +179,17 @@ export const MAX_ENTRY_MARKDOWN_BYTES = 200_000;
  */
 export const LIBRARY_BASELINE_TITLE_PREFIX = 'Current state (rolling baseline)';
 
+const GENERATED_LIBRARY_BASELINE_FILE_NAME = new RegExp(
+  `^\\d{4}-\\d{2}-\\d{2} — ${LIBRARY_BASELINE_TITLE_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} `
+    + '(?:\\d{2}\\.\\d{2}|\\d{2}\\.\\d{2}\\.\\d{2}\\.\\d{3} [A-Za-z0-9_-]+)\\.md$',
+);
+const GENERATED_LIBRARY_BASELINE_TITLE = new RegExp(
+  `^${LIBRARY_BASELINE_TITLE_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} `
+    + '\\d{2}\\.\\d{2}\\.\\d{2}\\.\\d{3} [A-Za-z0-9_-]+$',
+);
+
 export function isLibraryBaselineFileName(fileName: string): boolean {
-  return fileName.includes(LIBRARY_BASELINE_TITLE_PREFIX);
+  return GENERATED_LIBRARY_BASELINE_FILE_NAME.test(fileName);
 }
 
 /**
@@ -177,7 +205,11 @@ export function buildLibraryEntryViewLink(fileId: string): string {
 const DOWNLOAD_TIMEOUT_MS = 10_000;
 
 /** Bounded text fetch for a presigned download URL. */
-export type LibraryFetchText = (url: string, maxBytes: number) => Promise<string>;
+export type LibraryFetchText = (
+  url: string,
+  maxBytes: number,
+  signal?: AbortSignal,
+) => Promise<string>;
 
 export interface AccountLibraryDeps {
   /** Composio executor seam. Defaults to the real bridge; tests inject a fake. */
@@ -185,6 +217,17 @@ export interface AccountLibraryDeps {
   /** Presigned-URL reader seam. Defaults to a bounded global fetch. */
   fetchText?: LibraryFetchText;
   now?: () => Date;
+  /** Cancels every Composio/download request made by this library operation. */
+  signal?: AbortSignal;
+}
+
+function resolveAccountLibraryExecutor(deps: AccountLibraryDeps): PartnerComposioExecutor {
+  const execute = deps.execute ?? executeComposioAction;
+  if (!deps.signal) return execute;
+  return (actionName, input, ctx) => execute(actionName, input, {
+    ...ctx,
+    signal: ctx.signal ?? deps.signal,
+  });
 }
 
 export interface AccountLibraryEntry {
@@ -216,6 +259,12 @@ export interface AccountLibrarySnapshot {
   entryCount: number;
   entries: AccountLibraryEntry[];
   /**
+   * False when Drive says older app-written entries exist beyond this bounded
+   * read and no readable baseline compacted them. Baseline refreshes must fail
+   * closed in that state or they would permanently omit unseen findings.
+   */
+  appEntryHistoryComplete?: boolean;
+  /**
    * The folder-drop sweep's own verdict for this read: whether the platform
    * reader could see the library folder at all, and any named skips
    * (unsupported file, share problem, cap). Optional and additive.
@@ -241,7 +290,10 @@ export interface EnsureLibraryFolderResult {
   createdFolder: boolean;
 }
 
-type LibraryFailure = IntegrationReadinessError;
+type LibraryFailure = IntegrationReadinessError & {
+  /** A write crossed the provider boundary but its final remote state is not proven. */
+  externalActionOutcome?: 'unknown';
+};
 
 interface ComposioEnvelope {
   successful?: boolean;
@@ -293,6 +345,15 @@ function libraryFailure(
   };
 }
 
+function unknownLibraryMutation(failure: LibraryFailure): LibraryFailure {
+  return { ...failure, externalActionOutcome: 'unknown' };
+}
+
+/** Used by the runner to quarantine a returned failure that may have written remotely. */
+export function hasUnknownLibraryMutationOutcome(value: unknown): boolean {
+  return isRecord(value) && value.externalActionOutcome === 'unknown';
+}
+
 export function isLibraryFailure(
   value:
     | EnsureLibraryFolderResult
@@ -335,22 +396,24 @@ async function runDriveAction(
   workspaceId: string,
   actionName: string,
   input: Record<string, unknown>,
+  options: { mutating?: boolean } = {},
 ): Promise<{ ok: true; data: unknown } | { ok: false; failure: LibraryFailure }> {
+  const failure = (value: LibraryFailure) => ({
+    ok: false as const,
+    failure: options.mutating ? unknownLibraryMutation(value) : value,
+  });
   try {
     const response = await execute(actionName, input, { entityId: workspaceId });
     if (!isRecord(response)) {
-      return { ok: false, failure: libraryFailure('integration_query_failed') };
+      return failure(libraryFailure('integration_query_failed'));
     }
     const envelope = response as ComposioEnvelope;
     if (envelope.successful !== true) {
-      return {
-        ok: false,
-        failure: libraryFailure(classifyPartnerFailure(envelope.error ?? 'drive action failed')),
-      };
+      return failure(libraryFailure(classifyPartnerFailure(envelope.error ?? 'drive action failed')));
     }
     return { ok: true, data: envelope.data };
   } catch (error) {
-    return { ok: false, failure: libraryFailure(classifyPartnerFailure(error)) };
+    return failure(libraryFailure(classifyPartnerFailure(error)));
   }
 }
 
@@ -359,29 +422,23 @@ function escapeDriveQueryValue(value: string): string {
   return value.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 }
 
-/**
- * Keep the newest-first file list down to "newer than the baseline, plus the
- * baseline itself". Older baselines in the tail are dropped with the rest —
- * each baseline supersedes every entry older than it, including its own
- * predecessors.
- */
-function compactFileListAroundBaseline(files: Record<string, unknown>[]): Record<string, unknown>[] {
-  const baselineIndex = files.findIndex((file) => {
-    const name = asString(file.name);
-    return Boolean(name && isLibraryBaselineFileName(name));
-  });
-  if (baselineIndex === -1) return files;
-  return files.slice(0, baselineIndex + 1);
-}
-
-function readDriveFiles(payload: unknown): Record<string, unknown>[] {
+function readDriveFiles(payload: unknown): Record<string, unknown>[] | null {
   const container = isRecord(payload) && isRecord(payload.data) ? payload.data : payload;
   const raw = Array.isArray(container)
     ? container
     : isRecord(container) && Array.isArray(container.files)
       ? container.files
-      : [];
-  return raw.filter(isRecord);
+      : null;
+  if (!raw || raw.some((file) => !isRecord(file) || !asString(file.id) || !asString(file.name))) return null;
+  return raw;
+}
+
+function readDriveNextPageToken(payload: unknown): { valid: true; value?: string } | { valid: false } {
+  const container = isRecord(payload) && isRecord(payload.data) ? payload.data : payload;
+  if (!isRecord(container)) return { valid: true };
+  if (!('nextPageToken' in container) || container.nextPageToken === undefined) return { valid: true };
+  const value = asString(container.nextPageToken);
+  return value ? { valid: true, value } : { valid: false };
 }
 
 /**
@@ -422,7 +479,11 @@ async function findFolderRecord(
   });
   if (!result.ok) return result;
 
-  const folder = readDriveFiles(result.data)
+  const files = readDriveFiles(result.data);
+  if (!files) {
+    return { ok: false, failure: libraryFailure('integration_query_failed', 'Drive returned an invalid file listing.') };
+  }
+  const folder = files
     .map((file) => {
       const id = asString(file.id);
       if (!id) return null;
@@ -455,7 +516,7 @@ async function createFolder(
   const input: Record<string, unknown> = { name };
   if (parentId) input.parent_id = parentId;
 
-  const result = await runDriveAction(execute, workspaceId, CREATE_FOLDER_ACTION, input);
+  const result = await runDriveAction(execute, workspaceId, CREATE_FOLDER_ACTION, input, { mutating: true });
   if (!result.ok) return result;
 
   const container =
@@ -464,7 +525,9 @@ async function createFolder(
   if (!folderId) {
     return {
       ok: false,
-      failure: libraryFailure('integration_query_failed', 'Drive did not return a folder id.'),
+      failure: unknownLibraryMutation(
+        libraryFailure('integration_query_failed', 'Drive did not return a folder id.'),
+      ),
     };
   }
   return { ok: true, folderId };
@@ -487,26 +550,18 @@ export type FindLibraryRootFolderResult =
  * outage in onboarding copy — HTTP 200 "run your first mission" while
  * Composio was down.
  *
- * One deliberate exception keeps absence honest rather than alarmist: a
- * workspace with no usable Drive lane at all (`integration_not_ready` /
- * `integration_not_connected` — no connected account, or the Composio
- * bridge itself is off) cannot have an app-created library, so that case IS
- * confirmed absence, not an outage.
+ * A missing or disabled Drive connection is also a failed lookup. The
+ * workspace may have created a library before the connection was lost, so
+ * connectivity state cannot prove that the folder is absent.
  */
 export async function findLibraryRootFolderId(
   workspaceId: string,
   deps: AccountLibraryDeps = {},
 ): Promise<FindLibraryRootFolderResult> {
   if (!workspaceId.trim()) return { ok: true, folderId: null };
-  const execute = deps.execute ?? executeComposioAction;
+  const execute = resolveAccountLibraryExecutor(deps);
   const result = await findFolderByName(execute, workspaceId, LIBRARY_ROOT_FOLDER_NAME);
   if (result.ok) return { ok: true, folderId: result.folderId };
-  if (
-    result.failure.code === 'integration_not_ready' ||
-    result.failure.code === 'integration_not_connected'
-  ) {
-    return { ok: true, folderId: null };
-  }
   return { ok: false, failure: result.failure };
 }
 
@@ -552,7 +607,7 @@ export async function ensureLibraryFolder(
     return libraryFailure('unsupported_query', 'No library section was named.');
   }
 
-  const execute = deps.execute ?? executeComposioAction;
+  const execute = resolveAccountLibraryExecutor(deps);
 
   const root = await findOrCreateFolder(execute, workspaceId, LIBRARY_ROOT_FOLDER_NAME);
   if (!root.ok) return root.failure;
@@ -563,7 +618,11 @@ export async function ensureLibraryFolder(
     normalizedSection,
     root.folderId,
   );
-  if (!sectionFolder.ok) return sectionFolder.failure;
+  if (!sectionFolder.ok) {
+    return root.created
+      ? unknownLibraryMutation(sectionFolder.failure)
+      : sectionFolder.failure;
+  }
 
   return {
     ok: true,
@@ -611,7 +670,7 @@ export async function provisionLibrarySection(
   // "Connect Google Drive" or "Reauthorize Google Drive".
   if (isLibraryFailure(ensured)) return ensured;
 
-  const execute = deps.execute ?? executeComposioAction;
+  const execute = resolveAccountLibraryExecutor(deps);
   const normalizedSection = normalizeSection(section);
 
   // Best-effort links. The folders exist either way, so a link lookup that
@@ -670,7 +729,7 @@ export async function summarizeLibrarySection(
   if (!workspaceId.trim()) return libraryFailure('integration_not_connected');
   if (!normalizedSection) return libraryFailure('unsupported_query', 'No library section was named.');
 
-  const execute = deps.execute ?? executeComposioAction;
+  const execute = resolveAccountLibraryExecutor(deps);
 
   const root = await findFolderByName(execute, workspaceId, LIBRARY_ROOT_FOLDER_NAME);
   if (!root.ok) return root.failure;
@@ -696,6 +755,7 @@ export async function summarizeLibrarySection(
   if (!listing.ok) return listing.failure;
 
   const files = readDriveFiles(listing.data);
+  if (!files) return libraryFailure('integration_query_failed', 'Drive returned an invalid file listing.');
   const newest = files[0];
   const lastEntryAt = newest
     ? asString(newest.createdTime) || asString(newest.modifiedTime)
@@ -722,11 +782,14 @@ function clampReadLimit(limit: number | undefined): number {
  * but nothing about a URL guarantees that, and this process must not be
  * forced to hold an arbitrary file in memory to find out.
  */
-async function defaultFetchText(url: string, maxBytes: number): Promise<string> {
+async function defaultFetchText(url: string, maxBytes: number, parentSignal?: AbortSignal): Promise<string> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
   try {
-    const response = await fetch(url, { signal: controller.signal });
+    const signal = parentSignal
+      ? AbortSignal.any([controller.signal, parentSignal])
+      : controller.signal;
+    const response = await fetch(url, { signal });
     if (!response.ok) {
       throw new Error(`download responded ${response.status}`);
     }
@@ -773,6 +836,8 @@ async function readEntryContent(
   workspaceId: string,
   fileId: string,
   budgetBytes: number,
+  signal?: AbortSignal,
+  maxEntryBytes = MAX_ENTRY_CONTENT_BYTES,
 ): Promise<{ content: string | null; truncated: boolean; contentError?: string }> {
   if (budgetBytes <= 0) {
     return { content: null, truncated: true, contentError: 'content budget exhausted' };
@@ -794,9 +859,9 @@ async function readEntryContent(
     return { content: null, truncated: false, contentError: 'download url unavailable' };
   }
 
-  const limit = Math.min(MAX_ENTRY_CONTENT_BYTES, budgetBytes);
+  const limit = Math.min(maxEntryBytes, budgetBytes);
   try {
-    const text = await fetchText(s3url, limit);
+    const text = await fetchText(s3url, limit, signal);
     // Byte length, not character count — the ceiling is about transport size.
     const truncated = Buffer.byteLength(text, 'utf8') >= limit;
     return { content: text, truncated };
@@ -814,6 +879,9 @@ async function readEntryContent(
 export const FOLDER_DROP_NEEDS_SHARE_WARNING =
   "Folder drop is enabled but Violema's reader can no longer see your Violema Library folder — re-share it to include your dropped files.";
 
+export const FOLDER_DROP_UNAVAILABLE_WARNING =
+  'Folder drop could not be read because Google Drive or the Violema reader is temporarily unavailable — retry later; re-sharing the folder will not fix this incident.';
+
 /**
  * Read the most recent entries in a section.
  *
@@ -825,14 +893,29 @@ export const FOLDER_DROP_NEEDS_SHARE_WARNING =
 export async function readLibrary(
   workspaceId: string,
   section: string,
-  options: { limit?: number; includeOperatorFiles?: boolean } = {},
+  options: {
+    limit?: number;
+    includeOperatorFiles?: boolean;
+    /** Internal compaction lane may widen metadata reads to recover history. */
+    requireCompleteAppHistory?: boolean;
+    /**
+     * Internal compaction transaction: content already held in memory for a
+     * just-appended app entry. It must not be downloaded through the normal
+     * 8 KB mission-read cap and then misclassified as incomplete.
+     */
+    knownAppEntryContentByFileId?: Readonly<Record<string, string>>;
+    /** Internal baseline recovery only; ordinary mission reads stay at 8 KB. */
+    maxAppEntryContentBytes?: number;
+    /** Aggregate recovery bound across Violema-authored app entries. */
+    maxAppHistoryBytes?: number;
+  } = {},
   deps: AccountLibraryDeps = {},
 ): Promise<IntegrationQuerySuccess<AccountLibrarySnapshot> | LibraryFailure> {
   const normalizedSection = normalizeSection(section);
   if (!workspaceId.trim()) return libraryFailure('integration_not_connected');
   if (!normalizedSection) return libraryFailure('unsupported_query', 'No library section was named.');
 
-  const execute = deps.execute ?? executeComposioAction;
+  const execute = resolveAccountLibraryExecutor(deps);
   const fetchText = deps.fetchText ?? defaultFetchText;
   const now = deps.now ? deps.now() : new Date();
   const startedAt = Date.now();
@@ -841,6 +924,21 @@ export async function readLibrary(
   // over Violema's own written entries and have no business paying for a
   // folder-drop sweep. The default — every mission read — keeps the sweep.
   const includeOperatorFiles = options.includeOperatorFiles !== false;
+  const requireCompleteAppHistory = options.requireCompleteAppHistory === true;
+  const maxAppEntryContentBytes = Math.max(
+    MAX_ENTRY_CONTENT_BYTES,
+    Math.min(
+      MAX_RECOVERABLE_APP_ENTRY_CONTENT_BYTES,
+      Math.trunc(options.maxAppEntryContentBytes ?? MAX_ENTRY_CONTENT_BYTES),
+    ),
+  );
+  const maxAppHistoryBytes = Math.max(
+    MAX_TOTAL_CONTENT_BYTES,
+    Math.min(
+      MAX_RECOVERABLE_APP_HISTORY_BYTES,
+      Math.trunc(options.maxAppHistoryBytes ?? MAX_TOTAL_CONTENT_BYTES),
+    ),
+  );
 
   const root = await findFolderByName(execute, workspaceId, LIBRARY_ROOT_FOLDER_NAME);
   if (!root.ok) return root.failure;
@@ -857,7 +955,7 @@ export async function readLibrary(
   let operatorEntries: AccountLibraryEntry[] = [];
   let sweep: { laneState: FolderDropLaneState; warnings: string[] } | undefined;
   if (includeOperatorFiles) {
-    const probedLaneState = await getFolderDropLaneState(rootFolderId);
+    const probedLaneState = await getFolderDropLaneState(rootFolderId, { signal: deps.signal });
     // The probe above and the sweep below each run their own access check —
     // two separate Drive calls, so access can be revoked (or a platform
     // failure can begin) between them. When both ran, the sweep's verdict is
@@ -870,7 +968,7 @@ export async function readLibrary(
       try {
         sweepResult = await sweepOperatorFiles(
           { workspaceId, rootFolderId, budgetBytes: Math.floor(MAX_TOTAL_CONTENT_BYTES / 2) },
-          { execute },
+          { execute, signal: deps.signal },
         );
       } catch (error) {
         if (!(error instanceof LibrarySweepError)) throw error;
@@ -880,6 +978,8 @@ export async function readLibrary(
       sweepWarnings.push(...sweepResult.warnings);
       if (sweepResult.laneState === 'needs_share') {
         sweepWarnings.push(FOLDER_DROP_NEEDS_SHARE_WARNING);
+      } else if (sweepResult.laneState === 'unavailable') {
+        sweepWarnings.push(FOLDER_DROP_UNAVAILABLE_WARNING);
       }
       operatorEntries = sweepResult.entries.map((entry) => ({
         fileId: entry.fileId,
@@ -893,6 +993,8 @@ export async function readLibrary(
       }));
     } else if (probedLaneState === 'needs_share') {
       sweepWarnings.push(FOLDER_DROP_NEEDS_SHARE_WARNING);
+    } else if (probedLaneState === 'unavailable') {
+      sweepWarnings.push(FOLDER_DROP_UNAVAILABLE_WARNING);
     }
     sweep = { laneState, warnings: sweepWarnings };
   }
@@ -922,41 +1024,150 @@ export async function readLibrary(
         folderId: null,
         entryCount: operatorEntries.length,
         entries: operatorEntries,
+        appEntryHistoryComplete: true,
         sweep,
       },
       now,
       startedAt,
     );
   }
+  const resolvedFolderId = folderId;
 
-  const listing = await runDriveAction(execute, workspaceId, FIND_FILE_ACTION, {
-    q: `'${escapeDriveQueryValue(folderId)}' in parents and trashed = false`,
-    fields: 'files(id,name,modifiedTime,createdTime,webViewLink),nextPageToken',
-    orderBy: 'createdTime desc',
-    pageSize: limit,
-    spaces: 'drive',
-  });
+  const listSectionFiles = (pageSize: number) => runDriveAction(
+    execute,
+    workspaceId,
+    FIND_FILE_ACTION,
+    {
+      q: `'${escapeDriveQueryValue(resolvedFolderId)}' in parents and trashed = false`,
+      fields: 'files(id,name,modifiedTime,createdTime,webViewLink),nextPageToken',
+      orderBy: 'createdTime desc',
+      pageSize,
+      spaces: 'drive',
+    },
+  );
+  const listing = await listSectionFiles(limit);
   if (!listing.ok) return listing.failure;
 
-  // Compaction: everything older than the newest rolling baseline is already
-  // folded INTO that baseline, so reading it again would re-pay its bytes in
-  // every prompt for information the baseline already carries. Applied to
-  // the newest-first listing BEFORE any content download, so the dropped
-  // tail costs neither content budget nor tokens. A section with no baseline
-  // reads exactly as before.
-  const files = compactFileListAroundBaseline(readDriveFiles(listing.data)).slice(0, limit);
+  // Compaction is content-validated, never filename-trusting. A baseline may
+  // still appear in Drive while its export is unreadable; cutting the listing
+  // at that name would discard the exact source memos needed to recover. Walk
+  // newest-first until a NON-EMPTY baseline has actually been downloaded.
+  const initialListedFiles = readDriveFiles(listing.data);
+  const initialNextPage = readDriveNextPageToken(listing.data);
+  if (!initialListedFiles || !initialNextPage.valid) {
+    return libraryFailure('integration_query_failed', 'Drive returned an invalid file listing.');
+  }
+  let files = initialListedFiles.slice(0, limit);
+  let listingHasMore = Boolean(initialNextPage.value) || initialListedFiles.length > limit;
   const appEntries: AccountLibraryEntry[] = [];
   // App entries fill whatever budget the operator sweep above left behind, so
   // the two origins share one ceiling instead of each getting a full one.
-  let remainingBudget = Math.max(0, MAX_TOTAL_CONTENT_BYTES - operatorBytesUsed);
+  let remainingBudget = Math.max(0, maxAppHistoryBytes - operatorBytesUsed);
 
-  for (const file of files) {
+  let unreadableBaselineSeen = false;
+  let readableBaselineFound = false;
+  let recoveryListingLoaded = false;
+  const loadRecoveryListing = async (): Promise<LibraryFailure | null> => {
+    const recoveryListing = await listSectionFiles(MAX_LIBRARY_HISTORY_RECOVERY_FILES);
+    if (!recoveryListing.ok) return recoveryListing.failure;
+    const recoveryListedFiles = readDriveFiles(recoveryListing.data);
+    const recoveryNextPage = readDriveNextPageToken(recoveryListing.data);
+    if (!recoveryListedFiles || !recoveryNextPage.valid) {
+      return libraryFailure('integration_query_failed', 'Drive returned an invalid file listing.');
+    }
+    files = recoveryListedFiles.slice(0, MAX_LIBRARY_HISTORY_RECOVERY_FILES);
+    listingHasMore = Boolean(recoveryNextPage.value)
+      || recoveryListedFiles.length > MAX_LIBRARY_HISTORY_RECOVERY_FILES;
+    recoveryListingLoaded = true;
+    return null;
+  };
+
+  // If the requested window has older history but contains no compaction
+  // boundary, inspect a bounded metadata window before downloading bodies.
+  // Waiting until after the first page was read could spend the whole content
+  // budget on newer memos and make the healthy predecessor baseline
+  // unreadable. It also deadlocked seeded read→write workflows after enough
+  // soft refresh failures pushed the baseline just beyond their small limit.
+  const initialWindowHasBaseline = files.some((candidate) => {
+    const candidateName = asString(candidate.name);
+    return Boolean(candidateName && isLibraryBaselineFileName(candidateName));
+  });
+  if (requireCompleteAppHistory && listingHasMore && !initialWindowHasBaseline) {
+    const recoveryFailure = await loadRecoveryListing();
+    if (recoveryFailure) return recoveryFailure;
+  }
+
+  for (let index = 0; ; index += 1) {
+    if (index >= files.length) {
+      // The normal query remains bounded by the caller's limit. Internal
+      // compaction widens metadata after proving there is more history, so a
+      // streak of failed refreshes cannot permanently push the predecessor
+      // outside the ten-entry window.
+      if (
+        (unreadableBaselineSeen || requireCompleteAppHistory) &&
+        !readableBaselineFound &&
+        !recoveryListingLoaded &&
+        listingHasMore
+      ) {
+        const recoveryFailure = await loadRecoveryListing();
+        if (recoveryFailure) return recoveryFailure;
+        // The for-loop increments after `continue`; rewind once so the first
+        // newly loaded entry (at the old length) is not skipped.
+        index -= 1;
+        continue;
+      }
+      break;
+    }
+
+    // Preserve the caller's ordinary entry-count bound. The only exception is
+    // recovery after an unreadable baseline: continue within the global
+    // metadata/byte caps until usable compacted history is found (or the
+    // bounded listing ends), rather than returning success with history gone.
+    if (
+      appEntries.length >= limit
+      && !unreadableBaselineSeen
+      && !requireCompleteAppHistory
+      && !recoveryListingLoaded
+    ) break;
+
+    const file = files[index];
     const fileId = asString(file.id);
     const fileName = asString(file.name);
     if (!fileId || !fileName) continue;
 
-    const body = await readEntryContent(execute, fetchText, workspaceId, fileId, remainingBudget);
-    if (body.content) {
+    const isBaseline = isLibraryBaselineFileName(fileName);
+    const hasBaselineAtOrAfter = files.slice(index).some((candidate) => {
+      const candidateName = asString(candidate.name);
+      return Boolean(candidateName && isLibraryBaselineFileName(candidateName));
+    });
+    // Reserve one entry's worth of the shared byte budget while searching for
+    // a readable baseline. Otherwise a few large newer memos could exhaust the
+    // budget and make a healthy baseline look unreadable.
+    const fileBudget = !isBaseline && hasBaselineAtOrAfter
+      ? Math.max(0, remainingBudget - MAX_ENTRY_CONTENT_BYTES)
+      : remainingBudget;
+    const knownContent = options.knownAppEntryContentByFileId
+      && Object.prototype.hasOwnProperty.call(options.knownAppEntryContentByFileId, fileId)
+      ? options.knownAppEntryContentByFileId[fileId]
+      : undefined;
+    const body = knownContent !== undefined
+      ? { content: knownContent, truncated: false }
+      : await readEntryContent(
+          execute,
+          fetchText,
+          workspaceId,
+          fileId,
+          fileBudget,
+          deps.signal,
+          // Baselines are authoritative only inside their stricter generated
+          // output contract. The widened lane is for full app findings, never
+          // a way to bless an oversized legacy baseline as readable.
+          isBaseline ? MAX_ENTRY_CONTENT_BYTES : maxAppEntryContentBytes,
+        );
+    // Known content is the already-authorized current brief. It is accounted
+    // separately in the baseline prompt projection, so do not let it consume
+    // the bounded historical-read budget needed to recover the predecessor.
+    if (body.content && knownContent === undefined) {
       remainingBudget -= Buffer.byteLength(body.content, 'utf8');
     }
 
@@ -971,9 +1182,31 @@ export async function readLibrary(
       origin: 'app_entry' as const,
       ...(body.contentError ? { contentError: body.contentError } : {}),
     });
+
+    if (isBaseline) {
+      if (body.content?.trim() && !body.truncated && !body.contentError) {
+        readableBaselineFound = true;
+        break;
+      }
+      unreadableBaselineSeen = true;
+    }
   }
 
   const entries = [...operatorEntries, ...appEntries];
+  // Metadata exhaustion alone does not prove that the evidence is usable.
+  // When no readable baseline covers older memos, every source memo in the
+  // returned history must have been downloaded in full. Otherwise a clipped
+  // or failed body would be reported as a complete history and the mission
+  // layer could produce a partial brief from it. Broken baseline files are
+  // deliberately excluded here: they are recovery markers, not source memos,
+  // and a readable older baseline can still safely cover the preceding state.
+  const requiredAppSourcesReadable = appEntries
+    .filter((entry) => !isLibraryBaselineFileName(entry.fileName))
+    .every((entry) =>
+      Boolean(entry.content?.trim())
+      && !entry.truncated
+      && !entry.contentError
+    );
 
   return librarySnapshotResult(
     {
@@ -983,6 +1216,9 @@ export async function readLibrary(
       folderId,
       entryCount: entries.length,
       entries,
+      appEntryHistoryComplete:
+        (readableBaselineFound || !listingHasMore)
+        && requiredAppSourcesReadable,
       sweep,
     },
     now,
@@ -1014,21 +1250,23 @@ function librarySnapshotResult(
 }
 
 /** Drive rejects these in file names; collapse them rather than fail the run. */
-function sanitizeEntryTitle(title: string): string {
+function sanitizeEntryTitle(title: string, maxChars = 120): string {
   return title
     .replace(/[<>:"/\\|?*]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
-    .slice(0, 120);
+    .slice(0, maxChars);
 }
 
 function formatEntryDate(now: Date): string {
   return now.toISOString().slice(0, 10);
 }
 
-export function buildLibraryEntryFileName(title: string, now: Date): string {
-  const safeTitle = sanitizeEntryTitle(title) || 'Entry';
-  return `${formatEntryDate(now)} — ${safeTitle}${ENTRY_FILE_EXTENSION}`;
+export function buildLibraryEntryFileName(title: string, now: Date, versionId?: string): string {
+  const safeVersion = versionId ? sanitizeEntryTitle(versionId, 48) : '';
+  const suffix = safeVersion ? ` · revision ${safeVersion}` : '';
+  const safeTitle = sanitizeEntryTitle(title, Math.max(1, 120 - suffix.length)) || 'Entry';
+  return `${formatEntryDate(now)} — ${safeTitle}${suffix}${ENTRY_FILE_EXTENSION}`;
 }
 
 /**
@@ -1044,12 +1282,25 @@ export function buildLibraryEntryFileName(title: string, now: Date): string {
 export async function appendLibraryEntry(
   workspaceId: string,
   section: string,
-  entry: { title: string; markdown: string },
+  entry: { title: string; markdown: string; kind?: 'baseline'; versionId?: string },
   deps: AccountLibraryDeps = {},
 ): Promise<AccountLibraryAppendResult | LibraryFailure> {
   const normalizedSection = normalizeSection(section);
   if (!workspaceId.trim()) return libraryFailure('integration_not_connected');
   if (!normalizedSection) return libraryFailure('unsupported_query', 'No library section was named.');
+
+  const normalizedTitle = typeof entry.title === 'string' ? entry.title.trim() : '';
+  const usesReservedBaselineNamespace = normalizedTitle.toLocaleLowerCase('en-US')
+    .startsWith(LIBRARY_BASELINE_TITLE_PREFIX.toLocaleLowerCase('en-US'));
+  if (usesReservedBaselineNamespace && entry.kind !== 'baseline') {
+    return libraryFailure(
+      'unsupported_query',
+      `Entry titles beginning with "${LIBRARY_BASELINE_TITLE_PREFIX}" are reserved for generated baselines.`,
+    );
+  }
+  if (entry.kind === 'baseline' && !GENERATED_LIBRARY_BASELINE_TITLE.test(normalizedTitle)) {
+    return libraryFailure('unsupported_query', 'The generated baseline title had an invalid format.');
+  }
 
   const markdown = typeof entry.markdown === 'string' ? entry.markdown : '';
   if (!markdown.trim()) {
@@ -1058,7 +1309,7 @@ export async function appendLibraryEntry(
     return libraryFailure('unsupported_query', 'There was no drafted content to record.');
   }
 
-  const execute = deps.execute ?? executeComposioAction;
+  const execute = resolveAccountLibraryExecutor(deps);
   const now = deps.now ? deps.now() : new Date();
 
   const folder = await ensureLibraryFolder(workspaceId, normalizedSection, deps);
@@ -1071,7 +1322,7 @@ export async function appendLibraryEntry(
     return libraryFailure('integration_query_failed', 'The library folder could not be resolved.');
   }
 
-  const fileName = buildLibraryEntryFileName(entry.title, now);
+  const fileName = buildLibraryEntryFileName(entry.title, now, entry.versionId);
 
   const existing = await runDriveAction(execute, workspaceId, FIND_FILE_ACTION, {
     q: [
@@ -1084,9 +1335,18 @@ export async function appendLibraryEntry(
     pageSize: 5,
     spaces: 'drive',
   });
-  if (!existing.ok) return existing.failure;
+  if (!existing.ok) {
+    return folder.createdFolder
+      ? unknownLibraryMutation(existing.failure)
+      : existing.failure;
+  }
 
-  const existingId = readDriveFiles(existing.data)
+  const existingFiles = readDriveFiles(existing.data);
+  if (!existingFiles) {
+    const failure = libraryFailure('integration_query_failed', 'Drive returned an invalid file listing.');
+    return folder.createdFolder ? unknownLibraryMutation(failure) : failure;
+  }
+  const existingId = existingFiles
     .map((file) => asString(file.id))
     .find((id): id is string => Boolean(id));
 
@@ -1111,14 +1371,16 @@ export async function appendLibraryEntry(
     text_content: body,
     mime_type: ENTRY_MIME_TYPE,
     parent_id: folder.folderId,
-  });
+  }, { mutating: true });
   if (!created.ok) return created.failure;
 
   const container =
     isRecord(created.data) && isRecord(created.data.data) ? created.data.data : created.data;
   const fileId = isRecord(container) ? asString(container.id) : undefined;
   if (!fileId) {
-    return libraryFailure('integration_query_failed', 'Drive did not return a file id.');
+    return unknownLibraryMutation(
+      libraryFailure('integration_query_failed', 'Drive did not return a file id.'),
+    );
   }
 
   return {

@@ -203,6 +203,48 @@ test('token request is a valid RS256 JWT for drive.readonly and is cached across
   assert.equal(listCallCount, 2);
 });
 
+test('a malformed successful files.list response is unavailable, not an empty folder', async () => {
+  const { privateKey } = generateTestKeypair();
+  const clientEmail = 'malformed-list-reader@test.iam.gserviceaccount.com';
+  const reader = createDriveReader({ clientEmail, privateKey }, async (input) => {
+    const url = typeof input === 'string' ? input : input.toString();
+    if (url === TOKEN_URL) return jsonResponse({ access_token: 'tok', expires_in: 3600 });
+    if (url.startsWith('https://www.googleapis.com/drive/v3/files?')) {
+      return jsonResponse({ wrong_field: [] });
+    }
+    throw new Error(`Unexpected fetch to ${url}`);
+  });
+
+  await assert.rejects(reader.listFolderTree('root-folder'), (error: unknown) => {
+    if (!(error instanceof DriveReaderError)) return false;
+    assert.equal(error.code, 'http_error');
+    assert.match(error.message, /invalid shape/);
+    return true;
+  });
+});
+
+test('files.list rejects records with blank required strings', async () => {
+  const { privateKey } = generateTestKeypair();
+  const reader = createDriveReader(
+    { clientEmail: 'blank-list-record@test.iam.gserviceaccount.com', privateKey },
+    async (input) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url === TOKEN_URL) return jsonResponse({ access_token: 'tok', expires_in: 3600 });
+      if (url.startsWith('https://www.googleapis.com/drive/v3/files?')) {
+        return jsonResponse({ files: [{ id: 'file-1', name: '   ', mimeType: 'text/plain' }] });
+      }
+      throw new Error(`Unexpected fetch to ${url}`);
+    },
+  );
+
+  await assert.rejects(reader.listFolderTree('root-folder'), (error: unknown) => {
+    if (!(error instanceof DriveReaderError)) return false;
+    assert.equal(error.code, 'http_error');
+    assert.match(error.message, /invalid shape/);
+    return true;
+  });
+});
+
 // --- listFolderTree pagination + recursion ----------------------------------
 
 test('listFolderTree paginates and recurses but never fetches more than 3 pages', async () => {
@@ -336,6 +378,37 @@ test('getFolderMeta requests files.get with id,name,mimeType fields and returns 
   assert.equal(params.get('fields'), 'id,name,mimeType');
 });
 
+test('getFolderMeta maps malformed 200 payloads to DriveReaderError unavailable state', async () => {
+  const { privateKey } = generateTestKeypair();
+  const malformedPayloads = [
+    null,
+    [],
+    { id: 'folder-id', name: '   ', mimeType: 'application/vnd.google-apps.folder' },
+  ];
+
+  for (const [index, payload] of malformedPayloads.entries()) {
+    const folderId = `malformed-folder-${index}`;
+    const reader = createDriveReader(
+      { clientEmail: `malformed-meta-${index}@test.iam.gserviceaccount.com`, privateKey },
+      async (input) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        if (url === TOKEN_URL) return jsonResponse({ access_token: 'tok', expires_in: 3600 });
+        if (url.startsWith(`https://www.googleapis.com/drive/v3/files/${folderId}?`)) {
+          return jsonResponse(payload);
+        }
+        throw new Error(`Unexpected fetch to ${url}`);
+      },
+    );
+
+    await assert.rejects(reader.getFolderMeta(folderId), (error: unknown) => {
+      if (!(error instanceof DriveReaderError)) return false;
+      assert.equal(error.code, 'http_error');
+      assert.match(error.message, /required fields|invalid shape/);
+      return true;
+    });
+  }
+});
+
 test('getFolderMeta surfaces a 404 (folder not shared with the reader) as DriveReaderError http_error carrying status 404', async () => {
   const { privateKey } = generateTestKeypair();
   const clientEmail = 'folder-meta-404-reader@test.iam.gserviceaccount.com';
@@ -358,6 +431,37 @@ test('getFolderMeta surfaces a 404 (folder not shared with the reader) as DriveR
     assert.equal(error.status, 404);
     return true;
   });
+});
+
+test('oversized Drive 403 envelopes preserve the structured reason without unbounded buffering', async () => {
+  const { privateKey } = generateTestKeypair();
+  for (const reason of ['rateLimitExceeded', 'insufficientFilePermissions']) {
+    const folderId = `oversized-403-${reason}`;
+    const reader = createDriveReader(
+      { clientEmail: `${reason.toLowerCase()}@test.iam.gserviceaccount.com`, privateKey },
+      async (input) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        if (url === TOKEN_URL) return jsonResponse({ access_token: 'tok', expires_in: 3600 });
+        if (url.startsWith(`https://www.googleapis.com/drive/v3/files/${folderId}?`)) {
+          return jsonResponse({
+            error: {
+              message: 'x'.repeat(5_000),
+              errors: [{ reason }],
+              status: 'PERMISSION_DENIED',
+            },
+          }, 403);
+        }
+        throw new Error(`Unexpected fetch to ${url}`);
+      },
+    );
+
+    await assert.rejects(reader.getFolderMeta(folderId), (error: unknown) => {
+      if (!(error instanceof DriveReaderError)) return false;
+      assert.equal(error.status, 403);
+      assert.equal(error.reason, reason);
+      return true;
+    });
+  }
 });
 
 // --- downloadFile size guard -------------------------------------------------
@@ -591,7 +695,8 @@ test('errors never contain the private key', async () => {
     reader.listFolderTree('some-folder'),
     (error: unknown) => {
       if (!(error instanceof DriveReaderError)) assert.fail('expected a DriveReaderError');
-      assert.equal(error.code, 'auth_failed');
+      assert.equal(error.code, 'http_error');
+      assert.equal(error.status, 500);
       assert.ok(!error.message.includes(privateKey));
       assert.ok(!(error.stack || '').includes(privateKey));
       // Also guard against a leaked key body fragment (in case of partial normalization bugs).
@@ -657,11 +762,49 @@ test('token endpoint 200 with invalid JSON surfaces as DriveReaderError', async 
     reader.listFolderTree('some-folder'),
     (error: unknown) => {
       if (!(error instanceof DriveReaderError)) assert.fail('expected a DriveReaderError');
-      assert.equal(error.code, 'auth_failed');
+      assert.equal(error.code, 'http_error');
       assert.ok(!error.message.includes(privateKey));
       return true;
     },
   );
+});
+
+test('token endpoint 200 without an access token is an unavailable platform response', async () => {
+  const { privateKey } = generateTestKeypair();
+  const clientEmail = 'missing-token-reader@test.iam.gserviceaccount.com';
+  const reader = createDriveReader({ clientEmail, privateKey }, async (input) => {
+    const url = typeof input === 'string' ? input : input.toString();
+    if (url === TOKEN_URL) return jsonResponse({ expires_in: 3600 });
+    throw new Error(`Unexpected fetch to ${url}`);
+  });
+
+  await assert.rejects(
+    reader.listFolderTree('some-folder'),
+    (error: unknown) => {
+      if (!(error instanceof DriveReaderError)) assert.fail('expected a DriveReaderError');
+      assert.equal(error.code, 'http_error');
+      assert.match(error.message, /access_token/);
+      return true;
+    },
+  );
+});
+
+test('token endpoint 200 with a non-string access token is an unavailable platform response', async () => {
+  const { privateKey } = generateTestKeypair();
+  const reader = createDriveReader(
+    { clientEmail: 'object-token-reader@test.iam.gserviceaccount.com', privateKey },
+    async (input) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url === TOKEN_URL) return jsonResponse({ access_token: {}, expires_in: 3600 });
+      throw new Error(`Unexpected fetch to ${url}`);
+    },
+  );
+
+  await assert.rejects(reader.listFolderTree('some-folder'), (error: unknown) => {
+    if (!(error instanceof DriveReaderError)) return false;
+    assert.equal(error.code, 'http_error');
+    return true;
+  });
 });
 
 test('files.list endpoint 200 with invalid JSON surfaces as DriveReaderError', async () => {

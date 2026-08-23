@@ -11,6 +11,9 @@ const automationPlan = {
   complexity: 'medium',
   estimatedToolCalls: 3,
   estimatedCredits: 72,
+  authorizationCredits: 72,
+  manualAuthorizationCredits: 72,
+  generationProjections: [],
   topology: {
     version: 'violema-10',
     primaryRole: 'analyst',

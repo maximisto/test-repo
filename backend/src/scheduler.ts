@@ -79,6 +79,7 @@ export interface AutomationRecord {
 
 const AUTOMATIONS_FILE = path.join(process.cwd(), 'automations.json');
 const scheduledTasks = new Map<string, ScheduledTask>();
+const activeAutomationExecutions = new Set<string>();
 const DEFAULT_AUTOMATION_TIMEZONE = process.env.DEFAULT_AUTOMATION_TIMEZONE || 'UTC';
 let cronModule: typeof import('node-cron') | null = null;
 
@@ -769,15 +770,20 @@ function evaluateCondition(condition: string, record: AutomationRecord): { pass:
   };
 }
 
-async function executeAutomation(
+async function executeAutomationClaimed(
   record: AutomationRecord,
-  onTrigger: (record: AutomationRecord) => Promise<{ ok: boolean; error?: string } | void>
+  onTrigger: (record: AutomationRecord) => Promise<{ ok: boolean; error?: string } | void>,
+  options: {
+    conditionAlreadyChecked?: boolean;
+    startedAt?: string;
+    startRecorded?: boolean;
+  } = {},
 ) {
-  const startedAt = new Date().toISOString();
+  const startedAt = options.startedAt ?? new Date().toISOString();
   const timezone = normalizeTimeZone(record.timezone);
 
   // Evaluate condition before running
-  if (record.condition?.trim()) {
+  if (!options.conditionAlreadyChecked && record.condition?.trim()) {
     const { pass, reason } = evaluateCondition(record.condition, record);
     if (!pass) {
       console.log(`[scheduler] automation ${record.id} skipped: ${reason}`);
@@ -791,11 +797,13 @@ async function executeAutomation(
     console.log(`[scheduler] automation ${record.id} condition passed: ${reason}`);
   }
 
-  updateAutomationRecord(record.id, (current) => ({
-    ...current,
-    timezone,
-    last_run_at: startedAt,
-  }));
+  if (!options.startRecorded) {
+    updateAutomationRecord(record.id, (current) => ({
+      ...current,
+      timezone,
+      last_run_at: startedAt,
+    }));
+  }
 
   let result: { ok: boolean; error?: string } | void;
 
@@ -817,6 +825,26 @@ async function executeAutomation(
     consecutive_failures: ok ? 0 : (current.consecutive_failures ?? 0) + 1,
     next_run_at: computeNextRunAt(current.cron_expression, timezone, new Date(startedAt)),
   }));
+}
+
+async function executeAutomation(
+  record: AutomationRecord,
+  onTrigger: (record: AutomationRecord) => Promise<{ ok: boolean; error?: string } | void>,
+) {
+  if (activeAutomationExecutions.has(record.id)) {
+    console.warn(`[scheduler] automation ${record.id} is already running; duplicate trigger skipped`);
+    return;
+  }
+  activeAutomationExecutions.add(record.id);
+  try {
+    await executeAutomationClaimed(record, onTrigger);
+  } finally {
+    activeAutomationExecutions.delete(record.id);
+  }
+}
+
+export function isAutomationExecutionInFlight(id: string) {
+  return activeAutomationExecutions.has(id);
 }
 
 function scheduleAutomationTask(
@@ -1043,14 +1071,69 @@ export function deleteAutomation(id: string) {
 
 export function triggerAutomationNow(
   id: string,
-  onTrigger: (record: AutomationRecord) => Promise<{ ok: boolean; error?: string } | void>
+  onTrigger: (record: AutomationRecord) => Promise<{ ok: boolean; error?: string } | void>,
+  expectedRecord?: AutomationRecord,
 ) {
   const record = getAutomationById(id);
-  if (!record) return null;
-  void executeAutomation(record, onTrigger).catch((error) => {
-    console.error(`[scheduler] manual trigger failed for ${id}`, error);
-  });
-  return record;
+  if (!record) return { status: 'not_found' as const };
+  if (activeAutomationExecutions.has(id)) return { status: 'already_running' as const };
+  if (record.status === 'paused') return { status: 'paused' as const };
+
+  // Manual surfaces price and reserve against one exact record. Refuse the
+  // handoff if a concurrent PATCH changed any execution input while readiness
+  // or billing checks were in flight; the caller releases its hold and asks
+  // the operator to retry against the new revision.
+  if (expectedRecord && JSON.stringify(record) !== JSON.stringify(expectedRecord)) {
+    return { status: 'stale_record' as const };
+  }
+
+  if (record.condition?.trim()) {
+    const condition = evaluateCondition(record.condition, record);
+    if (!condition.pass) {
+      const timezone = normalizeTimeZone(record.timezone);
+      try {
+        updateAutomationRecord(record.id, (current) => ({
+          ...current,
+          timezone,
+          next_run_at: computeNextRunAt(current.cron_expression, timezone),
+        }));
+      } catch (error) {
+        return { status: 'handoff_failed' as const, error };
+      }
+      return { status: 'condition_skipped' as const, reason: condition.reason };
+    }
+  }
+
+  const startedAt = new Date().toISOString();
+  const timezone = normalizeTimeZone(record.timezone);
+  try {
+    // This is the durable scheduler side of the handoff. Only after it lands
+    // may an HTTP/Slack caller acknowledge or consume a one-shot review.
+    updateAutomationRecord(record.id, (current) => ({
+      ...current,
+      timezone,
+      last_run_at: startedAt,
+    }));
+  } catch (error) {
+    return { status: 'handoff_failed' as const, error };
+  }
+
+  // Claim synchronously before returning. `executeAutomation` used to claim
+  // only after the caller had already received success, leaving a same-tick
+  // duplicate window and making condition skips leak transferred holds.
+  activeAutomationExecutions.add(id);
+  void executeAutomationClaimed(record, onTrigger, {
+    conditionAlreadyChecked: true,
+    startedAt,
+    startRecorded: true,
+  })
+    .catch((error) => {
+      console.error(`[scheduler] manual trigger failed for ${id}`, error);
+    })
+    .finally(() => {
+      activeAutomationExecutions.delete(id);
+    });
+  return { status: 'started' as const, record };
 }
 
 export function createAutomation(

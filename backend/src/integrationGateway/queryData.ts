@@ -1,5 +1,10 @@
-import { queryStripeRevenue, type StripeLikeClient } from './adapters/nativeStripe';
 import {
+  queryStripeRevenue,
+  STRIPE_REVENUE_QUERY_TYPES,
+  type StripeLikeClient,
+} from './adapters/nativeStripe';
+import {
+  PARTNER_COMPOSIO_QUERY_TYPES,
   queryPartnerComposio,
   type PartnerComposioQueryInput,
   type PartnerComposioSource,
@@ -8,6 +13,9 @@ import {
   ACCOUNT_LIBRARY_BACKING_SOURCE,
   ACCOUNT_LIBRARY_READ_QUERY_TYPE,
   ACCOUNT_LIBRARY_SOURCE,
+  ACCOUNT_LIBRARY_WRITE_QUERY_TYPE,
+  MAX_RECOVERABLE_APP_ENTRY_CONTENT_BYTES,
+  MAX_RECOVERABLE_APP_HISTORY_BYTES,
   readAccountLibrarySection,
   readLibrary,
   type AccountLibraryDeps,
@@ -22,6 +30,10 @@ import {
   buildPlatformTelemetrySnapshot,
   type PlatformTelemetrySnapshot,
 } from '../platform/platformTelemetry';
+import {
+  sanitizeIntegrationDiagnostic,
+  sanitizeIntegrationFailurePayload,
+} from './diagnostics';
 
 export interface LegacyQueryDataSuccess<T = unknown>
   extends Omit<IntegrationQuerySuccess<T>, 'live' | 'cache_hit'> {
@@ -42,6 +54,8 @@ export interface ExecuteQueryDataInput {
   filters?: Record<string, unknown>;
   limit?: number;
   now?: Date;
+  /** Cancels the live integration read when the automation step times out. */
+  signal?: AbortSignal;
   clientOverrides?: {
     stripe?: StripeLikeClient;
     partner?: (input: PartnerComposioQueryInput) => Promise<IntegrationQueryResult>;
@@ -49,7 +63,12 @@ export interface ExecuteQueryDataInput {
     accountLibraryRead?: (
       workspaceId: string,
       section: string,
-      options: { limit?: number },
+      options: {
+        limit?: number;
+        requireCompleteAppHistory?: boolean;
+        maxAppEntryContentBytes?: number;
+        maxAppHistoryBytes?: number;
+      },
       deps?: AccountLibraryDeps,
     ) => Promise<IntegrationQueryResult<AccountLibrarySnapshot>>;
   };
@@ -112,6 +131,73 @@ const LEGACY_MOCK_DATA: Record<string, Record<string, unknown>> = {
   },
 };
 
+export interface QueryDataDefinitionInput {
+  source: unknown;
+  queryType: unknown;
+  filters?: unknown;
+}
+
+/**
+ * Validate an authored query against the exact dispatcher contract before a
+ * manual/scheduled run can reserve credits. This is intentionally pure and
+ * shares the adapters' own query-type constants so save-time and execution do
+ * not drift into "accepted, then deterministically refused" behavior.
+ */
+export function validateQueryDataDefinition(input: QueryDataDefinitionInput): string | null {
+  const source = typeof input.source === 'string' ? input.source.trim() : '';
+  const queryType = typeof input.queryType === 'string' ? input.queryType.trim() : '';
+  const filters = input.filters && typeof input.filters === 'object' && !Array.isArray(input.filters)
+    ? input.filters as Record<string, unknown>
+    : {};
+
+  if (!source) return 'A query step must name a data source.';
+  if (!queryType) return `The ${source} query step must name a query_type.`;
+
+  if (source === 'stripe') {
+    if (!(STRIPE_REVENUE_QUERY_TYPES as readonly string[]).includes(queryType)) {
+      return `Stripe query_type "${queryType}" is not supported. Use ${STRIPE_REVENUE_QUERY_TYPES.map((item) => `"${item}"`).join(', ')}.`;
+    }
+    return null;
+  }
+
+  if (source === ACCOUNT_LIBRARY_SOURCE) {
+    if (![ACCOUNT_LIBRARY_READ_QUERY_TYPE, ACCOUNT_LIBRARY_WRITE_QUERY_TYPE].includes(queryType)) {
+      return `Account library query_type "${queryType}" is not supported. Use "${ACCOUNT_LIBRARY_READ_QUERY_TYPE}" or "${ACCOUNT_LIBRARY_WRITE_QUERY_TYPE}".`;
+    }
+    return null;
+  }
+
+  if (source === PLATFORM_TELEMETRY_SOURCE) {
+    return queryType === 'platform_learning_snapshot'
+      ? null
+      : 'Platform telemetry supports only query_type "platform_learning_snapshot".';
+  }
+
+  if (isPartnerDemoSource(source)) {
+    const expected = PARTNER_COMPOSIO_QUERY_TYPES[source];
+    if (queryType !== expected) {
+      return `${source} supports only query_type "${expected}".`;
+    }
+    if (source === 'github') {
+      const owner = typeof filters.owner === 'string' ? filters.owner.trim() : '';
+      const repo = typeof filters.repo === 'string' ? filters.repo.trim() : '';
+      if (!owner || !repo) {
+        return 'GitHub query steps require both filters.owner and filters.repo.';
+      }
+    }
+    return null;
+  }
+
+  const demoQueries = LEGACY_MOCK_DATA[source];
+  if (demoQueries) {
+    return Object.prototype.hasOwnProperty.call(demoQueries, queryType)
+      ? null
+      : `${source} query_type "${queryType}" is not available.`;
+  }
+
+  return `${source} is not a supported query source.`;
+}
+
 const PARTNER_DEMO_SOURCES: PartnerComposioSource[] = [
   'github',
   'linear',
@@ -126,7 +212,7 @@ function isPartnerDemoSource(source: string): source is PartnerComposioSource {
 
 function readQueryPayloadFailureMessage(payload: Record<string, unknown>, stepTitle: string) {
   if (typeof payload.message === 'string' && payload.message.trim()) {
-    return payload.message.trim();
+    return sanitizeIntegrationDiagnostic(payload.message);
   }
   if (typeof payload.code === 'string' && payload.code.trim()) {
     return `Query step "${stepTitle}" failed with ${payload.code.trim()}.`;
@@ -139,13 +225,16 @@ export function applyQueryStepPayloadToExecution(
 ) {
   const { stepTitle, payload, stepExecution, stepErrors, artifactCount } = input;
 
-  stepExecution.output = payload;
+  const persistedPayload = payload.ok === false
+    ? sanitizeIntegrationFailurePayload(payload, `Query step "${stepTitle}" failed.`)
+    : payload;
+  stepExecution.output = persistedPayload;
   stepExecution.artifactKind = 'query_data';
   stepExecution.toolCalls = 1;
   stepExecution.artifactCount = artifactCount;
 
   if (payload.ok === false) {
-    const failureMessage = readQueryPayloadFailureMessage(payload, stepTitle);
+    const failureMessage = readQueryPayloadFailureMessage(persistedPayload, stepTitle);
     stepExecution.status = 'failed';
     stepExecution.summary = failureMessage;
     stepExecution.error = failureMessage;
@@ -179,6 +268,7 @@ export async function executeQueryData(
       queryType: input.queryType,
       limit: input.limit,
       now,
+      signal: input.signal,
       client: input.clientOverrides?.stripe,
       secretKey: input.credentialOverrides?.stripeSecretKey,
     });
@@ -244,12 +334,33 @@ export async function executeQueryData(
     }
 
     const readLibrarySection = input.clientOverrides?.accountLibraryRead ?? readLibrary;
-    return await readLibrarySection(
+    const result = await readLibrarySection(
       input.workspaceId,
       readAccountLibrarySection(input.filters),
-      { limit: input.limit },
-      { now: () => now },
+      {
+        limit: input.limit,
+        // A small workflow limit is a presentation preference, not permission
+        // to hide newer unbaselined memos. Widen only Violema-owned history,
+        // under the same 100-file/64 KB recovery bounds used by compaction, so
+        // the later write step can safely re-establish the baseline.
+        requireCompleteAppHistory: true,
+        maxAppEntryContentBytes: MAX_RECOVERABLE_APP_ENTRY_CONTENT_BYTES,
+        maxAppHistoryBytes: MAX_RECOVERABLE_APP_HISTORY_BYTES,
+      },
+      { now: () => now, signal: input.signal },
     );
+    if (result.ok && result.data.appEntryHistoryComplete === false) {
+      return {
+        ok: false,
+        code: 'integration_query_failed',
+        source: ACCOUNT_LIBRARY_BACKING_SOURCE,
+        message:
+          'Violema could not read the account library history completely, so this run was stopped before producing a partial brief.',
+        can_continue: false,
+        nextAction: { label: 'Retry Google Drive', route: '/integrations?provider=google_drive' },
+      };
+    }
+    return result;
   }
 
   if (isPartnerDemoSource(input.source)) {
@@ -261,6 +372,7 @@ export async function executeQueryData(
       filters: input.filters,
       limit: input.limit,
       now,
+      signal: input.signal,
     });
   }
 

@@ -83,8 +83,18 @@ import {
   isRateLimitExempt,
   isSensitiveRateLimitPath,
 } from './security';
-import { takeBrowserScreenshot } from './tools/browserScreenshot';
-import { getIntegrationStatus, searchWeb, sendMessage, validateMessageTarget } from './integrations';
+import {
+  preflightBrowserScreenshotUrl,
+  takeBrowserScreenshot,
+  validateBrowserScreenshotUrlLiteral,
+} from './tools/browserScreenshot';
+import {
+  getIntegrationStatus,
+  preflightMessageDelivery,
+  searchWeb,
+  sendMessage,
+  validateMessageTarget,
+} from './integrations';
 import { usesInternalDemoRouting } from './platform/tenancy';
 import { renderChartSpecsToFiles } from './chartImage';
 import {
@@ -128,11 +138,18 @@ import {
 import { resolveAutomationStepSeverity } from './platform/stepSeverity';
 import {
   AUTOMATION_MEMO_MAX_TOKENS,
+  AUTOMATION_ANALYSIS_MAX_BYTES,
+  AUTOMATION_EXTRACTION_MAX_BYTES,
+  AUTOMATION_MEMO_BODY_WORD_LIMIT,
   AUTOMATION_MEMO_WORD_LIMIT,
+  AUTOMATION_SUMMARY_MAX_BYTES,
   AUTOMATION_SUMMARY_WORD_LIMIT,
-  appendFullAnalysisLink,
+  buildBoundedAutomationSummaryFallback,
+  buildDeterministicAutomationMemo,
   automationSummaryTokenBudget,
+  requireCompleteAutomationMemoWithLink,
   requireCompleteAutomationSummary,
+  requireBoundedAutomationOutput,
 } from './platform/automationSummaryPolicy';
 import { extractToolArtifactsFromResult, type StoredToolArtifact } from './platform/toolArtifacts';
 import { applyBusinessContextToStep } from './platform/businessContext';
@@ -141,6 +158,7 @@ import {
   deleteAutomation,
   ensureCoreAutomationSeeds,
   getAutomationById,
+  isAutomationExecutionInFlight,
   listAutomations,
   loadPersistedAutomations,
   runBusinessContextMigration,
@@ -158,10 +176,13 @@ import {
   type AutomationReviewPolicy,
   calculateRuntimeCredits,
   type AutomationExecutionPlan,
+  type AutomationGenerationCall,
+  type AutomationGenerationProjection,
   type AutomationRolePlan,
   type AutomationStepDefinition,
   type AutomationStepExecution,
   type AutomationStepKind,
+  type AutomationToolAttempt,
   type PersistedAutomationStep,
   buildCreditSnapshot,
   buildCreditBudgetBlock,
@@ -169,7 +190,6 @@ import {
   buildCreditOverrunReason,
   buildInsufficientCreditsBlock,
   checkRunAffordability,
-  countPlannedModelCalls,
   type CreditBlockDescriptor,
   type CreditBudgetBlockDescriptor,
   CREDIT_BUDGET_EXCEEDED_CODE,
@@ -185,10 +205,14 @@ import {
   evaluatePlanEnforcement,
   ensureWorkspaceCredits,
   estimateCreditCost,
+  estimateGenerationCallTokenCredits,
+  maximumGenerationCallTokenCredits,
   estimateProviderCostUsd,
   estimateProviderCostUsdForUsage,
+  extendCreditHold,
   CREDIT_VALUE_USD,
   finalizeTaskRun,
+  getPlatformState,
   getBillingStatus,
   getBusinessContext,
   setBusinessContext,
@@ -202,9 +226,13 @@ import {
   markReferralQualified,
   markReferralRewarded,
   type ModelTier,
+  type TaskRecord,
+  type TaskRunStatus,
+  type TaskStatus,
   purchaseTopUp,
   recordReferralEvent,
   releaseCreditHold,
+  renewCreditHold,
   settleCreditHold,
   summarizeReferralRewards,
   mapTaskRunToStatus,
@@ -237,8 +265,11 @@ import {
   getModelSource,
   getModelSourceLabel,
   getModelRoutingStatus,
+  hasConfiguredTextGenerationRoute,
   getUtilityModelConfig,
   routeChatProfile,
+  type TextGenerationAttempt,
+  type TextGenerationUsage,
   type TextProfile,
   withModelRetry,
 } from './models';
@@ -285,6 +316,7 @@ import {
   executeReviewApproval,
   executeReviewChangeRequest,
   findAutomationReviewContext,
+  reconcilePendingReviewDeliveries,
   reviewFailureStatusCode,
   type ReviewActionContext,
   type ReviewActor,
@@ -313,23 +345,37 @@ import {
   appendWorkflowLedgerEvent,
   listWorkflowLedgerEvents,
 } from './integrationGateway/auditLog';
-import { applyQueryStepPayloadToExecution, executeQueryData } from './integrationGateway/queryData';
+import {
+  applyQueryStepPayloadToExecution,
+  executeQueryData,
+  validateQueryDataDefinition,
+} from './integrationGateway/queryData';
+import { sanitizeIntegrationFailurePayload } from './integrationGateway/diagnostics';
 import {
   ACCOUNT_LIBRARY_BACKING_SOURCE,
   ACCOUNT_LIBRARY_DRIVE_TOOLKIT,
-  appendLibraryEntry,
   buildLibraryAccessFailure,
   COMPETITIVE_INTELLIGENCE_SECTION,
   findLibraryRootFolderId,
+  hasUnknownLibraryMutationOutcome,
   isAccountLibraryWriteRequest,
   isLibraryFailure,
+  MAX_RECOVERABLE_APP_HISTORY_BYTES,
+  MAX_TOTAL_CONTENT_BYTES,
   provisionLibrarySection,
   readAccountLibraryEntryTitle,
   readAccountLibrarySection,
   buildLibraryEntryViewLink,
   summarizeLibrarySection,
 } from './integrationGateway/accountLibrary';
-import { updateLibraryBaseline } from './integrationGateway/libraryBaseline';
+import {
+  appendLibraryEntryWithBaseline,
+  buildLibraryBaselineSystemPrompt,
+  LIBRARY_BASELINE_LOOKBACK_LIMIT,
+  LIBRARY_BASELINE_MAX_PROMPT_SOURCE_COUNT,
+  LIBRARY_BASELINE_MAX_TOKENS,
+  projectLibraryBaselineUserContentBytes,
+} from './integrationGateway/libraryBaseline';
 import {
   getFolderDropLaneState,
   getFolderDropReaderEmail,
@@ -369,7 +415,25 @@ const PUBLIC_APP_BASE_URL = (process.env.PUBLIC_APP_URL || process.env.APP_BASE_
 const SLACK_EVENT_CACHE_WINDOW_MS = 5 * 60 * 1000;
 // Hang guard, not a pace expectation: Opus-tier drafting of evidence-heavy
 // briefs (table + source links) legitimately runs past a minute.
-const AUTOMATION_STEP_TIMEOUT_MS = Number(process.env.AUTOMATION_STEP_TIMEOUT_MS || 120000);
+const AUTOMATION_STEP_TIMEOUT_MS = (() => {
+  const configured = Number(process.env.AUTOMATION_STEP_TIMEOUT_MS || 120000);
+  return Number.isFinite(configured) && configured > 0 ? Math.trunc(configured) : 120000;
+})();
+const AUTOMATION_STEP_BILLABLE_DURATION_SECONDS = Math.max(
+  1,
+  Math.ceil(AUTOMATION_STEP_TIMEOUT_MS / 1000),
+);
+// Automations use a smaller, explicitly priced retry/fallback envelope than
+// interactive chat. Every physical attempt crosses the live credit boundary;
+// unbudgeted holds grow atomically and mission budgets stop before overspend.
+const AUTOMATION_GENERATION_ATTEMPTS_PER_ROUTE = 2;
+const AUTOMATION_GENERATION_ROUTE_LIMIT = 2;
+const MANUAL_GENERATION_ATTEMPTS_PER_ROUTE = 1;
+const MANUAL_GENERATION_ROUTE_LIMIT = 1;
+const AUTOMATION_CREDIT_HOLD_LEASE_MS = Math.max(
+  60 * 60 * 1000,
+  AUTOMATION_STEP_TIMEOUT_MS * 3,
+);
 const MAX_TOOL_ITERATIONS = readPositiveIntegerEnv('MAX_TOOL_ITERATIONS', 24);
 const CHAT_MAX_OUTPUT_TOKENS = readPositiveIntegerEnv('CHAT_MAX_OUTPUT_TOKENS', 8000);
 const handledSlackEvents = new Map<string, number>();
@@ -1416,26 +1480,6 @@ function describeInFlightRun(automationName: string, startedAt: string) {
   return `"${automationName}" is already running — started ${elapsed} ago. It will park in Reviews when the draft is ready.`;
 }
 
-/**
- * `triggerAutomationNow` starts the run asynchronously and hands back the
- * automation, not the run. The run id appears once `runAutomation` creates the
- * task run, so this waits briefly for it rather than inventing one — and gives
- * up honestly instead of blocking the reply.
- */
-async function resolveStartedRunId(workspaceId: string, automationId: string, sinceMs: number) {
-  for (let attempt = 0; attempt < 10; attempt += 1) {
-    const run = listTaskRuns(workspaceId)
-      .filter((item) =>
-        item.metadata?.automationId === automationId &&
-        Date.parse(item.startedAt) >= sinceMs
-      )
-      .sort((left, right) => Date.parse(right.startedAt) - Date.parse(left.startedAt))[0];
-    if (run) return run.id;
-    await new Promise((resolve) => setTimeout(resolve, 150));
-  }
-  return null;
-}
-
 async function handleSlackRunIntent(input: {
   missionQuery: string;
   channel: string;
@@ -1458,6 +1502,15 @@ async function handleSlackRunIntent(input: {
 
   const automation = match.automation;
 
+  if (automation.status === 'paused') {
+    await replyInSlack(
+      input.channel,
+      `*${automation.name}* is paused. Resume it after resolving the recorded blocker, then try again.`,
+      input.threadTs,
+    );
+    return;
+  }
+
   const inFlight = findInFlightRunForAutomation(automation.workspaceId || input.workspaceId, automation.id);
   if (inFlight) {
     await replyInSlack(input.channel, describeInFlightRun(automation.name, inFlight.startedAt), input.threadTs);
@@ -1470,6 +1523,11 @@ async function handleSlackRunIntent(input: {
     const readiness = await evaluateAutomationRunReadiness({
       workspaceId: automation.workspaceId || input.workspaceId,
       workflowId: inferWorkflowIdFromAutomation(automation),
+      automationId: automation.id,
+      automationName: automation.name,
+      description: automation.description,
+      condition: automation.condition,
+      actions: automation.actions,
       steps: automation.steps,
       deliveryTarget: automation.notify,
     });
@@ -1492,21 +1550,82 @@ async function handleSlackRunIntent(input: {
     return;
   }
 
-  const startedAt = Date.now();
-  const record = triggerAutomationNow(automation.id, runAutomation);
-  if (!record) {
-    await replyInSlack(input.channel, `I could not start ${automation.name}.`, input.threadTs);
+  let creditDecision: ReturnType<typeof acquireManualRunCreditAuthorization>;
+  try {
+    creditDecision = acquireManualRunCreditAuthorization(
+      automation,
+      automation.workspaceId || input.workspaceId,
+    );
+  } catch (error) {
+    console.error('[slack] credit authorization failed before run', error);
+    await replyInSlack(
+      input.channel,
+      'I could not verify and reserve the credits for that mission. Nothing was started — try again.',
+      input.threadTs,
+    );
+    return;
+  }
+  if (creditDecision.block) {
+    const blockers = creditDecision.block.blockers.map((blocker) => {
+      const label = 'label' in blocker ? blocker.label : blocker.nextAction.label;
+      const detail = 'detail' in blocker ? blocker.detail : blocker.message;
+      return `• ${label} — ${detail}`;
+    });
+    await replyInSlack(
+      input.channel,
+      [creditDecision.block.summary, ...blockers].filter(Boolean).join('\n'),
+      input.threadTs,
+    );
+    return;
+  }
+
+  const authorization = creditDecision.authorization;
+  const launch = createAutomationLaunchHandoff();
+  const trigger = triggerAutomationNow(
+    automation.id,
+    (fresh) => runAutomation({
+      ...fresh,
+      _creditAuthorization: authorization,
+      _launchHandoff: launch.handoff,
+    }),
+    automation,
+  );
+  if (trigger.status !== 'started') {
+    safelyReleaseManualRunCreditAuthorization(
+      authorization,
+      `Released credits because ${automation.name} did not start (${trigger.status})`,
+    );
+    const refusal = trigger.status === 'condition_skipped'
+      ? `${automation.name} was skipped: ${trigger.reason} Nothing was spent.`
+      : trigger.status === 'stale_record'
+        ? `${automation.name} changed while I was checking it. Nothing was started — try again.`
+        : trigger.status === 'handoff_failed'
+          ? `${automation.name} could not be handed to the runner safely. Nothing was started or spent — try again.`
+        : trigger.status === 'paused'
+          ? `${automation.name} is paused. Resume it after resolving the recorded blocker, then try again.`
+        : `${automation.name} is already starting or running.`;
+    await replyInSlack(
+      input.channel,
+      refusal,
+      input.threadTs,
+    );
+    return;
+  }
+  const record = trigger.record;
+  const launchResult = await launch.promise;
+  if (!launchResult.ok) {
+    await replyInSlack(
+      input.channel,
+      `${automation.name} could not be handed to the runner safely. Nothing was started or spent — try again.`,
+      input.threadTs,
+    );
     return;
   }
 
   broadcastTaskPanelEvent(input.workspaceId, { type: 'automation_triggered', automationId: record.id });
-
-  const runId = await resolveStartedRunId(input.workspaceId, automation.id, startedAt);
   await replyInSlack(
     input.channel,
-    runId
-      ? `Started *${record.name}* — run \`${runId}\`. I'll post the review card here when it needs approval.`
-      : `Started *${record.name}*. I'll post the review card here when it needs approval.`,
+    `Started *${record.name}* — run \`${launchResult.receipt.taskRunId}\`. I'll post the review card here when it needs approval.`,
     input.threadTs,
   );
 }
@@ -2140,7 +2259,7 @@ async function runOpenAIChatLoop(
         tool_choice: 'auto',
         max_tokens: CHAT_MAX_OUTPUT_TOKENS,
       }),
-    });
+    }, route);
 
     const data = await response.json() as {
       error?: { message?: string };
@@ -2537,13 +2656,14 @@ function buildChartArtifact(toolInput: Record<string, unknown>) {
 async function executeToolCall(
   toolName: string,
   toolInput: Record<string, unknown>,
-  ctx?: { workspaceId?: string },
+  ctx?: { workspaceId?: string; signal?: AbortSignal },
 ): Promise<string> {
   // Composio fallback path — tool names like SLACK_SEND_MESSAGE, GITHUB_CREATE_ISSUE etc.
   if (isComposioToolName(toolName) && isComposioEnabled()) {
     try {
       const result = await executeComposioAction(toolName, toolInput, {
         entityId: ctx?.workspaceId ?? 'default',
+        signal: ctx?.signal,
       });
       return JSON.stringify(result);
     } catch (err) {
@@ -2558,7 +2678,7 @@ async function executeToolCall(
     case 'web_search': {
       const query = toolInput.query as string;
       const numResults = toolInput.num_results as number | undefined;
-      return JSON.stringify(await searchWeb(query, numResults));
+      return JSON.stringify(await searchWeb(query, numResults, ctx?.signal));
     }
 
     case 'browser_screenshot': {
@@ -2568,7 +2688,7 @@ async function executeToolCall(
         width: toolInput.width as number | undefined,
         height: toolInput.height as number | undefined,
         wait_until: toolInput.wait_until as 'load' | 'domcontentloaded' | 'networkidle' | undefined,
-      });
+      }, ctx?.signal);
       return JSON.stringify(result);
     }
 
@@ -2690,6 +2810,7 @@ async function executeToolCall(
         // Scopes channel aliases and picks the Slack transport, so a tenant's
         // send never resolves through our demo aliases or our bot token.
         workspaceId: ctx?.workspaceId || DEFAULT_WORKSPACE_ID,
+        signal: ctx?.signal,
       }));
     }
 
@@ -2702,6 +2823,7 @@ async function executeToolCall(
         queryType,
         filters: isObjectRecord(toolInput.filters) ? toolInput.filters : undefined,
         limit: typeof toolInput.limit === 'number' ? toolInput.limit : undefined,
+        signal: ctx?.signal,
       }));
     }
 
@@ -3149,6 +3271,16 @@ function collectAutomationSourceLinks(
       links.push({ url, label: typeof result.title === 'string' && result.title ? result.title : url });
       if (links.length >= 6) return links;
     }
+    const boundedLinks = Array.isArray((artifact.payload as { source_links?: unknown[] }).source_links)
+      ? ((artifact.payload as { source_links: unknown[] }).source_links)
+      : [];
+    for (const result of boundedLinks) {
+      if (!isObjectRecord(result)) continue;
+      const url = typeof result.url === 'string' ? result.url : '';
+      if (!url.startsWith('https://')) continue;
+      links.push({ url, label: typeof result.title === 'string' && result.title ? result.title : url });
+      if (links.length >= 6) return links;
+    }
   }
   return links;
 }
@@ -3166,6 +3298,47 @@ function isObjectRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
+const MAX_PERSISTED_AUTOMATION_STEPS = 24;
+const MAX_AUTOMATION_STEP_TEXT_CHARS = 1_000;
+const MAX_AUTOMATION_STEP_INPUT_TEXT_CHARS = 1_000;
+const MAX_AUTOMATION_STEP_INPUT_TOTAL_CHARS = 8_000;
+const MAX_AUTOMATION_STEP_INPUT_NODES = 128;
+const MAX_AUTOMATION_STEP_INPUT_DEPTH = 4;
+
+function normalizeAutomationStepInputs(value: unknown): Record<string, unknown> | undefined {
+  if (!isObjectRecord(value)) return undefined;
+  let remainingChars = MAX_AUTOMATION_STEP_INPUT_TOTAL_CHARS;
+  let remainingNodes = MAX_AUTOMATION_STEP_INPUT_NODES;
+
+  const visit = (candidate: unknown, depth: number): unknown => {
+    if (remainingNodes <= 0 || depth > MAX_AUTOMATION_STEP_INPUT_DEPTH) return undefined;
+    remainingNodes -= 1;
+    if (typeof candidate === 'string') {
+      const limit = Math.min(MAX_AUTOMATION_STEP_INPUT_TEXT_CHARS, remainingChars);
+      const normalized = candidate.trim().slice(0, Math.max(0, limit));
+      remainingChars -= normalized.length;
+      return normalized;
+    }
+    if (typeof candidate === 'number') return Number.isFinite(candidate) ? candidate : undefined;
+    if (typeof candidate === 'boolean' || candidate === null) return candidate;
+    if (Array.isArray(candidate)) {
+      return candidate.slice(0, 20).reduce<unknown[]>((entries, entry) => {
+        const normalized = visit(entry, depth + 1);
+        if (normalized !== undefined) entries.push(normalized);
+        return entries;
+      }, []);
+    }
+    if (!isObjectRecord(candidate)) return undefined;
+    return Object.entries(candidate).slice(0, 32).reduce<Record<string, unknown>>((record, [key, entry]) => {
+      const normalized = visit(entry, depth + 1);
+      if (normalized !== undefined) record[key.slice(0, 100)] = normalized;
+      return record;
+    }, {});
+  };
+
+  return visit(value, 0) as Record<string, unknown>;
+}
+
 function normalizePersistedAutomationSteps(input: unknown[]): PersistedAutomationStep[] {
   return input.reduce<PersistedAutomationStep[]>((steps, item, index) => {
     if (!isObjectRecord(item)) return steps;
@@ -3173,9 +3346,9 @@ function normalizePersistedAutomationSteps(input: unknown[]): PersistedAutomatio
     if (!['search', 'query', 'summarize', 'deliver', 'capture', 'analyze', 'note'].includes(kind)) return steps;
 
     const objectiveCandidate = typeof item.objective === 'string'
-      ? item.objective.trim()
+      ? item.objective.trim().slice(0, MAX_AUTOMATION_STEP_TEXT_CHARS)
       : typeof item.title === 'string'
-        ? item.title.trim()
+        ? item.title.trim().slice(0, MAX_AUTOMATION_STEP_TEXT_CHARS)
         : '';
     if (!objectiveCandidate) return steps;
 
@@ -3195,13 +3368,78 @@ function normalizePersistedAutomationSteps(input: unknown[]): PersistedAutomatio
     steps.push({
       id: typeof item.id === 'string' && item.id.trim() ? item.id.trim() : `step_${index + 1}`,
       kind: kind as PersistedAutomationStep['kind'],
-      title: typeof item.title === 'string' && item.title.trim() ? item.title.trim() : undefined,
+      title: typeof item.title === 'string' && item.title.trim()
+        ? item.title.trim().slice(0, MAX_AUTOMATION_STEP_TEXT_CHARS)
+        : undefined,
       objective: objectiveCandidate,
-      inputs: isObjectRecord(item.inputs) ? item.inputs : undefined,
+      inputs: normalizeAutomationStepInputs(item.inputs),
       deliveryTarget,
     });
     return steps;
   }, []);
+}
+
+type AutomationStepArgumentDefinition = Pick<
+  PersistedAutomationStep,
+  'kind' | 'title' | 'objective' | 'inputs'
+>;
+
+function automationExecutionPhase(step: AutomationStepArgumentDefinition): number {
+  if (step.kind === 'search' || step.kind === 'capture' || step.kind === 'note') return 0;
+  if (step.kind === 'query') return isAccountLibraryWriteRequest(step.inputs) ? 3 : 0;
+  if (step.kind === 'analyze') return 1;
+  if (step.kind === 'summarize') return 2;
+  return 4; // delivery is the terminal external consumer
+}
+
+/**
+ * Structural argument validation shared by save-time and the authoritative
+ * pre-run gate. Connector readiness answers "can this workspace reach it?";
+ * this answers the earlier question "could this exact step ever execute?".
+ */
+function validateAutomationExecutableStepArguments(
+  steps: readonly AutomationStepArgumentDefinition[],
+) {
+  let completedSummaryAvailable = false;
+  let highestPhase = -1;
+  for (const [index, step] of steps.entries()) {
+    const label = step.title?.trim() || step.objective.trim() || `Step ${index + 1}`;
+    const phase = automationExecutionPhase(step);
+    if (phase < highestPhase) {
+      throw new Error(
+        `Workflow step order is invalid at "${label}". Put evidence reads and notes first, then analysis, `
+        + 'summary, account-library write, and delivery last.',
+      );
+    }
+    highestPhase = Math.max(highestPhase, phase);
+    if (step.kind === 'summarize') completedSummaryAvailable = true;
+    if (step.kind === 'query') {
+      const failure = validateQueryDataDefinition({
+        source: step.inputs?.source,
+        queryType: step.inputs?.query_type,
+        filters: step.inputs?.filters,
+      });
+      if (failure) throw new Error(`Query step "${label}" is not executable: ${failure}`);
+      if (isAccountLibraryWriteRequest(step.inputs) && !completedSummaryAvailable) {
+        throw new Error(
+          `Account library write step "${label}" must come after a summary step so the current brief is archived.`,
+        );
+      }
+    }
+
+    if (step.kind === 'capture') {
+      const rawUrl = typeof step.inputs?.url === 'string' ? step.inputs.url.trim() : '';
+      if (!rawUrl) {
+        throw new Error(`Capture step "${label}" needs a public http or https URL.`);
+      }
+      try {
+        validateBrowserScreenshotUrlLiteral(rawUrl);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : 'A valid public http or https URL is required.';
+        throw new Error(`Capture step "${label}" is not executable: ${detail}`);
+      }
+    }
+  }
 }
 
 function deriveLegacyActionFromStep(step: PersistedAutomationStep) {
@@ -3537,7 +3775,22 @@ function createAutomationStepDefinitionFromPersisted(
 ): AutomationStepDefinition {
   // Resolve operator-owned business context BEFORE any kind-specific handling,
   // so the search/analyze/summarize branches below see concrete inputs.
-  const step = applyBusinessContextToStep(persistedStep, businessContext);
+  const contextStep = applyBusinessContextToStep(persistedStep, businessContext);
+  // Reapply the write-time bounds here so legacy/store-edited rows cannot
+  // bypass them. Every manual/scheduled path builds this same execution plan.
+  const step: PersistedAutomationStep = {
+    ...contextStep,
+    id: contextStep.id?.trim().slice(0, 200),
+    title: contextStep.title?.trim().slice(0, MAX_AUTOMATION_STEP_TEXT_CHARS),
+    objective: contextStep.objective.trim().slice(0, MAX_AUTOMATION_STEP_TEXT_CHARS),
+    inputs: normalizeAutomationStepInputs(contextStep.inputs),
+    deliveryTarget: contextStep.deliveryTarget
+      ? {
+          channel: contextStep.deliveryTarget.channel,
+          target: contextStep.deliveryTarget.target.trim().slice(0, MAX_AUTOMATION_STEP_INPUT_TEXT_CHARS),
+        }
+      : contextStep.deliveryTarget,
+  };
   const baseId = step.id?.trim() || buildAutomationStepId(automation.id, index);
   const title = step.title?.trim() || step.objective.trim() || `Step ${index + 1}`;
   const objective = step.objective.trim() || title;
@@ -3954,6 +4207,104 @@ function estimateSuccessfulAutomationCredits(stepExecutions: AutomationStepExecu
   }, 0);
 }
 
+function hasReliableGenerationUsage(usage: AutomationGenerationCall['usage']): boolean {
+  if (!usage) return false;
+  const fields = [usage.inputTokens, usage.outputTokens, usage.totalTokens]
+    .filter((value): value is number => value !== undefined);
+  if (fields.length === 0 || fields.some((value) => !Number.isFinite(value) || value < 0)) return false;
+
+  const inputTokens = usage.inputTokens ?? 0;
+  const outputTokens = usage.outputTokens ?? 0;
+  const reportedTotal = usage.totalTokens;
+  if (reportedTotal !== undefined) {
+    if (reportedTotal <= 0 || reportedTotal < inputTokens || reportedTotal < outputTokens) return false;
+    if (usage.inputTokens !== undefined && usage.outputTokens !== undefined && reportedTotal < inputTokens + outputTokens) {
+      return false;
+    }
+    return true;
+  }
+
+  // A non-empty generation request cannot legitimately consume zero tokens.
+  // Without an authoritative total, both sides of the request must be
+  // reported. One partial field is only a known minimum: charge it, but keep
+  // the attempt in reconciliation because the omitted side may be billable.
+  if (usage.inputTokens === undefined || usage.outputTokens === undefined) return false;
+  return inputTokens + outputTokens > 0;
+}
+
+/** Bill every finite positive token field even when the provider omitted the
+ * rest of the usage tuple. Completeness and charging are deliberately
+ * separate: partial usage is a known minimum that still requires quarantine. */
+function hasObservedGenerationUsage(usage: AutomationGenerationCall['usage']): boolean {
+  if (!usage) return false;
+  return [usage.inputTokens, usage.outputTokens, usage.totalTokens]
+    .some((value) => typeof value === 'number' && Number.isFinite(value) && value > 0);
+}
+
+function findUnreconciledGenerationCalls(stepExecutions: AutomationStepExecution[]) {
+  return readAutomationGenerationCalls(stepExecutions)
+    .filter((call) => !hasReliableGenerationUsage(call.usage));
+}
+
+function hasBlockingAutomationStepFailure(stepExecutions: AutomationStepExecution[]) {
+  return stepExecutions.some((step) => step.status === 'failed' && step.stepSeverity !== 'auxiliary');
+}
+
+function hasFallbackBlockingAutomationStepFailure(stepExecutions: AutomationStepExecution[]) {
+  return stepExecutions.some((step) =>
+    step.status === 'failed'
+    && step.stepSeverity !== 'auxiliary'
+    && step.kind !== 'summarize'
+  );
+}
+
+function buildGenerationAccountingReconciliationError(callCount: number) {
+  const noun = callCount === 1 ? 'provider attempt has' : 'provider attempts have';
+  return `Usage for ${callCount} physical ${noun} not been proven. Known charges were settled, but token cost is incomplete; manual accounting reconciliation is required before this automation can run again.`;
+}
+
+function pauseAutomationForAccountingReconciliation(automationId: string) {
+  const current = getAutomationById(automationId);
+  if (!current || current.status === 'paused') return;
+  updateAutomation(automationId, { status: 'paused' }, runAutomation);
+}
+
+function buildAutomationStepCharges(stepExecutions: AutomationStepExecution[]) {
+  return stepExecutions.map((step) => ({
+    stepId: step.stepId,
+    title: step.title,
+    status: step.status,
+    actualCredits: step.actualCredits || 0,
+    charge: step.charge,
+    tokenUsage: step.tokenUsage,
+    generationCalls: step.generationCalls,
+  }));
+}
+
+function readAutomationGenerationCalls(stepExecutions: AutomationStepExecution[]) {
+  return stepExecutions
+    .flatMap((step) => step.generationCalls ?? [])
+    .filter((call) => call.status !== 'prepared');
+}
+
+function readAutomationToolAttempts(stepExecutions: AutomationStepExecution[]) {
+  return stepExecutions.flatMap((step) => step.toolAttempts ?? []);
+}
+
+function findUnreconciledExternalActionAttempts(stepExecutions: AutomationStepExecution[]) {
+  return stepExecutions.flatMap((step) => (step.toolAttempts ?? []).filter((attempt) =>
+    attempt.mutating
+    && (
+      attempt.status === 'outcome_unknown'
+      // A remote mutation returned successfully, then local artifact/audit
+      // closeout failed and the step was rewritten as failed. The successful
+      // remote result remains truthful, but the failed step must not make that
+      // write or send replayable.
+      || (attempt.status === 'succeeded' && step.status === 'failed')
+    )
+  ));
+}
+
 function inferAutomationStepTaskKind(kind: AutomationStepKind) {
   if (kind === 'search' || kind === 'capture') return 'research' as const;
   if (kind === 'query' || kind === 'analyze') return 'analysis' as const;
@@ -3980,18 +4331,24 @@ function attachAutomationStepCharge(step: AutomationStepExecution) {
     Number.isFinite(startedAt) && Number.isFinite(finishedAt) && finishedAt >= startedAt
       ? Math.max(0, finishedAt - startedAt)
       : undefined;
-  const toolCalls = step.toolCalls ?? ((step.kind === 'search' || step.kind === 'query' || step.kind === 'capture' || step.kind === 'deliver') ? 1 : 0);
+  const toolCalls = step.toolCalls ?? 0;
   const artifactCount = step.artifactCount ?? (step.artifactKind ? 1 : 0);
   const runtimeCharge = calculateRuntimeCredits({
     taskKind: inferAutomationStepTaskKind(step.kind),
     modelTier: step.modelTier || 'micro',
     toolCalls,
     artifactCount,
-    durationSeconds: durationMs ? Math.ceil(durationMs / 1000) : undefined,
+    // Cleanup after an abort can outlive the operation deadline. Bill only the
+    // bounded execution window that was authorized before the step started.
+    durationSeconds: durationMs
+      ? Math.min(Math.ceil(durationMs / 1000), AUTOMATION_STEP_BILLABLE_DURATION_SECONDS)
+      : undefined,
     complexity: inferAutomationStepComplexity(step),
     inputTokens: step.tokenUsage?.inputTokens,
     outputTokens: step.tokenUsage?.outputTokens,
     totalTokens: step.tokenUsage?.totalTokens,
+    generationCalls: step.generationCalls?.flatMap((call) =>
+      hasObservedGenerationUsage(call.usage) ? [{ modelTier: call.modelTier, usage: call.usage! }] : []),
   });
 
   step.durationMs = durationMs;
@@ -4011,6 +4368,115 @@ function attachAutomationStepCharge(step: AutomationStepExecution) {
   return step;
 }
 
+interface RuntimeCreditBudgetBlock {
+  code: typeof CREDIT_BUDGET_EXCEEDED_CODE;
+  budgetCredits: number;
+  projectedCredits: number;
+  remainingCredits: number;
+  operationCredits: number;
+  purpose: string;
+  summary: string;
+}
+
+class RuntimeCreditBudgetError extends Error {
+  block: RuntimeCreditBudgetBlock;
+
+  constructor(block: RuntimeCreditBudgetBlock) {
+    super(block.summary);
+    this.name = 'RuntimeCreditBudgetError';
+    this.block = block;
+  }
+}
+
+class RuntimeGenerationAccountingError extends Error {
+  constructor(callCount: number) {
+    super(buildGenerationAccountingReconciliationError(Math.max(1, callCount)));
+    this.name = 'RuntimeGenerationAccountingError';
+  }
+}
+
+class AutomationEvidenceOverflowError extends Error {
+  constructor(actualBytes: number) {
+    super(
+      `Automation evidence is too large to summarize safely (${actualBytes} bytes; ` +
+      `${AUTOMATION_EVIDENCE_BYTES_CEILING} maximum). The run stopped before dropping later evidence.`,
+    );
+    this.name = 'AutomationEvidenceOverflowError';
+  }
+}
+
+function isFatalAutomationGenerationError(error: unknown): boolean {
+  return error instanceof RuntimeCreditBudgetError
+    || error instanceof RuntimeGenerationAccountingError
+    || error instanceof AutomationEvidenceOverflowError;
+}
+
+export function projectedAuthorizedStepCredits(step: AutomationStepExecution): number {
+  const toolCalls = ['search', 'query', 'capture', 'deliver'].includes(step.kind) ? 1 : 0;
+  const artifactCount = step.kind === 'analyze'
+    ? 3
+    : step.kind === 'query'
+      ? 2
+      : 1;
+  const reportedUsageCharge = calculateRuntimeCredits({
+    taskKind: inferAutomationStepTaskKind(step.kind),
+    modelTier: step.modelTier || 'micro',
+    toolCalls,
+    artifactCount,
+    durationSeconds: AUTOMATION_STEP_BILLABLE_DURATION_SECONDS,
+    complexity: inferAutomationStepComplexity(step),
+    generationCalls: step.generationCalls?.flatMap((call) =>
+      hasReliableGenerationUsage(call.usage) ? [{ modelTier: call.modelTier, usage: call.usage! }] : []),
+  }).actualCredits;
+  // A failed or still-running attempt may have spent tokens without returning
+  // usage. Keep its full pre-request authorization committed for the rest of
+  // this run; a later retry may start only if both attempts still fit.
+  const unreportedAttemptAuthorizations = (step.generationCalls ?? [])
+    .filter((call) => !hasReliableGenerationUsage(call.usage))
+    .reduce((total, call) => total + Math.max(0, Math.trunc(call.authorizedTokenCredits ?? 0)), 0);
+  return reportedUsageCharge + unreportedAttemptAuthorizations;
+}
+
+function completedAutomationCredits(
+  stepExecutions: AutomationStepExecution[],
+  currentStep: AutomationStepExecution,
+): number {
+  return stepExecutions.reduce((total, step) => {
+    if (step === currentStep || step.status === 'skipped' || step.status === 'planned') return total;
+    const actualCredits = Math.max(0, Math.trunc(step.actualCredits ?? step.charge?.actualCredits ?? 0));
+    const hasUnreconciledAttempt = (step.generationCalls ?? [])
+      .some((call) => !hasReliableGenerationUsage(call.usage));
+    // A completed step's known minimum is not its maximum when the provider
+    // omitted part or all of usage. Keep that attempt's full authorization in
+    // the mission envelope so a later step cannot spend the same remainder.
+    return total + (hasUnreconciledAttempt
+      ? Math.max(actualCredits, projectedAuthorizedStepCredits(step))
+      : actualCredits);
+  }, 0);
+}
+
+function buildRuntimeCreditBudgetBlock(input: {
+  automationName: string;
+  budgetCredits: number;
+  projectedCredits: number;
+  operationCredits: number;
+  purpose: string;
+}): RuntimeCreditBudgetBlock {
+  const remainingCredits = Math.max(0, input.budgetCredits - (input.projectedCredits - input.operationCredits));
+  return {
+    code: CREDIT_BUDGET_EXCEEDED_CODE,
+    budgetCredits: input.budgetCredits,
+    projectedCredits: input.projectedCredits,
+    remainingCredits,
+    operationCredits: input.operationCredits,
+    purpose: input.purpose,
+    summary:
+      `${input.automationName} paused before ${input.purpose}: the next billable operation could require ` +
+      `${input.operationCredits} credits, but only ${remainingCredits} of the ` +
+      `${input.budgetCredits}-credit per-run budget remains. Raise the budget or trim the mission, then rerun.`,
+  };
+}
+
 function ensureAutomationSummaryStep(
   automation: { id: string },
   steps: AutomationStepDefinition[],
@@ -4019,6 +4485,11 @@ function ensureAutomationSummaryStep(
   const hasSummary = steps.some((step) => step.kind === 'summarize');
   if (!hasEvidence || hasSummary) return steps;
 
+  const firstRequiredConsumerIndex = steps.findIndex((step) => (
+    step.kind === 'deliver'
+    || (step.kind === 'query' && isAccountLibraryWriteRequest(step.inputs))
+  ));
+  const insertionIndex = firstRequiredConsumerIndex === -1 ? steps.length : firstRequiredConsumerIndex;
   const summaryStep: AutomationStepDefinition = {
     id: buildAutomationStepId(automation.id, steps.length),
     kind: 'summarize',
@@ -4029,18 +4500,13 @@ function ensureAutomationSummaryStep(
     estimatedCredits: estimateAutomationStepCredits('summarize', 'default', { complexity: 'medium' }),
     toolName: 'generate_text',
     inputs: { instruction: 'Generate a concise, decision-ready summary from the gathered evidence.' },
-    dependsOnStepIds: steps.map((step) => step.id),
+    dependsOnStepIds: steps.slice(0, insertionIndex).map((step) => step.id),
   };
 
-  const firstDeliveryIndex = steps.findIndex((step) => step.kind === 'deliver');
-  if (firstDeliveryIndex === -1) {
-    return [...steps, summaryStep] as AutomationStepDefinition[];
-  }
-
   return [
-    ...steps.slice(0, firstDeliveryIndex),
+    ...steps.slice(0, insertionIndex),
     summaryStep,
-    ...steps.slice(firstDeliveryIndex),
+    ...steps.slice(insertionIndex),
   ] as AutomationStepDefinition[];
 }
 
@@ -4071,6 +4537,38 @@ function ensureAutomationDeliveryStep(
   ] as AutomationStepDefinition[];
 }
 
+interface AutomationExecutableDefinition {
+  id: string;
+  name: string;
+  workspaceId?: string;
+  description?: string;
+  actions: string[];
+  steps?: PersistedAutomationStep[];
+  notify?: string;
+  condition?: string;
+}
+
+/**
+ * Canonical tool/action view shared by readiness, pricing, and execution.
+ * Inspecting raw persisted steps missed every requirement inferred from legacy
+ * actions and every injected delivery step, so manual routes could acknowledge
+ * work that the runtime was guaranteed to refuse only after spending.
+ */
+function buildAutomationExecutableSteps(
+  automation: AutomationExecutableDefinition,
+): AutomationStepDefinition[] {
+  const businessContext = getBusinessContext(automation.workspaceId ?? DEFAULT_WORKSPACE_ID);
+  const baseSteps = automation.steps?.length
+    ? automation.steps.map((step, index) =>
+        createAutomationStepDefinitionFromPersisted(automation, step, index, businessContext))
+    : automation.actions.map((action, index) => createAutomationStepDefinition(automation, action, index));
+  const canonicalSteps = canonicalizeAutomationPlanSteps(baseSteps);
+  return ensureAutomationDeliveryStep(
+    automation,
+    ensureAutomationSummaryStep(automation, canonicalSteps),
+  );
+}
+
 export function buildAutomationExecutionPlan(automation: {
   id: string;
   name: string;
@@ -4082,16 +4580,9 @@ export function buildAutomationExecutionPlan(automation: {
   studio_state?: AutomationStudioState;
   notify?: string;
   condition?: string;
+  reviewFeedback?: string;
 }): AutomationExecutionPlan {
-  // One context read per plan build; seed records with no workspaceId are
-  // internal and resolve to the default workspace, matching run-time tenancy.
-  const businessContext = getBusinessContext(automation.workspaceId ?? DEFAULT_WORKSPACE_ID);
-  const baseSteps = automation.steps?.length
-    ? automation.steps.map((step, index) =>
-        createAutomationStepDefinitionFromPersisted(automation, step, index, businessContext))
-    : automation.actions.map((action, index) => createAutomationStepDefinition(automation, action, index));
-  const canonicalSteps = canonicalizeAutomationPlanSteps(baseSteps);
-  const steps = ensureAutomationDeliveryStep(automation, ensureAutomationSummaryStep(automation, canonicalSteps));
+  const steps = buildAutomationExecutableSteps(automation);
   const baseRolePlan = deriveAutomationRolePlan(steps);
   const complexity = inferAutomationComplexityFromPlan(steps);
   const executionPolicy = normalizeAutomationExecutionPolicy(automation.execution_policy);
@@ -4114,7 +4605,51 @@ export function buildAutomationExecutionPlan(automation: {
     complexity,
     taskKind: 'automation',
   });
-
+  const generationProjections = buildAutomationGenerationProjections(
+    automation,
+    studioPlan.steps,
+    studioPlan.suggestedModelTier,
+  );
+  const runEstimate = estimateCreditCost({
+    taskKind: 'automation',
+    modelTier: studioPlan.suggestedModelTier,
+    automationRuns: 1,
+    toolCalls: estimatedToolCalls,
+    complexity,
+    generationProjections,
+  });
+  const executableStepCredits = studioPlan.steps.reduce(
+    (total, step) => total + Math.max(0, Math.trunc(step.estimatedCredits || 0)),
+    0,
+  );
+  const estimatedCredits = Math.max(
+    runEstimate.estimatedCredits,
+    executableStepCredits + runEstimate.breakdown.projectedTokenCredits,
+  );
+  const nonGenerationCredits = Math.max(
+    0,
+    estimatedCredits - runEstimate.breakdown.projectedTokenCredits,
+  );
+  const runtimeNonGenerationAuthorizationCredits = studioPlan.steps.reduce(
+    (total, step) => total + projectedAuthorizedStepCredits({
+      stepId: step.id,
+      kind: step.kind,
+      title: step.title,
+      assignedRole: step.assignedRole,
+      status: 'planned',
+      modelTier: step.modelTier || studioPlan.suggestedModelTier,
+      generationCalls: [],
+    }),
+    0,
+  );
+  const hardSingleAttemptGenerationCredits = generationProjections.reduce(
+    (total, call) => total + maximumGenerationCallTokenCredits(call).tokenCredits,
+    0,
+  );
+  const manualAuthorizationCredits = Math.max(
+    nonGenerationCredits,
+    runtimeNonGenerationAuthorizationCredits,
+  ) + hardSingleAttemptGenerationCredits;
   return {
     primaryRole: studioPlan.primaryRole,
     supportingRoles: studioPlan.supportingRoles,
@@ -4124,13 +4659,13 @@ export function buildAutomationExecutionPlan(automation: {
     suggestedModelTier: studioPlan.suggestedModelTier,
     complexity,
     estimatedToolCalls,
-    estimatedCredits: estimateCreditCost({
-      taskKind: 'automation',
-      modelTier: studioPlan.suggestedModelTier,
-      automationRuns: 1,
-      toolCalls: estimatedToolCalls,
-      complexity,
-    }).estimatedCredits,
+    estimatedCredits,
+    // This is only the initial lease. Immediately before every provider call
+    // the runtime prices the exact serialized envelope and atomically extends
+    // an unbudgeted hold; a budgeted run already holds the full user ceiling.
+    authorizationCredits: estimatedCredits,
+    manualAuthorizationCredits,
+    generationProjections,
     steps: studioPlan.steps,
     topology,
   };
@@ -4249,6 +4784,28 @@ function markUntrustedEvidencePayload(payload: unknown): unknown {
   return { ...payload, data: { ...data, entries } };
 }
 
+export const AUTOMATION_EXECUTION_NOTE_MAX_BYTES = 2_000;
+
+export function boundAutomationExecutionText(value: string) {
+  const redacted = sanitizeAutomationPromptText(value)
+    .replace(/\bBearer\s+[^\s,;]+/giu, 'Bearer [redacted]')
+    .replace(/\b(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9_-]+\b/gu, '[redacted credential]')
+    .replace(/\b(authorization|api[_-]?key|access[_-]?token)\s*[:=]\s*[^\s,;]+/giu, '$1=[redacted]')
+    .trim();
+  return truncateUtf8ToBytes(redacted, AUTOMATION_EXECUTION_NOTE_MAX_BYTES);
+}
+
+function normalizeAutomationExecutionDiagnostics(
+  stepExecution: AutomationStepExecution,
+  stepErrors: string[],
+) {
+  if (stepExecution.summary) stepExecution.summary = boundAutomationExecutionText(stepExecution.summary);
+  if (stepExecution.error) stepExecution.error = boundAutomationExecutionText(stepExecution.error);
+  for (let index = 0; index < stepErrors.length; index += 1) {
+    stepErrors[index] = boundAutomationExecutionText(stepErrors[index]);
+  }
+}
+
 export function buildAutomationEvidenceBlock(
   automation: { name: string; description?: string; condition?: string; actions: string[] },
   artifacts: AutomationExecutionArtifact[],
@@ -4256,22 +4813,30 @@ export function buildAutomationEvidenceBlock(
   stepErrors: string[],
 ) {
   const evidence = artifacts
-    .map((artifact) => `## ${artifact.title}\n${JSON.stringify(markUntrustedEvidencePayload(artifact.payload), null, 2)}`)
+    // Artifact bounds and plan projections are calculated from compact JSON.
+    // Pretty-print indentation grows quadratically with nesting depth and can
+    // turn an otherwise sub-8KB payload into the full 120KB evidence ceiling.
+    .map((artifact) => `## ${artifact.title}\n${JSON.stringify(markUntrustedEvidencePayload(artifact.payload))}`)
     .join('\n\n');
   const stepNotes = stepExecutions
     .filter((step) => step.summary)
-    .map((step) => `- ${step.assignedRole} · ${step.title}: ${step.summary}`)
+    .map((step) => `- ${step.assignedRole} · ${step.title}: ${boundAutomationExecutionText(step.summary || '')}`)
     .join('\n');
 
-  return [
+  const block = [
     `Automation: ${automation.name}`,
     automation.description ? `Description: ${automation.description}` : null,
     automation.condition ? `Condition: ${automation.condition}` : null,
     `Requested steps:\n- ${automation.actions.join('\n- ')}`,
     stepNotes ? `Execution notes:\n${stepNotes}` : null,
     evidence ? `Evidence:\n${evidence}` : null,
-    stepErrors.length > 0 ? `Execution errors:\n- ${stepErrors.join('\n- ')}` : null,
+    stepErrors.length > 0
+      ? `Execution errors:\n- ${stepErrors.map(boundAutomationExecutionText).join('\n- ')}`
+      : null,
   ].filter(Boolean).join('\n\n');
+  const blockBytes = Buffer.byteLength(block, 'utf8');
+  if (blockBytes <= AUTOMATION_EVIDENCE_BYTES_CEILING) return block;
+  throw new AutomationEvidenceOverflowError(blockBytes);
 }
 
 // The four prompts that read an evidence block and produce outward-facing
@@ -4294,7 +4859,7 @@ export const AUTOMATION_FALLBACK_SUMMARY_SYSTEM_PROMPT =
 // so the untrusted-source rule rides along like every other evidence-reading
 // prompt in this file.
 export const AUTOMATION_MEMO_SYSTEM_PROMPT =
-  `You condense a finished VIOLEMA brief into a short delivery memo of at most ${AUTOMATION_MEMO_WORD_LIMIT} words. Keep the sharpest facts, numbers, dates, and the "Next actions" — bullets over prose, no tables. Keep at most three inline markdown links drawn from the brief; never introduce a URL that is not in it. Output the memo only, with no meta commentary. ${UNTRUSTED_EVIDENCE_PROMPT_RULE}`;
+  `You condense a finished VIOLEMA brief into a short delivery memo of at most ${AUTOMATION_MEMO_BODY_WORD_LIMIT} words. Violema adds a fixed library link afterward so the final rendered delivery remains within ${AUTOMATION_MEMO_WORD_LIMIT} words. Keep the sharpest facts, numbers, dates, and the "Next actions" — bullets over prose, no tables. Keep at most three inline markdown links drawn from the brief; never introduce a URL that is not in it. Output the memo only, with no meta commentary. ${UNTRUSTED_EVIDENCE_PROMPT_RULE}`;
 
 // Nested inside the analyze step, triggered only when the step title/objective
 // matches /competitor|competitive|market/i. Its output is charted (pricing,
@@ -4302,6 +4867,309 @@ export const AUTOMATION_MEMO_SYSTEM_PROMPT =
 // the same evidence block as the three prompts above and needs the same rule.
 export const AUTOMATION_INTEL_EXTRACTION_SYSTEM_PROMPT =
   `You extract competitive intelligence as strict JSON. From the supplied evidence only, list up to 6 competitors as {"competitors":[{"name":string,"focus":string|null,"pricing_usd_month":number|null,"funding_musd":number|null}]}. Use null for anything the evidence does not state — never estimate or invent numbers. Output the JSON object only. ${UNTRUSTED_EVIDENCE_PROMPT_RULE}`;
+
+export const AUTOMATION_PROJECTED_ARTIFACT_BYTES = 8_000;
+export const AUTOMATION_EVIDENCE_BYTES_CEILING = 120_000;
+
+function truncateUtf8ToBytes(value: string, maxBytes: number) {
+  if (maxBytes <= 0) return '';
+  if (Buffer.byteLength(value, 'utf8') <= maxBytes) return value;
+  const bounded = Buffer.alloc(maxBytes);
+  const written = bounded.write(value, 0, maxBytes, 'utf8');
+  return bounded.toString('utf8', 0, written);
+}
+
+function readArtifactSourceLinks(payload: Record<string, unknown>) {
+  const results = Array.isArray(payload.results) ? payload.results : [];
+  return results.reduce<Array<{ title: string; url: string }>>((links, result) => {
+    if (links.length >= 4 || !isObjectRecord(result)) return links;
+    const url = typeof result.url === 'string' ? result.url.trim() : '';
+    if (!url.startsWith('https://') || Buffer.byteLength(url, 'utf8') > 1_024) return links;
+    const title = typeof result.title === 'string' && result.title.trim()
+      ? truncateUtf8ToBytes(result.title.trim(), 160)
+      : url;
+    links.push({ title, url });
+    return links;
+  }, []);
+}
+
+/**
+ * Bound provider/tool artifacts at the same byte boundary used by execution
+ * planning. The evidence fence protects the aggregate prompt, but it is too
+ * late for a truthful manual-run authorization: one escape-heavy payload can
+ * otherwise consume the entire 120 KB fence even though the plan priced that
+ * artifact at 8 KB.
+ *
+ * Oversized payloads become a valid, bounded preview rather than a sliced JSON
+ * fragment. Web-search source links are retained separately so delivery
+ * previews keep working even when a provider returns an enormous snippet.
+ */
+export function boundAutomationArtifactPayload(
+  payload: Record<string, unknown>,
+  maxBytes = AUTOMATION_PROJECTED_ARTIFACT_BYTES,
+): Record<string, unknown> {
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(payload);
+  } catch {
+    return { truncated: true, originalBytes: null, preview: '[Artifact could not be serialized.]' };
+  }
+  const originalBytes = Buffer.byteLength(serialized, 'utf8');
+  if (originalBytes <= maxBytes) return payload;
+
+  const sourceLinks = readArtifactSourceLinks(payload);
+  const base: Record<string, unknown> = {
+    truncated: true,
+    originalBytes,
+    ...(sourceLinks.length > 0 ? { source_links: sourceLinks } : {}),
+  };
+  const buildCandidate = (previewBytes: number) => ({
+    ...base,
+    preview: truncateUtf8ToBytes(serialized, previewBytes),
+  });
+
+  // JSON escaping can expand the preview (the exact hostile case this guard
+  // closes), so choose the largest preview whose serialized envelope fits.
+  let low = 0;
+  let high = Math.min(originalBytes, maxBytes);
+  let best = buildCandidate(0);
+  while (low <= high) {
+    const midpoint = Math.floor((low + high) / 2);
+    const candidate = buildCandidate(midpoint);
+    if (Buffer.byteLength(JSON.stringify(candidate), 'utf8') <= maxBytes) {
+      best = candidate;
+      low = midpoint + 1;
+    } else {
+      high = midpoint - 1;
+    }
+  }
+  return best;
+}
+
+function projectedPromptBytes(system: string, userBytes: number): number {
+  // Runtime authorizes `system + JSON.stringify(messages)`. Prompt text is
+  // control-sanitized before that boundary, so quotes, slashes, and line
+  // breaks can expand each content byte by at most 2x. Price that serialized
+  // envelope, including the exact empty-message framing, rather than the
+  // pre-JSON visible bytes.
+  const framingBytes = Buffer.byteLength(JSON.stringify([{ role: 'user', content: '' }]), 'utf8');
+  return Buffer.byteLength(system, 'utf8') + 1 + framingBytes + (Math.max(0, Math.trunc(userBytes)) * 2);
+}
+
+function projectedJsonPayloadBytes(rawBytes: number) {
+  // Artifact payloads are JSON-stringified once while building the evidence
+  // block. An arbitrary C0 control byte may become `\u0000` (6 bytes).
+  return Math.max(0, Math.trunc(rawBytes)) * 6;
+}
+
+function projectedTypicalJsonPayloadBytes(rawBytes: number) {
+  // Forecast normal text/JSON rather than charging every future byte as an
+  // escaped C0 control. The separate hard projection above still authorizes
+  // hostile-but-valid payloads at the exact runtime boundary.
+  return Math.max(0, Math.trunc(rawBytes)) * 2;
+}
+
+function sanitizeAutomationPromptText(text: string) {
+  // Keep normal layout controls; replace C0 bytes whose JSON representation
+  // can expand beyond the 2x projection above. This also prevents invisible
+  // binary-ish Drive content from reaching a provider prompt verbatim.
+  return text.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/gu, ' ');
+}
+
+/**
+ * Model-producing branches derived from the FINAL executable plan. Evidence
+ * bodies do not exist yet, so preflight uses their bounded runtime envelopes;
+ * each call still carries its own tier, prompt-size projection, and exact
+ * configured output allowance. The runtime budget guard replaces these
+ * planning assumptions with the actual serialized prompt bytes before spend.
+ */
+export function buildAutomationGenerationProjections(
+  automation: { name: string; description?: string; condition?: string; actions: string[]; reviewFeedback?: string },
+  steps: AutomationStepDefinition[],
+  suggestedModelTier: ModelTier,
+): AutomationGenerationProjection[] {
+  const projections: AutomationGenerationProjection[] = [];
+  const automationBytes = Buffer.byteLength([
+    automation.name,
+    automation.description || '',
+    automation.condition || '',
+    ...automation.actions,
+  ].join('\n'), 'utf8');
+  const reviewFeedbackBytes = Buffer.byteLength(automation.reviewFeedback || '', 'utf8');
+  let evidenceBytes = Math.min(
+    AUTOMATION_EVIDENCE_BYTES_CEILING,
+    automationBytes + 512,
+  );
+  let estimatedEvidenceBytes = evidenceBytes;
+  let libraryWritten = false;
+  let estimatedSummaryBytes = AUTOMATION_SUMMARY_MAX_BYTES;
+
+  const addEvidence = (bytes: number, estimatedBytes = bytes) => {
+    evidenceBytes = Math.min(
+      AUTOMATION_EVIDENCE_BYTES_CEILING,
+      evidenceBytes + projectedJsonPayloadBytes(bytes) + 128,
+    );
+    estimatedEvidenceBytes = Math.min(
+      AUTOMATION_EVIDENCE_BYTES_CEILING,
+      estimatedEvidenceBytes + projectedTypicalJsonPayloadBytes(estimatedBytes) + 128,
+    );
+  };
+  const add = (
+    step: AutomationStepDefinition,
+    purpose: string,
+    modelTier: ModelTier,
+    system: string,
+    userBytes: number,
+    maxOutputTokens: number,
+    estimatedUserBytes = userBytes,
+    estimatedMaxOutputTokens = maxOutputTokens,
+    includeInEstimate = true,
+  ) => {
+    projections.push({
+      stepId: step.id,
+      purpose,
+      modelTier,
+      promptBytes: projectedPromptBytes(system, userBytes),
+      maxOutputTokens,
+      estimatedPromptBytes: projectedPromptBytes(system, estimatedUserBytes),
+      estimatedMaxOutputTokens,
+      includeInEstimate,
+    });
+  };
+
+  for (const step of steps) {
+    const modelTier = step.modelTier || suggestedModelTier;
+    const stepBytes = Buffer.byteLength(`${step.title}\n${step.objective}`, 'utf8');
+
+    if (step.kind === 'search' || step.kind === 'capture') {
+      addEvidence(AUTOMATION_PROJECTED_ARTIFACT_BYTES);
+      continue;
+    }
+
+    if (step.kind === 'query') {
+      if (isAccountLibraryWriteRequest(step.inputs)) {
+        const baselineSection = readAccountLibrarySection(step.inputs);
+        const baselineSystem = buildLibraryBaselineSystemPrompt(
+          baselineSection,
+          UNTRUSTED_EVIDENCE_PROMPT_RULE,
+        );
+        add(
+          step,
+          'library_baseline',
+          'ops',
+          baselineSystem,
+          projectLibraryBaselineUserContentBytes({
+            historicalContentBytes: MAX_RECOVERABLE_APP_HISTORY_BYTES,
+            currentFindingsBytes: AUTOMATION_SUMMARY_MAX_BYTES,
+            sourceCount: LIBRARY_BASELINE_MAX_PROMPT_SOURCE_COUNT,
+          }),
+          LIBRARY_BASELINE_MAX_TOKENS,
+          projectLibraryBaselineUserContentBytes({
+            historicalContentBytes: MAX_TOTAL_CONTENT_BYTES,
+            currentFindingsBytes: estimatedSummaryBytes,
+            sourceCount: LIBRARY_BASELINE_LOOKBACK_LIMIT + 2,
+          }),
+        );
+        libraryWritten = true;
+      } else {
+        const source = typeof step.inputs?.source === 'string'
+          ? step.inputs.source.trim().toLowerCase()
+          : '';
+        addEvidence(source === 'account_library'
+          ? MAX_RECOVERABLE_APP_HISTORY_BYTES
+          : AUTOMATION_PROJECTED_ARTIFACT_BYTES);
+      }
+      continue;
+    }
+
+    if (step.kind === 'note') {
+      // Notes are artifacts too: their title, JSON payload, and execution
+      // line all enter every later summary/fallback evidence block. Omitting
+      // them let a valid 23-note plan authorize ~47 KB while runtime handed
+      // the provider ~230 KB of serialized prompt.
+      addEvidence(stepBytes);
+      continue;
+    }
+
+    if (step.kind === 'analyze') {
+      add(
+        step,
+        'analysis',
+        modelTier,
+        AUTOMATION_ANALYZE_SYSTEM_PROMPT,
+        stepBytes + reviewFeedbackBytes + evidenceBytes + 128,
+        500,
+        stepBytes + reviewFeedbackBytes + estimatedEvidenceBytes + 128,
+      );
+      addEvidence(AUTOMATION_ANALYSIS_MAX_BYTES, 500 * 2);
+      if (/competitor|competitive|market/i.test(`${step.title} ${step.objective}`)) {
+        add(
+          step,
+          'competitive_extraction',
+          'hard',
+          AUTOMATION_INTEL_EXTRACTION_SYSTEM_PROMPT,
+          evidenceBytes,
+          700,
+          estimatedEvidenceBytes,
+        );
+        addEvidence(AUTOMATION_EXTRACTION_MAX_BYTES, 700 * 2);
+      }
+      continue;
+    }
+
+    if (step.kind === 'summarize') {
+      const summaryEvidenceBytes = stepBytes + reviewFeedbackBytes + evidenceBytes + 128;
+      const estimatedSummaryEvidenceBytes = stepBytes + reviewFeedbackBytes + estimatedEvidenceBytes + 128;
+      const maxOutputTokens = automationSummaryTokenBudget(summaryEvidenceBytes);
+      const estimatedMaxOutputTokens = automationSummaryTokenBudget(estimatedSummaryEvidenceBytes);
+      add(
+        step,
+        'summary',
+        modelTier,
+        AUTOMATION_SUMMARIZE_SYSTEM_PROMPT,
+        summaryEvidenceBytes,
+        maxOutputTokens,
+        estimatedSummaryEvidenceBytes,
+        estimatedMaxOutputTokens,
+      );
+      estimatedSummaryBytes = Math.min(AUTOMATION_SUMMARY_MAX_BYTES, estimatedMaxOutputTokens * 2);
+      addEvidence(AUTOMATION_SUMMARY_MAX_BYTES, estimatedSummaryBytes);
+      continue;
+    }
+
+    if (step.kind === 'deliver' && libraryWritten) {
+      add(
+        step,
+        'delivery_memo',
+        'ops',
+        AUTOMATION_MEMO_SYSTEM_PROMPT,
+        AUTOMATION_SUMMARY_MAX_BYTES,
+        AUTOMATION_MEMO_MAX_TOKENS,
+        estimatedSummaryBytes,
+      );
+    }
+  }
+
+  // Any executed step can fail after producing evidence, which invokes the
+  // fallback-summary generation. Reserve it prospectively so a rejected
+  // planned summary cannot turn one approved call into an unpriced second.
+  const fallbackOwner = steps[steps.length - 1];
+  if (fallbackOwner) {
+    add(
+      fallbackOwner,
+      'fallback_summary',
+      suggestedModelTier,
+      AUTOMATION_FALLBACK_SUMMARY_SYSTEM_PROMPT,
+      evidenceBytes,
+      600,
+      estimatedEvidenceBytes,
+      600,
+      false,
+    );
+  }
+
+  return projections;
+}
 
 function buildAutomationDeliveryFallbackBody(
   automation: { name: string; description?: string; condition?: string; actions: string[] },
@@ -4331,7 +5199,7 @@ function buildAutomationDeliveryFallbackBody(
   ].filter(Boolean).join('\n');
 }
 
-function buildDeterministicAutomationSummary(
+export function buildDeterministicAutomationSummary(
   automation: { name: string; description?: string; condition?: string; actions: string[] },
   artifacts: AutomationExecutionArtifact[],
   stepExecutions: AutomationStepExecution[],
@@ -4352,42 +5220,59 @@ function buildDeterministicAutomationSummary(
       return `- ${step.status.toUpperCase()} · ${step.title}${detail ? `: ${detail}` : ''}`;
     });
 
-  return [
+  return buildBoundedAutomationSummaryFallback([
     `# ${automation.name}`,
     automation.description ? automation.description : null,
     `Run produced ${artifacts.length} artifact${artifacts.length === 1 ? '' : 's'} across ${stepExecutions.length} step${stepExecutions.length === 1 ? '' : 's'}. ${completed} succeeded, ${failed} failed, ${skipped} skipped.`,
     latestMarkdown ? `## Latest Generated Output\n${latestMarkdown}` : null,
     stepLines.length > 0 ? `## Step Results\n${stepLines.join('\n')}` : null,
     stepErrors.length > 0 ? `## Needs Attention\n${stepErrors.map((error) => `- ${error}`).join('\n')}` : null,
-  ].filter(Boolean).join('\n\n');
+  ].filter(Boolean).join('\n\n'));
 }
 
 async function ensureAutomationSummaryText(
   automation: { name: string; description?: string; condition?: string; actions: string[] },
   plan: AutomationExecutionPlan,
-  workspaceId: string,
   artifacts: AutomationExecutionArtifact[],
   stepExecutions: AutomationStepExecution[],
   stepErrors: string[],
+  stepExecution: AutomationStepExecution,
+  runGeneration: (input: {
+    label: string;
+    stepExecution: AutomationStepExecution;
+    purpose: string;
+    modelTier: ModelTier;
+    system: string;
+    messages: Parameters<typeof generateTextDetailed>[2];
+    maxOutputTokens: number;
+  }) => Promise<{
+    result: Awaited<ReturnType<typeof generateTextDetailed>>;
+    event: AutomationGenerationCall;
+  }>,
 ) {
   if (artifacts.length === 0 && stepErrors.length === 0) return '';
 
   try {
-    const fallbackSummaryResult = await runAutomationStepWithTimeout(
-      `Fallback summary for "${automation.name}"`,
-      generateTextDetailed(
-        plan.suggestedModelTier,
-        AUTOMATION_FALLBACK_SUMMARY_SYSTEM_PROMPT,
-        [{ role: 'user', content: buildAutomationEvidenceBlock(automation, artifacts, stepExecutions, stepErrors) }],
-        600,
-        workspaceId,
-      ),
-    );
-
-    return requireCompleteAutomationSummary(fallbackSummaryResult);
+    const fallbackCall = await runGeneration({
+      label: `Fallback summary for "${automation.name}"`,
+      stepExecution,
+      purpose: 'fallback_summary',
+      modelTier: plan.suggestedModelTier,
+      system: AUTOMATION_FALLBACK_SUMMARY_SYSTEM_PROMPT,
+      messages: [{ role: 'user', content: buildAutomationEvidenceBlock(automation, artifacts, stepExecutions, stepErrors) }],
+      maxOutputTokens: 600,
+    });
+    try {
+      return requireCompleteAutomationSummary(fallbackCall.result);
+    } catch (error) {
+      fallbackCall.event.status = 'rejected';
+      fallbackCall.event.error = error instanceof Error ? error.message : 'Rejected fallback summary';
+      throw error;
+    }
   } catch (error) {
+    if (isFatalAutomationGenerationError(error)) throw error;
     const summaryError = error instanceof Error ? error.message : 'Unknown summary generation error';
-    stepErrors.push(`Fallback summary: ${summaryError}`);
+    stepErrors.push(boundAutomationExecutionText(`Fallback summary: ${summaryError}`));
     return buildDeterministicAutomationSummary(automation, artifacts, stepExecutions, stepErrors);
   }
 }
@@ -4396,22 +5281,42 @@ async function ensureAutomationSummaryText(
 // steps so the next draft actually addresses it — with an honesty guard, since
 // briefs must stay evidence-only.
 function buildReviewFeedbackBlock(feedback?: string) {
-  const trimmed = feedback?.trim();
+  const trimmed = feedback?.trim().slice(0, MAX_AUTOMATION_REVIEW_FEEDBACK_CHARS);
   if (!trimmed) return '';
   return `\n\nREVIEWER FEEDBACK on the previous run — address it explicitly in this output: "${trimmed}". If the gathered evidence does not cover something the reviewer asked for, name that gap plainly in the output — never invent facts to satisfy the request.`;
 }
 
-async function runAutomationStepWithTimeout<T>(label: string, operation: Promise<T>) {
+async function runAutomationStepWithTimeout<T>(
+  label: string,
+  operation: Promise<T> | ((signal: AbortSignal) => Promise<T>),
+  parentSignal?: AbortSignal,
+) {
+  // An already-started Promise cannot be cancelled by a controller created
+  // here. Racing it used to let the run settle while that operation (including
+  // a nested model call) kept spending. Those operations own their own bounded
+  // I/O; await them so closeout never overtakes a late side effect or charge.
+  if (typeof operation !== 'function') return operation;
+
+  const controller = new AbortController();
+  const signal = parentSignal
+    ? AbortSignal.any([controller.signal, parentSignal])
+    : controller.signal;
   let timeoutId: NodeJS.Timeout | undefined;
+  let timeoutError: Error | null = null;
   try {
-    return await Promise.race([
-      operation,
-      new Promise<T>((_, reject) => {
-        timeoutId = setTimeout(() => {
-          reject(new Error(`${label} timed out after ${Math.round(AUTOMATION_STEP_TIMEOUT_MS / 1000)}s.`));
-        }, AUTOMATION_STEP_TIMEOUT_MS);
-      }),
-    ]);
+    const operationPromise = Promise.resolve().then(() => operation(signal));
+    timeoutId = setTimeout(() => {
+      timeoutError = new Error(`${label} timed out after ${Math.round(AUTOMATION_STEP_TIMEOUT_MS / 1000)}s.`);
+      controller.abort(timeoutError);
+    }, AUTOMATION_STEP_TIMEOUT_MS);
+    try {
+      const result = await operationPromise;
+      if (timeoutError) throw timeoutError;
+      return result;
+    } catch (error) {
+      if (timeoutError) throw timeoutError;
+      throw error;
+    }
   } finally {
     if (timeoutId) clearTimeout(timeoutId);
   }
@@ -4438,6 +5343,11 @@ async function executeAutomationCore(
     workflowId: string;
     taskId: string;
     taskRunId: string;
+    creditBudgetCredits: number | null;
+    renewCreditAuthorization?: () => void;
+    extendCreditAuthorization?: (requiredCredits: number) => number;
+    generationMaxAttemptsPerRoute?: number;
+    generationMaxRoutes?: number;
   },
   onProgress?: (state: {
     artifacts: AutomationExecutionArtifact[];
@@ -4451,6 +5361,7 @@ async function executeAutomationCore(
 ) {
   const artifacts: AutomationExecutionArtifact[] = [];
   const stepExecutions: AutomationStepExecution[] = [];
+  const generationCalls: AutomationGenerationCall[] = [];
   const stepErrors: string[] = [];
   const pendingApprovalRequestedEvents: PendingApprovalRequestedLedgerEvent[] = [];
   let summaryText = '';
@@ -4460,6 +5371,36 @@ async function executeAutomationCore(
   let libraryDocLink: string | null = null;
   let delivery: Record<string, unknown> | null = null;
   let deliveryError: string | null = null;
+  let creditBudgetBlock: RuntimeCreditBudgetBlock | null = null;
+
+  const assertRuntimeBudget = (
+    stepExecution: AutomationStepExecution,
+    purpose: string,
+    operationCredits = 0,
+  ) => {
+    let budgetCredits = runContext.creditBudgetCredits;
+    if (budgetCredits === null) return;
+    const alreadyCommittedCredits =
+      completedAutomationCredits(stepExecutions, stepExecution) +
+      projectedAuthorizedStepCredits(stepExecution);
+    const projectedCredits = alreadyCommittedCredits + operationCredits;
+    if (projectedCredits <= budgetCredits) return;
+    if (runContext.extendCreditAuthorization) {
+      budgetCredits = runContext.extendCreditAuthorization(projectedCredits);
+      runContext.creditBudgetCredits = budgetCredits;
+      if (projectedCredits <= budgetCredits) return;
+    }
+
+    const block = buildRuntimeCreditBudgetBlock({
+      automationName: automation.name,
+      budgetCredits,
+      projectedCredits,
+      operationCredits,
+      purpose,
+    });
+    creditBudgetBlock = block;
+    throw new RuntimeCreditBudgetError(block);
+  };
 
   const emitProgress = async () => {
     if (!onProgress) return;
@@ -4475,7 +5416,295 @@ async function executeAutomationCore(
     });
   };
 
+  const runToolOperation = async <T>(input: {
+    stepExecution: AutomationStepExecution;
+    operation: string;
+    mutating: boolean;
+    /**
+     * Mutating transports use this when they can prove the exact request
+     * boundary. A rejection before the callback is local and retryable; once
+     * called, a thrown result may be a lost response or partial mutation.
+     */
+    tracksExternalBoundary?: boolean;
+    execute: (onExternalRequestStart: () => Promise<void>) => Promise<T>;
+  }): Promise<T> => {
+    const attempt: AutomationToolAttempt = {
+      id: `${runContext.taskRunId}:tool:${input.stepExecution.stepId}:${(input.stepExecution.toolAttempts?.length ?? 0) + 1}`,
+      operation: input.operation,
+      mutating: input.mutating,
+      status: input.mutating && input.tracksExternalBoundary ? 'prepared' : 'started',
+      startedAt: new Date().toISOString(),
+    };
+    input.stepExecution.toolCalls = (input.stepExecution.toolCalls ?? 0) + 1;
+    input.stepExecution.toolAttempts = [
+      ...(input.stepExecution.toolAttempts ?? []),
+      attempt,
+    ];
+    // The authorization journal reaches durable run progress before the
+    // external boundary. Boundary-aware mutations remain `prepared` here;
+    // the awaited sender callback durably promotes them immediately before
+    // the provider request begins.
+    try {
+      await emitProgress();
+    } catch (error) {
+      // The journal itself is before the external boundary. If it rejects,
+      // the callback provably never ran: remove the authorization intent so
+      // normal recovery cannot certify a phantom tool call or mutation.
+      input.stepExecution.toolAttempts = (input.stepExecution.toolAttempts ?? [])
+        .filter((candidate) => candidate.id !== attempt.id);
+      input.stepExecution.toolCalls = Math.max(0, (input.stepExecution.toolCalls ?? 1) - 1);
+      throw error;
+    }
+
+    let externalRequestStarted = !input.tracksExternalBoundary;
+    const onExternalRequestStart = async () => {
+      if (externalRequestStarted) return;
+      attempt.status = 'started';
+      try {
+        await emitProgress();
+        externalRequestStarted = true;
+      } catch (error) {
+        // The sender awaits this hook before the physical request. Keep the
+        // durable state truthful when its transition cannot be persisted.
+        attempt.status = 'prepared';
+        throw error;
+      }
+    };
+
+    let result: T;
+    try {
+      result = await input.execute(onExternalRequestStart);
+    } catch (error) {
+      if (input.mutating && input.tracksExternalBoundary && !externalRequestStarted) {
+        // The sender proved that no provider request began. Remove the durable
+        // authorization intent and its tool count so a deterministic routing,
+        // suppression, or configuration refusal is neither billed nor
+        // quarantined as a possibly completed send.
+        input.stepExecution.toolAttempts = (input.stepExecution.toolAttempts ?? [])
+          .filter((candidate) => candidate.id !== attempt.id);
+        input.stepExecution.toolCalls = Math.max(0, (input.stepExecution.toolCalls ?? 1) - 1);
+        await emitProgress();
+        throw error;
+      }
+      // A mutating API rejection is not proof that nothing happened. Slack can
+      // accept an earlier chunk before a later chunk fails, and any provider
+      // can lose the response after accepting the write. Quarantine that
+      // ambiguity; read-only failures remain ordinary failed attempts.
+      attempt.status = input.mutating ? 'outcome_unknown' : 'failed';
+      attempt.finishedAt = new Date().toISOString();
+      attempt.error = boundAutomationExecutionText(
+        error instanceof Error ? error.message : 'Unknown external operation error',
+      );
+      await emitProgress();
+      throw error;
+    }
+
+    attempt.status = 'succeeded';
+    attempt.finishedAt = new Date().toISOString();
+    // Persist the remote outcome before artifact shaping, ledger append, or
+    // any other local closeout that can still fail after the call returns.
+    await emitProgress();
+    return result;
+  };
+
+  const runGeneration = async (input: {
+    label: string;
+    stepExecution: AutomationStepExecution;
+    purpose: string;
+    modelTier: ModelTier;
+    system: string;
+    messages: Parameters<typeof generateTextDetailed>[2];
+    maxOutputTokens: number;
+    parentSignal?: AbortSignal;
+  }) => {
+    const system = sanitizeAutomationPromptText(input.system);
+    const messages = input.messages.map((message) =>
+      typeof message.content === 'string'
+        ? { ...message, content: sanitizeAutomationPromptText(message.content) }
+        : message
+    ) as Parameters<typeof generateTextDetailed>[2];
+    const promptBytes = Buffer.byteLength(`${system}\n${JSON.stringify(messages)}`, 'utf8');
+    const maximumCall = maximumGenerationCallTokenCredits({
+      modelTier: input.modelTier,
+      promptBytes,
+      maxOutputTokens: input.maxOutputTokens,
+    });
+    // This is the authorization boundary, immediately before provider spend.
+    // It also protects injected/test generators that do not implement the
+    // physical-attempt hooks. Production requests cross the same guard again
+    // inside `beforeAttempt`, where prior retry reservations are visible.
+    assertRuntimeBudget(input.stepExecution, input.purpose, maximumCall.tokenCredits);
+
+    const attemptEvents = new Map<string, AutomationGenerationCall>();
+    let succeededEvent: AutomationGenerationCall | null = null;
+    const appendEvent = (attempt?: TextGenerationAttempt) => {
+      const event: AutomationGenerationCall = {
+        id: `${runContext.taskRunId}:generation:${generationCalls.length + 1}`,
+        stepId: input.stepExecution.stepId,
+        purpose: input.purpose,
+        modelTier: input.modelTier,
+        ...(attempt
+          ? {
+              routeIndex: attempt.routeIndex,
+              attemptNumber: attempt.attemptNumber,
+              provider: attempt.provider,
+              model: attempt.model,
+              ...(attempt.baseUrl ? { baseUrl: attempt.baseUrl } : {}),
+            }
+          : { attemptNumber: 1 }),
+        authorizedTokenCredits: maximumCall.tokenCredits,
+        status: 'prepared',
+        maxOutputTokens: input.maxOutputTokens,
+        promptBytes,
+      };
+      generationCalls.push(event);
+      input.stepExecution.generationCalls = [
+        ...(input.stepExecution.generationCalls ?? []),
+        event,
+      ];
+      if (attempt) attemptEvents.set(`${attempt.routeIndex}:${attempt.attemptNumber}`, event);
+      return event;
+    };
+
+    const eventFor = (attempt: TextGenerationAttempt) =>
+      attemptEvents.get(`${attempt.routeIndex}:${attempt.attemptNumber}`);
+    const discardEvent = (attempt: TextGenerationAttempt, event: AutomationGenerationCall) => {
+      const runIndex = generationCalls.findIndex((candidate) => candidate.id === event.id);
+      if (runIndex >= 0) generationCalls.splice(runIndex, 1);
+      input.stepExecution.generationCalls = (input.stepExecution.generationCalls ?? [])
+        .filter((candidate) => candidate.id !== event.id);
+      attemptEvents.delete(`${attempt.routeIndex}:${attempt.attemptNumber}`);
+      if (succeededEvent?.id === event.id) succeededEvent = null;
+    };
+
+    try {
+      const result = await runAutomationStepWithTimeout(
+        input.label,
+        (signal) => generateTextDetailed(
+            input.modelTier,
+            system,
+            messages,
+            input.maxOutputTokens,
+            workspaceId,
+            {
+              signal,
+              maxAttemptsPerRoute:
+                runContext.generationMaxAttemptsPerRoute ?? AUTOMATION_GENERATION_ATTEMPTS_PER_ROUTE,
+              maxRoutes: runContext.generationMaxRoutes ?? AUTOMATION_GENERATION_ROUTE_LIMIT,
+              beforeAttempt: async (attempt) => {
+                runContext.renewCreditAuthorization?.();
+                assertRuntimeBudget(input.stepExecution, input.purpose, maximumCall.tokenCredits);
+                const event = appendEvent(attempt);
+                // Journal authorization separately from the physical request.
+                // A process death here proves no provider request began, so
+                // boot recovery can close the hold without inventing spend.
+                try {
+                  await emitProgress();
+                } catch (error) {
+                  discardEvent(attempt, event);
+                  throw error;
+                }
+              },
+              onAttemptStart: async (attempt) => {
+                const event = eventFor(attempt);
+                if (!event) throw new Error('Generation request began without an accounting event.');
+                event.status = 'running';
+                try {
+                  // The provider transport awaits this durable transition
+                  // immediately before fetch/SDK invocation.
+                  await emitProgress();
+                } catch (error) {
+                  event.status = 'prepared';
+                  throw error;
+                }
+              },
+              onAttemptNotStarted: async (attempt) => {
+                const event = eventFor(attempt);
+                if (!event) return;
+                // The signal fired after authorization was journaled but
+                // before withModelRetry invoked the provider callback.
+                discardEvent(attempt, event);
+                await emitProgress();
+              },
+              onAttemptSuccess: async (attempt, attemptResult) => {
+                const event = eventFor(attempt);
+                if (!event) throw new Error('Generation attempt completed without an accounting event.');
+                event.usage = attemptResult.usage;
+                event.status = 'succeeded';
+                succeededEvent = event;
+                attachAutomationStepCharge(input.stepExecution);
+                await emitProgress();
+              },
+              onAttemptFailure: async (
+                attempt,
+                attemptError,
+                usage?: TextGenerationUsage,
+              ) => {
+                const event = eventFor(attempt);
+                if (!event) throw new Error('Generation attempt failed without an accounting event.');
+                event.usage = usage;
+                event.status = 'failed';
+                event.error = attemptError instanceof Error
+                  ? attemptError.message
+                  : 'Unknown generation error';
+                attachAutomationStepCharge(input.stepExecution);
+                await emitProgress();
+              },
+            },
+          ),
+        input.parentSignal,
+      );
+
+      // Test seams and legacy injected generators may not invoke attempt
+      // hooks. The pre-call guard above still authorized them; synthesize the
+      // one physical event so their usage remains visible and billable.
+      if (attemptEvents.size === 0) {
+        const event = appendEvent();
+        event.usage = result.usage;
+        event.status = 'succeeded';
+        succeededEvent = event;
+      }
+      const event = succeededEvent;
+      if (!event) throw new Error('Generation completed without a successful accounting event.');
+      const unresolvedAttemptCount = (input.stepExecution.generationCalls ?? [])
+        .filter((call) => !hasReliableGenerationUsage(call.usage)).length;
+      if (unresolvedAttemptCount > 0) {
+        // Do not let a known minimum masquerade as freed mission budget. The
+        // provider call may have returned useful text, but without complete
+        // usage no later physical call can be authorized truthfully.
+        throw new RuntimeGenerationAccountingError(unresolvedAttemptCount);
+      }
+      return { result, event };
+    } catch (error) {
+      if (attemptEvents.size > 0) {
+        for (const [key, event] of [...attemptEvents.entries()]) {
+          if (event.status === 'prepared') {
+            const runIndex = generationCalls.findIndex((candidate) => candidate.id === event.id);
+            if (runIndex >= 0) generationCalls.splice(runIndex, 1);
+            input.stepExecution.generationCalls = (input.stepExecution.generationCalls ?? [])
+              .filter((candidate) => candidate.id !== event.id);
+            attemptEvents.delete(key);
+            continue;
+          }
+          if (event.status !== 'running') continue;
+          event.status = 'failed';
+          event.error = error instanceof Error ? error.message : 'Unknown generation error';
+        }
+      }
+      throw error;
+    }
+  };
+
   for (const step of plan.steps) {
+    // `continue` inside a step still runs its `finally`, then lands here. Gate
+    // before creating the next execution record so a failed critical source (or
+    // explicitly non-continuable query) cannot feed downstream generation or a
+    // real external delivery.
+    if (
+      creditBudgetBlock
+      || findUnreconciledGenerationCalls(stepExecutions).length > 0
+      || hasBlockingAutomationStepFailure(stepExecutions)
+    ) break;
     const stepModelSource = getModelSource(step.modelTier || plan.suggestedModelTier, workspaceId);
     const stepExecution: AutomationStepExecution = {
       stepId: step.id,
@@ -4491,6 +5720,8 @@ async function executeAutomationCore(
       // Fail closed: a plan step that arrived without a severity is critical,
       // so an unclassified failure blocks exactly as it does today.
       stepSeverity: step.stepSeverity ?? 'critical',
+      toolCalls: 0,
+      artifactCount: 0,
       status: 'running',
       startedAt: new Date().toISOString(),
     };
@@ -4499,6 +5730,8 @@ async function executeAutomationCore(
     await emitProgress();
 
     try {
+      runContext.renewCreditAuthorization?.();
+      assertRuntimeBudget(stepExecution, `step "${step.title}"`);
       if (step.kind === 'search') {
         const query = typeof step.inputs?.query === 'string'
           ? step.inputs.query
@@ -4506,16 +5739,25 @@ async function executeAutomationCore(
         const searchQuery = automation.reviewFeedback?.trim()
           ? `${query}. Also cover: ${automation.reviewFeedback.trim()}`
           : query;
-        const payload = await runAutomationStepWithTimeout(`Search step "${step.title}"`, searchWeb(searchQuery, 6));
+        const payload = await runToolOperation({
+          stepExecution,
+          operation: 'web_search',
+          mutating: false,
+          execute: () => runAutomationStepWithTimeout(
+            `Search step "${step.title}"`,
+            (signal) => searchWeb(searchQuery, 6, signal),
+          ),
+        });
+        const artifactPayload = boundAutomationArtifactPayload(payload);
         artifacts.push({
           kind: 'web_search',
           title: step.title,
-          payload,
+          payload: artifactPayload,
           origin: liveOrigin('web_search', new Date().toISOString()),
         });
         stepExecution.dataOrigin = 'live';
         stepExecution.status = 'succeeded';
-        stepExecution.summary = `Gathered current web evidence for "${query}".`;
+        stepExecution.summary = 'Gathered current web evidence for the configured search query.';
         stepExecution.output = { query, resultCount: Array.isArray((payload as { results?: unknown[] }).results) ? ((payload as { results?: unknown[] }).results?.length || 0) : undefined };
         stepExecution.artifactKind = 'web_search';
         stepExecution.toolCalls = 1;
@@ -4533,18 +5775,72 @@ async function executeAutomationCore(
       if (step.kind === 'query' && isAccountLibraryWriteRequest(step.inputs)) {
         const section = readAccountLibrarySection(step.inputs);
         const entryTitle = readAccountLibraryEntryTitle(step.inputs);
-        const libraryResult = await runAutomationStepWithTimeout(
-          `Library step "${step.title}"`,
-          appendLibraryEntry(workspaceId, section, {
-            title: entryTitle,
-            // The drafted memo is the finding. If drafting produced nothing,
-            // `appendLibraryEntry` fails closed rather than recording an empty
-            // entry that would poison every later run's delta context.
-            markdown: summaryText,
-          }),
-        );
+        const libraryTransaction = await runToolOperation({
+          stepExecution,
+          operation: 'account_library_append',
+          mutating: true,
+          execute: () => runAutomationStepWithTimeout(
+            `Library step "${step.title}"`,
+            (signal) => appendLibraryEntryWithBaseline({
+            workspaceId,
+            section,
+            runId: runContext.taskRunId,
+            latestFindingsMarkdown: summaryText,
+            untrustedRule: UNTRUSTED_EVIDENCE_PROMPT_RULE,
+            neutralize: neutralizeUntrustedDelimiters,
+            entry: {
+              title: entryTitle,
+              // Every completed task run is a distinct evidence version. The
+              // stable run id keeps retries inside this run idempotent without
+              // collapsing a second same-day manual/scheduled run onto the
+              // first run's file and stale baseline.
+              versionId: runContext.taskRunId,
+              // The drafted memo is the finding. If drafting produced nothing,
+              // `appendLibraryEntry` fails closed rather than recording an empty
+              // entry that would poison every later run's delta context.
+              markdown: summaryText,
+            },
+          }, {
+            signal,
+            generate: async (_profile, system, messages, maxTokens) => {
+              const call = await runGeneration({
+                label: `Baseline generation for "${section}"`,
+                stepExecution,
+                purpose: 'library_baseline',
+                modelTier: 'ops',
+                system,
+                messages,
+                maxOutputTokens: maxTokens,
+                parentSignal: signal,
+              });
+              return call.result;
+            },
+            }),
+          ),
+        });
+        const libraryResult = libraryTransaction.libraryResult;
+        if (libraryTransaction.baselineResult?.ok === false && libraryTransaction.baselineResult.generationRejected) {
+          const rejectedCall = [...(stepExecution.generationCalls ?? [])]
+            .reverse()
+            .find((call) => call.purpose === 'library_baseline' && call.status === 'succeeded');
+          if (rejectedCall) {
+            rejectedCall.status = 'rejected';
+            rejectedCall.error = libraryTransaction.baselineResult.message;
+          }
+        }
 
         if (isLibraryFailure(libraryResult)) {
+          const unknownMutation = hasUnknownLibraryMutationOutcome(libraryResult);
+          const attempt = stepExecution.toolAttempts?.at(-1);
+          if (attempt?.mutating && attempt.status === 'succeeded') {
+            // The transaction resolves failures so it can preserve Drive's
+            // boundary classification. A deterministic validation/read
+            // refusal proves no write was applied and must not retain the
+            // wrapper's generic `succeeded` state; only an explicitly unknown
+            // remote outcome is quarantined against replay.
+            attempt.status = unknownMutation ? 'outcome_unknown' : 'failed';
+            attempt.error = boundAutomationExecutionText(libraryResult.message);
+          }
           stepExecution.status = 'failed';
           stepExecution.summary = libraryResult.message;
           stepExecution.error = libraryResult.message;
@@ -4564,6 +5860,9 @@ async function executeAutomationCore(
               code: libraryResult.code,
             },
           });
+          if (unknownMutation) {
+            throw new Error(libraryResult.message);
+          }
           continue;
         }
 
@@ -4605,46 +5904,42 @@ async function executeAutomationCore(
           metadata: { source: ACCOUNT_LIBRARY_BACKING_SOURCE, ...libraryOutput },
         });
 
-        // Compaction lane: fold what this run just recorded into the rolling
-        // current-state baseline on the cheap model, so the next run's prompt
-        // carries compact state instead of an ever-growing stack of full
-        // memos (the 2026-08-11 credit-burn spiral). Auxiliary by design — a
-        // failed refresh is a named warning, never a failed run — and only a
-        // NEWLY created entry triggers it: an idempotent same-day rerun
-        // recorded nothing new, so there is nothing to fold in.
-        if (libraryResult.created) {
-          try {
-            const baselineResult = await runAutomationStepWithTimeout(
-              `Baseline refresh for "${libraryResult.section}"`,
-              updateLibraryBaseline({
-                workspaceId,
-                section: libraryResult.section,
-                latestFindingsMarkdown: summaryText,
-                untrustedRule: UNTRUSTED_EVIDENCE_PROMPT_RULE,
-                neutralize: neutralizeUntrustedDelimiters,
-              }),
-            );
-            if (!baselineResult.ok) {
-              stepExecution.warnings = [
-                ...(stepExecution.warnings ?? []),
-                `The rolling baseline was not refreshed this run: ${baselineResult.message}`,
-              ];
+        // The findings append and its successor baseline were serialized as
+        // one section transaction above. A failed refresh is still auxiliary,
+        // but no other run can interleave a memo behind a baseline that did not
+        // include it.
+        if (creditBudgetBlock) throw new RuntimeCreditBudgetError(creditBudgetBlock);
+        if (libraryTransaction.baselineResult && !libraryTransaction.baselineResult.ok) {
+          const unknownBaselineMutation =
+            libraryTransaction.baselineResult.externalActionOutcome === 'unknown';
+          if (unknownBaselineMutation) {
+            const attempt = stepExecution.toolAttempts?.at(-1);
+            if (attempt?.mutating && attempt.status === 'succeeded') {
+              attempt.status = 'outcome_unknown';
+              attempt.error = boundAutomationExecutionText(libraryTransaction.baselineResult.message);
             }
-          } catch (error) {
-            stepExecution.warnings = [
-              ...(stepExecution.warnings ?? []),
-              `The rolling baseline was not refreshed this run: ${error instanceof Error ? error.message : 'unknown error'}`,
-            ];
+          }
+          stepExecution.warnings = [
+            ...(stepExecution.warnings ?? []),
+            `The rolling baseline was not refreshed this run: ${libraryTransaction.baselineResult.message}`,
+          ];
+          if (unknownBaselineMutation) {
+            throw new Error(libraryTransaction.baselineResult.message);
           }
         }
         continue;
       }
 
       if (step.kind === 'query') {
-        const payload = JSON.parse(await runAutomationStepWithTimeout(
-          `Query step "${step.title}"`,
-          executeToolCall('query_data', step.inputs || {}, { workspaceId }),
-        )) as Record<string, unknown>;
+        const payload = JSON.parse(await runToolOperation({
+          stepExecution,
+          operation: 'query_data',
+          mutating: false,
+          execute: () => runAutomationStepWithTimeout(
+            `Query step "${step.title}"`,
+            (signal) => executeToolCall('query_data', step.inputs || {}, { workspaceId, signal }),
+          ),
+        })) as Record<string, unknown>;
         const payloadSource = typeof payload.source === 'string' ? payload.source : '';
         const queryType = typeof payload.query_type === 'string'
           ? payload.query_type
@@ -4658,10 +5953,27 @@ async function executeAutomationCore(
             payload,
           });
         const queryOrigin = readQueryPayloadOrigin(payload);
+        const persistedPayload = payload.ok === false
+          ? sanitizeIntegrationFailurePayload(payload, `Query step "${step.title}" failed.`)
+          : payload;
+        const completeAccountLibraryPayload =
+          payload.ok !== false
+          && payloadSource === ACCOUNT_LIBRARY_BACKING_SOURCE
+          && queryType === 'account_library_read'
+          && isObjectRecord(payload.data)
+          && payload.data.appEntryHistoryComplete === true;
+        // Account-library reads have already enforced a complete 64 KB source
+        // budget. Replacing that proven-complete snapshot with the generic
+        // 8 KB preview silently removed later entries. Preserve it whole; the
+        // aggregate 120 KB evidence fence still fails the run closed if the
+        // surrounding metadata ever makes the final model input too large.
+        const artifactPayload = completeAccountLibraryPayload
+          ? persistedPayload
+          : boundAutomationArtifactPayload(persistedPayload);
         artifacts.push({
           kind: 'query_data',
           title: step.title,
-          payload,
+          payload: artifactPayload,
           origin: queryOrigin,
         });
         if (chartArtifact) {
@@ -4669,11 +5981,18 @@ async function executeAutomationCore(
         }
         applyQueryStepPayloadToExecution({
           stepTitle: step.title,
-          payload,
+          payload: persistedPayload,
           stepExecution,
           stepErrors,
           artifactCount: chartArtifact ? 2 : 1,
         });
+        if (payload.ok === false && payload.can_continue === false) {
+          stepExecution.stepSeverity = 'critical';
+        }
+        // Persist the same bounded evidence payload the generation planner
+        // authorized, while retaining the full response only long enough to
+        // classify the query and derive any small chart artifact above.
+        stepExecution.output = artifactPayload;
         // Folder-drop warnings ride the run's warning pipeline rather than
         // failing the step: the read still succeeded, but something about
         // the operator's dropped files needs attention (a share problem, a
@@ -4703,7 +6022,7 @@ async function executeAutomationCore(
             queryType,
             ok: payload.ok !== false,
             live: payload.live === true,
-            message: typeof payload.message === 'string' ? payload.message : undefined,
+            message: typeof persistedPayload.message === 'string' ? persistedPayload.message : undefined,
           });
         }
         continue;
@@ -4716,17 +6035,26 @@ async function executeAutomationCore(
           continue;
         }
 
-        const payload = JSON.parse(await runAutomationStepWithTimeout(`Capture step "${step.title}"`, executeToolCall('browser_screenshot', step.inputs, { workspaceId }))) as Record<string, unknown>;
+        const payload = JSON.parse(await runToolOperation({
+          stepExecution,
+          operation: 'browser_screenshot',
+          mutating: false,
+          execute: () => runAutomationStepWithTimeout(
+            `Capture step "${step.title}"`,
+            (signal) => executeToolCall('browser_screenshot', step.inputs || {}, { workspaceId, signal }),
+          ),
+        })) as Record<string, unknown>;
+        const artifactPayload = boundAutomationArtifactPayload(payload);
         artifacts.push({
           kind: 'capture',
           title: step.title,
-          payload,
+          payload: artifactPayload,
           origin: liveOrigin('browser_screenshot', new Date().toISOString()),
         });
         stepExecution.dataOrigin = 'live';
         stepExecution.status = 'succeeded';
         stepExecution.summary = 'Captured the requested page state.';
-        stepExecution.output = payload;
+        stepExecution.output = artifactPayload;
         stepExecution.artifactKind = 'capture';
         stepExecution.toolCalls = 1;
         stepExecution.artifactCount = 1;
@@ -4734,17 +6062,28 @@ async function executeAutomationCore(
       }
 
       if (step.kind === 'analyze') {
-        const analysisResult = await runAutomationStepWithTimeout(
-          `Analysis step "${step.title}"`,
-          generateTextDetailed(
-          step.modelTier || plan.suggestedModelTier,
-          AUTOMATION_ANALYZE_SYSTEM_PROMPT,
-          [{ role: 'user', content: `${step.objective}${buildReviewFeedbackBlock(automation.reviewFeedback)}\n\n${buildAutomationEvidenceBlock(automation, artifacts, stepExecutions, stepErrors)}` }],
-          500,
-          workspaceId,
-          ),
-        );
-        const markdown = analysisResult.text;
+        const analysisCall = await runGeneration({
+          label: `Analysis step "${step.title}"`,
+          stepExecution,
+          purpose: 'analysis',
+          modelTier: step.modelTier || plan.suggestedModelTier,
+          system: AUTOMATION_ANALYZE_SYSTEM_PROMPT,
+          messages: [{ role: 'user', content: `${step.objective}${buildReviewFeedbackBlock(automation.reviewFeedback)}\n\n${buildAutomationEvidenceBlock(automation, artifacts, stepExecutions, stepErrors)}` }],
+          maxOutputTokens: 500,
+        });
+        const analysisResult = analysisCall.result;
+        let markdown: string;
+        try {
+          markdown = requireBoundedAutomationOutput(
+            analysisResult,
+            AUTOMATION_ANALYSIS_MAX_BYTES,
+            'analysis',
+          );
+        } catch (error) {
+          analysisCall.event.status = 'rejected';
+          analysisCall.event.error = error instanceof Error ? error.message : 'Analysis output was rejected.';
+          throw error;
+        }
         artifacts.push({
           kind: 'analysis',
           title: step.title,
@@ -4761,18 +6100,24 @@ async function executeAutomationCore(
         // hard tier so real intelligence charts (pricing, funding) ship to the
         // review pane and Slack — evidence-only, numbers never invented.
         if (/competitor|competitive|market/i.test(`${step.title} ${step.objective}`)) {
+          let intelCall: Awaited<ReturnType<typeof runGeneration>> | null = null;
           try {
-            const intelResult = await runAutomationStepWithTimeout(
-              `Intelligence extraction for "${step.title}"`,
-              generateTextDetailed(
-                'hard',
-                AUTOMATION_INTEL_EXTRACTION_SYSTEM_PROMPT,
-                [{ role: 'user', content: buildAutomationEvidenceBlock(automation, artifacts, stepExecutions, stepErrors) }],
-                700,
-                workspaceId,
-              ),
+            intelCall = await runGeneration({
+              label: `Intelligence extraction for "${step.title}"`,
+              stepExecution,
+              purpose: 'competitive_extraction',
+              modelTier: 'hard',
+              system: AUTOMATION_INTEL_EXTRACTION_SYSTEM_PROMPT,
+              messages: [{ role: 'user', content: buildAutomationEvidenceBlock(automation, artifacts, stepExecutions, stepErrors) }],
+              maxOutputTokens: 700,
+            });
+            const intelResult = intelCall.result;
+            const intelText = requireBoundedAutomationOutput(
+              intelResult,
+              AUTOMATION_EXTRACTION_MAX_BYTES,
+              'competitive extraction',
             );
-            const parsed = JSON.parse(intelResult.text.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '')) as {
+            const parsed = JSON.parse(intelText.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '')) as {
               competitors?: Array<{ name?: unknown; focus?: unknown; pricing_usd_month?: unknown; funding_musd?: unknown }>;
             };
             const competitors = (parsed.competitors || []).filter((entry) => typeof entry?.name === 'string' && entry.name.trim());
@@ -4804,9 +6149,19 @@ async function executeAutomationCore(
                     render_target: 'mission_workspace_artifact',
                   },
                 });
+                // The analysis markdown and each evidence-backed chart are
+                // distinct customer artifacts. Count what was actually
+                // produced so settlement and usage telemetry cannot certify
+                // one artifact while the review pane contains three.
+                stepExecution.artifactCount = (stepExecution.artifactCount ?? 0) + 1;
               }
             }
-          } catch {
+          } catch (error) {
+            if (isFatalAutomationGenerationError(error)) throw error;
+            if (intelCall?.event.status === 'succeeded') {
+              intelCall.event.status = 'rejected';
+              intelCall.event.error = error instanceof Error ? error.message : 'Invalid competitive extraction';
+            }
             // Intelligence extraction is additive; the analysis stands without it.
           }
         }
@@ -4819,17 +6174,23 @@ async function executeAutomationCore(
         // fixed cap (two refused runs on 2026-08-11). The truncation guard
         // below still refuses anything that hits the scaled ceiling.
         const summaryUserContent = `${step.objective}${buildReviewFeedbackBlock(automation.reviewFeedback)}\n\n${buildAutomationEvidenceBlock(automation, artifacts, stepExecutions, stepErrors)}`;
-        const summaryResult = await runAutomationStepWithTimeout(
-          `Summary step "${step.title}"`,
-          generateTextDetailed(
-          step.modelTier || plan.suggestedModelTier,
-          AUTOMATION_SUMMARIZE_SYSTEM_PROMPT,
-          [{ role: 'user', content: summaryUserContent }],
-          automationSummaryTokenBudget(summaryUserContent.length),
-          workspaceId,
-          ),
-        );
-        summaryText = requireCompleteAutomationSummary(summaryResult);
+        const summaryCall = await runGeneration({
+          label: `Summary step "${step.title}"`,
+          stepExecution,
+          purpose: 'summary',
+          modelTier: step.modelTier || plan.suggestedModelTier,
+          system: AUTOMATION_SUMMARIZE_SYSTEM_PROMPT,
+          messages: [{ role: 'user', content: summaryUserContent }],
+          maxOutputTokens: automationSummaryTokenBudget(summaryUserContent.length),
+        });
+        const summaryResult = summaryCall.result;
+        try {
+          summaryText = requireCompleteAutomationSummary(summaryResult);
+        } catch (error) {
+          summaryCall.event.status = 'rejected';
+          summaryCall.event.error = error instanceof Error ? error.message : 'Rejected summary';
+          throw error;
+        }
         artifacts.push({
           kind: 'summary',
           title: step.title,
@@ -4875,7 +6236,15 @@ async function executeAutomationCore(
         }
 
         if (!summaryText && (artifacts.length > 0 || stepErrors.length > 0)) {
-          summaryText = await ensureAutomationSummaryText(automation, plan, workspaceId, artifacts, stepExecutions, stepErrors);
+          summaryText = await ensureAutomationSummaryText(
+            automation,
+            plan,
+            artifacts,
+            stepExecutions,
+            stepErrors,
+            stepExecution,
+            runGeneration,
+          );
           if (summaryText) {
             artifacts.push({
               kind: 'summary',
@@ -4902,29 +6271,35 @@ async function executeAutomationCore(
         // delivers as before — a memo alone would silently lose the analysis.
         let body = summaryText || buildAutomationDeliveryFallbackBody(automation, artifacts, stepExecutions, stepErrors);
         if (summaryText && libraryDocLink) {
+          let memoCall: Awaited<ReturnType<typeof runGeneration>> | null = null;
           try {
-            const memoResult = await runAutomationStepWithTimeout(
-              `Memo tier for "${step.title}"`,
-              generateTextDetailed(
-                'ops',
-                AUTOMATION_MEMO_SYSTEM_PROMPT,
-                [{ role: 'user', content: summaryText }],
-                AUTOMATION_MEMO_MAX_TOKENS,
-                workspaceId,
-              ),
-            );
-            body = appendFullAnalysisLink(requireCompleteAutomationSummary(memoResult), libraryDocLink);
+            memoCall = await runGeneration({
+              label: `Memo tier for "${step.title}"`,
+              stepExecution,
+              purpose: 'delivery_memo',
+              modelTier: 'ops',
+              system: AUTOMATION_MEMO_SYSTEM_PROMPT,
+              messages: [{ role: 'user', content: summaryText }],
+              maxOutputTokens: AUTOMATION_MEMO_MAX_TOKENS,
+            });
+            body = requireCompleteAutomationMemoWithLink(memoCall.result, libraryDocLink);
           } catch (error) {
-            // Fail soft and honest: the reviewed full brief delivers instead,
-            // and the warning names why the memo tier did not run.
+            if (isFatalAutomationGenerationError(error)) throw error;
+            if (memoCall?.event.status === 'succeeded') {
+              memoCall.event.status = 'rejected';
+              memoCall.event.error = error instanceof Error ? error.message : 'Rejected delivery memo';
+            }
+            // Fail soft without violating the delivery contract: fall back to
+            // a deterministic slice of the reviewed brief, never the full
+            // 650-word body that the memo tier exists to keep out of Slack.
             stepExecution.warnings = [
               ...(stepExecution.warnings ?? []),
-              `The memo tier failed (${error instanceof Error ? error.message : 'unknown error'}); the full brief was delivered instead.`,
+              `The memo tier failed (${error instanceof Error ? error.message : 'unknown error'}); a bounded deterministic memo was delivered instead.`,
             ];
-            body = appendFullAnalysisLink(body, libraryDocLink);
+            body = buildDeterministicAutomationMemo(summaryText, libraryDocLink);
           }
         } else if (libraryDocLink) {
-          body = appendFullAnalysisLink(body, libraryDocLink);
+          body = buildDeterministicAutomationMemo(body, libraryDocLink);
         }
 
         if (isWorkflowDeliveryApprovalRequired({
@@ -4982,17 +6357,28 @@ async function executeAutomationCore(
           }
         }
 
-        delivery = await runAutomationStepWithTimeout(`Delivery step "${step.title}"`, sendMessage({
-          to: deliveryTarget.target,
-          subject: `Automation run: ${automation.name}`,
-          body,
-          channel: deliveryTarget.channel,
-          evidenceLinks: sourceLinks,
-          attachedImages: deliveryChartImages,
-          // A tenant's delivery routes through their own Slack connection, and
-          // fails naming "Connect Slack" rather than sending from our bot.
-          workspaceId,
-        }));
+        delivery = await runToolOperation({
+          stepExecution,
+          operation: 'message_delivery',
+          mutating: true,
+          tracksExternalBoundary: true,
+          execute: (onExternalRequestStart) => runAutomationStepWithTimeout(
+            `Delivery step "${step.title}"`,
+            (signal) => sendMessage({
+            to: deliveryTarget.target,
+            subject: `Automation run: ${automation.name}`,
+            body,
+            channel: deliveryTarget.channel,
+            evidenceLinks: sourceLinks,
+            attachedImages: deliveryChartImages,
+            // A tenant's delivery routes through their own Slack connection, and
+            // fails naming "Connect Slack" rather than sending from our bot.
+            workspaceId,
+            signal,
+            onExternalRequestStart,
+            }),
+          ),
+        });
         artifacts.push({
           kind: 'delivery',
           title: `Delivered to ${deliveryTarget.target}`,
@@ -5029,6 +6415,9 @@ async function executeAutomationCore(
       stepExecution.artifactCount = 1;
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown step error';
+      if (error instanceof RuntimeCreditBudgetError) {
+        creditBudgetBlock = error.block;
+      }
       stepErrors.push(`${step.title}: ${errorMessage}`);
       if (step.kind === 'deliver') {
         deliveryError = errorMessage;
@@ -5036,14 +6425,48 @@ async function executeAutomationCore(
       stepExecution.status = 'failed';
       stepExecution.error = errorMessage;
     } finally {
+      normalizeAutomationExecutionDiagnostics(stepExecution, stepErrors);
       stepExecution.finishedAt = new Date().toISOString();
       attachAutomationStepCharge(stepExecution);
       await emitProgress();
     }
+    if (
+      creditBudgetBlock
+      || findUnreconciledGenerationCalls(stepExecutions).length > 0
+      || findUnreconciledExternalActionAttempts(stepExecutions).length > 0
+    ) break;
   }
 
-  if (!summaryText && (artifacts.length > 0 || stepErrors.length > 0)) {
-    summaryText = await ensureAutomationSummaryText(automation, plan, workspaceId, artifacts, stepExecutions, stepErrors);
+  if (
+    !creditBudgetBlock
+    && findUnreconciledGenerationCalls(stepExecutions).length === 0
+    // A rejected summary may be replaced by the separately accounted fallback
+    // while the original step still keeps the run failed. Evidence/tool
+    // failures remain hard stops: no model may turn incomplete inputs into a
+    // plausible-looking final brief.
+    && !hasFallbackBlockingAutomationStepFailure(stepExecutions)
+    && !summaryText
+    && (artifacts.length > 0 || stepErrors.length > 0)
+  ) {
+    const fallbackOwner = stepExecutions[stepExecutions.length - 1];
+    try {
+      summaryText = fallbackOwner
+        ? await ensureAutomationSummaryText(
+            automation,
+            plan,
+            artifacts,
+            stepExecutions,
+            stepErrors,
+            fallbackOwner,
+            runGeneration,
+          )
+        : buildDeterministicAutomationSummary(automation, artifacts, stepExecutions, stepErrors);
+    } catch (error) {
+      if (!(error instanceof RuntimeCreditBudgetError)) throw error;
+      creditBudgetBlock = error.block;
+      stepErrors.push(boundAutomationExecutionText(`Fallback summary: ${error.message}`));
+      summaryText = buildDeterministicAutomationSummary(automation, artifacts, stepExecutions, stepErrors);
+    }
     artifacts.push({
       kind: 'summary',
       title: `${automation.name} summary`,
@@ -5059,18 +6482,23 @@ async function executeAutomationCore(
       summary: `Drafted ${automation.name} summary.`,
       metadata: { artifactKind: 'summary', generatedBy: 'fallback' },
     });
+    // The final fallback runs after its owning step's `finally` block. Reprice
+    // now so its provider usage is included exactly once in run accounting.
+    if (fallbackOwner) attachAutomationStepCharge(fallbackOwner);
     await emitProgress();
   }
 
   return {
     plan,
     artifacts,
+    generationCalls,
     pendingApprovalRequestedEvents,
     summaryText,
     stepErrors,
     stepExecutions,
     delivery,
     deliveryError,
+    creditBudgetBlock,
   };
 }
 
@@ -5088,15 +6516,121 @@ async function executeAutomationCore(
 export async function evaluateAutomationRunReadiness(input: {
   workspaceId: string;
   workflowId: string;
+  automationId?: string;
+  automationName?: string;
+  description?: string;
+  condition?: string;
+  actions?: string[];
   steps?: PersistedAutomationStep[];
   deliveryTarget?: string | null;
 }): Promise<RunReadinessDecision> {
+  let executableSteps: AutomationStepDefinition[] = [];
+  try {
+    // Persisted records can predate today's save-time validation, and demo
+    // workspaces still execute real tool/send code. Structural invariants
+    // therefore belong in the authoritative runtime gate before every bypass,
+    // hold, model call, or external action.
+    validateAutomationDeliveryDraft({
+      notify: input.deliveryTarget,
+      steps: input.steps,
+    });
+    const authoredStepCount = input.steps && input.steps.length > 0
+      ? input.steps.length
+      : (input.actions || []).length;
+    if (authoredStepCount > MAX_PERSISTED_AUTOMATION_STEPS) {
+      throw new Error(`A mission can contain at most ${MAX_PERSISTED_AUTOMATION_STEPS} workflow steps. Nothing was run.`);
+    }
+    if (
+      (!input.steps || input.steps.length === 0)
+      && (input.actions || []).filter(actionNeedsDelivery).length > 1
+    ) {
+      throw new Error('A mission can contain only one delivery step. Split multiple destinations into separate missions.');
+    }
+
+    executableSteps = buildAutomationExecutableSteps({
+      id: input.automationId || input.workflowId,
+      name: input.automationName || input.workflowId,
+      workspaceId: input.workspaceId,
+      description: input.description,
+      actions: input.actions || [],
+      steps: input.steps,
+      notify: input.deliveryTarget?.trim() || undefined,
+      condition: input.condition,
+    });
+    validateAutomationExecutableStepArguments(executableSteps);
+    await Promise.all(executableSteps
+      .filter((step) => step.kind === 'capture')
+      .map((step) => preflightBrowserScreenshotUrl(String(step.inputs?.url || ''))));
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : 'The workflow definition is not executable.';
+    return {
+      allowed: false,
+      tier: 'step_sources',
+      workflowId: input.workflowId,
+      summary: detail,
+      blockers: [{
+        key: 'AUTOMATION_STRUCTURE',
+        label: 'Workflow structure',
+        detail,
+        route: '/automations',
+      }],
+    };
+  }
+
+  const deliveryStep = executableSteps.find((step) => step.kind === 'deliver');
+  const resolvedDeliveryTarget = deliveryStep
+    ? resolveWorkflowDeliveryTarget({
+        step: deliveryStep,
+        notify: input.deliveryTarget,
+        workspaceDefaultTarget: resolveTenantDefaultDeliveryTarget(input.workspaceId),
+      })
+    : null;
+  const effectiveDeliveryTarget = resolvedDeliveryTarget?.target || input.deliveryTarget;
+
+  const applyExactDeliveryPreflight = async (
+    decision: RunReadinessDecision,
+  ): Promise<RunReadinessDecision> => {
+    if (!decision.allowed || !resolvedDeliveryTarget) return decision;
+    try {
+      // Integration status proves that a provider is configured; it does not
+      // prove that this exact destination is valid or currently allowed. Run
+      // the same non-sending checks used by approval before any hold, trigger
+      // acknowledgement, query, or model call. Demo workspaces are included:
+      // their source reads may be simulated, but their delivery code is real.
+      await preflightMessageDelivery({
+        to: resolvedDeliveryTarget.target,
+        channel: resolvedDeliveryTarget.channel,
+        workspaceId: input.workspaceId,
+        subject: `Delivery readiness: ${input.automationName || input.workflowId}`,
+        body: 'Delivery readiness check. No message will be sent.',
+      });
+      return decision;
+    } catch (error) {
+      const detail = boundAutomationExecutionText(
+        error instanceof Error ? error.message : 'The delivery destination could not be verified.',
+      );
+      return {
+        ...decision,
+        allowed: false,
+        summary: `This automation cannot run yet — ${detail}`,
+        blockers: [{
+          key: 'delivery_target',
+          label: 'Fix delivery destination',
+          detail,
+          route: '/automations',
+        }],
+      };
+    }
+  };
+
   if (isDemoWorkspace(input.workspaceId)) {
-    return evaluateRunReadiness({
+    return await applyExactDeliveryPreflight(evaluateRunReadiness({
       workflowId: input.workflowId,
       workspaceId: input.workspaceId,
       isDemoWorkspace: true,
-    });
+      steps: executableSteps,
+      deliveryTarget: effectiveDeliveryTarget,
+    }));
   }
 
   let connectedPartnerApps: string[] = [];
@@ -5117,12 +6651,12 @@ export async function evaluateAutomationRunReadiness(input: {
     }
   }
 
-  return evaluateRunReadiness({
+  const decision = evaluateRunReadiness({
     workflowId: input.workflowId,
     workspaceId: input.workspaceId,
     isDemoWorkspace: false,
-    steps: input.steps,
-    deliveryTarget: input.deliveryTarget,
+    steps: executableSteps,
+    deliveryTarget: effectiveDeliveryTarget,
     settingsView: getWorkspaceSettingsView(input.workspaceId),
     runtimeStatus: buildPartnerRuntimeStatus({
       connectedPartnerApps,
@@ -5131,6 +6665,7 @@ export async function evaluateAutomationRunReadiness(input: {
     }),
     businessContextSet: getBusinessContext(input.workspaceId) !== null,
   });
+  return await applyExactDeliveryPreflight(decision);
 }
 
 /**
@@ -5166,7 +6701,7 @@ function recordPreExecutionBlockedRun(input: {
   noteTitle: string;
   noteCode: string;
   blockers: unknown[];
-  blockKey: 'readinessBlock' | 'creditBlock' | 'creditBudgetBlock';
+  blockKey: 'readinessBlock' | 'creditBlock' | 'creditBudgetBlock' | 'modelRouteBlock';
   block: Record<string, unknown>;
 }) {
   const { workspaceId, summary } = input;
@@ -5344,6 +6879,69 @@ function recordCreditBudgetBlockedAutomationRun(input: {
   });
 }
 
+const MODEL_ROUTE_UNAVAILABLE_CODE = 'model_route_unavailable' as const;
+
+interface ModelRouteBlockDescriptor {
+  code: typeof MODEL_ROUTE_UNAVAILABLE_CODE;
+  summary: string;
+  missingModelTiers: ModelTier[];
+  blockers: Array<{
+    key: string;
+    label: string;
+    detail: string;
+    route: string;
+  }>;
+}
+
+export function buildAutomationModelRouteBlock(input: {
+  automationName: string;
+  workspaceId: string;
+  generationProjections: AutomationGenerationProjection[];
+}): ModelRouteBlockDescriptor | null {
+  const requiredModelTiers = [...new Set(input.generationProjections.map((call) => call.modelTier))];
+  const missingModelTiers = requiredModelTiers.filter(
+    (modelTier) => !hasConfiguredTextGenerationRoute(modelTier as TextProfile, input.workspaceId),
+  );
+  if (missingModelTiers.length === 0) return null;
+
+  const tierList = missingModelTiers.join(', ');
+  const summary =
+    `${input.automationName} did not start because no configured model route is ` +
+    `available for: ${tierList}. Configure a provider route, then try again.`;
+  return {
+    code: MODEL_ROUTE_UNAVAILABLE_CODE,
+    summary,
+    missingModelTiers,
+    blockers: missingModelTiers.map((modelTier) => ({
+      key: `model_route_${modelTier}`,
+      label: `Configure the ${modelTier} model route`,
+      detail: `This mission can execute a ${modelTier} generation call, but no primary or fallback route for that tier has credentials.`,
+      route: '/settings',
+    })),
+  };
+}
+
+function recordModelRouteBlockedAutomationRun(input: {
+  automationId: string;
+  automationName: string;
+  automationDescription?: string;
+  notify?: string | null;
+  steps?: PersistedAutomationStep[];
+  workspaceId: string;
+  workflowId: string;
+  block: ModelRouteBlockDescriptor;
+}) {
+  return recordPreExecutionBlockedRun({
+    ...input,
+    summary: input.block.summary,
+    noteTitle: `${input.automationName} did not run — no model route is configured`,
+    noteCode: MODEL_ROUTE_UNAVAILABLE_CODE,
+    blockers: input.block.blockers,
+    blockKey: 'modelRouteBlock',
+    block: { ...input.block, blockedAt: new Date().toISOString() },
+  });
+}
+
 /**
  * Read back whatever a run has already persisted through `persistProgress`.
  *
@@ -5357,20 +6955,462 @@ function recordCreditBudgetBlockedAutomationRun(input: {
  * correct answer for a run that failed before its first step.
  */
 function readPersistedRunProgress(workspaceId: string, taskRunId: string): {
-  artifacts: unknown[];
-  stepExecutions: unknown[];
+  artifacts: AutomationExecutionArtifact[];
+  stepExecutions: AutomationStepExecution[];
 } {
   try {
     const run = listTaskRuns(workspaceId).find((candidate) => candidate.id === taskRunId);
     const metadata = (run?.metadata || {}) as Record<string, unknown>;
     return {
-      artifacts: Array.isArray(metadata.artifacts) ? metadata.artifacts : [],
-      stepExecutions: Array.isArray(metadata.stepExecutions) ? metadata.stepExecutions : [],
+      artifacts: Array.isArray(metadata.artifacts)
+        ? metadata.artifacts as AutomationExecutionArtifact[]
+        : [],
+      stepExecutions: Array.isArray(metadata.stepExecutions)
+        ? metadata.stepExecutions as AutomationStepExecution[]
+        : [],
     };
   } catch {
     // Never let the recovery read turn a failing run into a crashing one.
     return { artifacts: [], stepExecutions: [] };
   }
+}
+
+interface AutomationSettlementPending {
+  holdId: string;
+  automationId: string;
+  automationName: string;
+  settlementCredits: number;
+  accountedActualCredits: number;
+  intendedRunStatus: TaskRunStatus;
+  intendedTaskStatus: TaskStatus;
+  intendedDelegationState: TaskRecord['delegationState'];
+  preparedAt: string;
+}
+
+const TASK_RUN_STATUSES = new Set<TaskRunStatus>(['queued', 'running', 'succeeded', 'failed', 'canceled', 'retrying']);
+const TASK_STATUSES = new Set<TaskStatus>(['queued', 'running', 'waiting_review', 'blocked', 'completed', 'failed', 'canceled']);
+const TASK_DELEGATION_STATES = new Set<NonNullable<TaskRecord['delegationState']>>([
+  'unassigned',
+  'planned',
+  'delegated',
+  'in_progress',
+  'review',
+  'completed',
+]);
+
+function readAutomationSettlementPending(metadata?: Record<string, unknown>): AutomationSettlementPending | null {
+  const raw = metadata?.settlementPending;
+  if (!isObjectRecord(raw)) return null;
+  const settlementCredits = Number(raw.settlementCredits);
+  const accountedActualCredits = Number(raw.accountedActualCredits);
+  if (
+    typeof raw.holdId !== 'string'
+    || !raw.holdId.trim()
+    || typeof raw.automationId !== 'string'
+    || !raw.automationId.trim()
+    || typeof raw.automationName !== 'string'
+    || !raw.automationName.trim()
+    || !Number.isFinite(settlementCredits)
+    || settlementCredits < 0
+    || !Number.isFinite(accountedActualCredits)
+    || accountedActualCredits < 0
+    || typeof raw.intendedRunStatus !== 'string'
+    || !TASK_RUN_STATUSES.has(raw.intendedRunStatus as TaskRunStatus)
+    || typeof raw.intendedTaskStatus !== 'string'
+    || !TASK_STATUSES.has(raw.intendedTaskStatus as TaskStatus)
+    || typeof raw.intendedDelegationState !== 'string'
+    || !TASK_DELEGATION_STATES.has(raw.intendedDelegationState as NonNullable<TaskRecord['delegationState']>)
+    || typeof raw.preparedAt !== 'string'
+  ) return null;
+
+  return {
+    holdId: raw.holdId.trim(),
+    automationId: raw.automationId.trim(),
+    automationName: raw.automationName.trim(),
+    settlementCredits: Math.trunc(settlementCredits),
+    accountedActualCredits: Math.trunc(accountedActualCredits),
+    intendedRunStatus: raw.intendedRunStatus as TaskRunStatus,
+    intendedTaskStatus: raw.intendedTaskStatus as TaskStatus,
+    intendedDelegationState: raw.intendedDelegationState as NonNullable<TaskRecord['delegationState']>,
+    preparedAt: raw.preparedAt,
+  };
+}
+
+function findCreditHoldTerminal(workspaceId: string, holdId: string) {
+  return listLedgerEntries(workspaceId).find((entry) =>
+    entry.metadata?.holdId === holdId
+    && (entry.metadata?.holdStatus === 'settled' || entry.metadata?.holdStatus === 'released'));
+}
+
+function buildOrphanedAttemptSettlementPending(
+  run: ReturnType<typeof getPlatformState>['taskRuns'][number],
+  now: Date,
+): AutomationSettlementPending | null {
+  if ((run.status !== 'running' && run.status !== 'retrying') || Date.parse(run.startedAt) >= now.getTime()) {
+    return null;
+  }
+  const metadata = run.metadata || {};
+  const holdId = typeof metadata.creditHoldId === 'string' ? metadata.creditHoldId.trim() : '';
+  const automationId = typeof metadata.automationId === 'string' ? metadata.automationId.trim() : '';
+  const automationName = typeof metadata.title === 'string' ? metadata.title.trim() : automationId;
+  const authorizedCredits = Number(metadata.authorizedCredits);
+  const steps = Array.isArray(metadata.stepExecutions)
+    ? metadata.stepExecutions as AutomationStepExecution[]
+    : [];
+  const generationCalls = readAutomationGenerationCalls(steps);
+  if (!holdId || !automationId || !Number.isFinite(authorizedCredits)) return null;
+
+  const accountingIncomplete = generationCalls.some((call) => !hasReliableGenerationUsage(call.usage));
+  const hasPreparedGenerationAttempt = steps
+    .flatMap((step) => step.generationCalls ?? [])
+    .some((call) => call.status === 'prepared');
+  const hasPreparedToolAttempt = readAutomationToolAttempts(steps)
+    .some((attempt) => attempt.status === 'prepared');
+
+  const recoverableCredits = steps.reduce((total, step) => {
+    const recorded = Math.max(0, Math.trunc(step.actualCredits ?? step.charge?.actualCredits ?? 0));
+    const preparedAttempts = (step.toolAttempts ?? [])
+      .filter((attempt) => attempt.status === 'prepared').length;
+    const billableAttempts = (step.toolAttempts ?? [])
+      .filter((attempt) => attempt.status !== 'prepared').length;
+    const toolCalls = Math.max(
+      Math.max(0, Math.trunc(step.toolCalls ?? 0) - preparedAttempts),
+      billableAttempts,
+    );
+    const physicalGenerationCalls = (step.generationCalls ?? [])
+      .filter((call) => call.status !== 'prepared');
+    const hasAttemptEvidence = toolCalls > 0 || physicalGenerationCalls.length > 0;
+    const observed = hasAttemptEvidence
+      ? calculateRuntimeCredits({
+          taskKind: inferAutomationStepTaskKind(step.kind),
+          modelTier: step.modelTier || 'micro',
+          toolCalls,
+          artifactCount: step.artifactCount ?? 0,
+          complexity: inferAutomationStepComplexity(step),
+          generationCalls: physicalGenerationCalls.flatMap((call) =>
+            hasObservedGenerationUsage(call.usage)
+              ? [{ modelTier: call.modelTier, usage: call.usage! }]
+              : []),
+        }).actualCredits
+      : 0;
+    return total + Math.max(recorded, observed);
+  }, 0);
+  // A prepared-only mutation did no billable work, but its abandoned hold
+  // still needs a durable zero-credit terminal settlement before the generic
+  // orphan sweep runs.
+  if (
+    recoverableCredits <= 0
+    && !accountingIncomplete
+    && !hasPreparedToolAttempt
+    && !hasPreparedGenerationAttempt
+  ) return null;
+
+  return {
+    holdId,
+    automationId,
+    automationName: automationName || automationId,
+    settlementCredits: Math.min(Math.trunc(authorizedCredits), recoverableCredits),
+    accountedActualCredits: recoverableCredits,
+    intendedRunStatus: 'failed',
+    intendedTaskStatus: accountingIncomplete ? 'blocked' : 'failed',
+    intendedDelegationState: 'review',
+    preparedAt: now.toISOString(),
+  };
+}
+
+function hasUnresolvedOrphanedGenerationAttempt(
+  run: ReturnType<typeof getPlatformState>['taskRuns'][number],
+  now: Date,
+) {
+  if ((run.status !== 'running' && run.status !== 'retrying') || Date.parse(run.startedAt) >= now.getTime()) {
+    return false;
+  }
+  const steps = Array.isArray(run.metadata?.stepExecutions)
+    ? run.metadata.stepExecutions as AutomationStepExecution[]
+    : [];
+  const calls = readAutomationGenerationCalls(steps);
+  return calls.length > 0 && calls.some((call) => !hasReliableGenerationUsage(call.usage));
+}
+
+function hasOrphanedMutatingToolAttempt(
+  run: ReturnType<typeof getPlatformState>['taskRuns'][number],
+  now: Date,
+) {
+  if ((run.status !== 'running' && run.status !== 'retrying') || Date.parse(run.startedAt) >= now.getTime()) {
+    return false;
+  }
+  const steps = Array.isArray(run.metadata?.stepExecutions)
+    ? run.metadata.stepExecutions as AutomationStepExecution[]
+    : [];
+  // `prepared` and `failed` are both known pre-boundary states. Only a request
+  // that reached `started` (or later) can have mutated the remote system.
+  return readAutomationToolAttempts(steps).some((attempt) =>
+    attempt.mutating
+    && ['started', 'succeeded', 'outcome_unknown'].includes(attempt.status)
+  );
+}
+
+function buildExternalActionReconciliationError() {
+  return 'A mutating external action may have completed before the run closed. Its fixed tool charge was settled, but the remote outcome must be verified before this automation can run again.';
+}
+
+/**
+ * Close the cross-file settlement window before orphan sweeping at boot.
+ * Pending intent survives both crash positions: before debit there is an open
+ * hold to settle; after debit the terminal ledger entry supplies the exact
+ * amount and the run/task closeout is replayed idempotently.
+ */
+export function reconcilePendingAutomationSettlements(now = new Date()) {
+  const snapshot = getPlatformState();
+  const recovered: Array<{ taskRunId: string; settledCredits: number; status: TaskRunStatus }> = [];
+
+  for (const run of snapshot.taskRuns) {
+    const recoveredStepExecutions = Array.isArray(run.metadata?.stepExecutions)
+      ? run.metadata.stepExecutions as AutomationStepExecution[]
+      : [];
+    const recoveredUsageMetadata = recoveredStepExecutions.length > 0
+      ? {
+          stepExecutions: recoveredStepExecutions,
+          stepCharges: buildAutomationStepCharges(recoveredStepExecutions),
+          generationCalls: readAutomationGenerationCalls(recoveredStepExecutions),
+        }
+      : {};
+    const durablePending = readAutomationSettlementPending(run.metadata);
+    const orphanedAccountingIncomplete = !durablePending && hasUnresolvedOrphanedGenerationAttempt(run, now);
+    const orphanedExternalActionIncomplete = !durablePending && hasOrphanedMutatingToolAttempt(run, now);
+    const accountingIncomplete = run.metadata?.settlementReconciliationRequired === true
+      || orphanedAccountingIncomplete;
+    const externalActionIncomplete = run.metadata?.externalActionReconciliationRequired === true
+      || orphanedExternalActionIncomplete;
+    const manualReconciliationRequired = accountingIncomplete || externalActionIncomplete;
+    const accountingRecoveryError = accountingIncomplete
+      ? buildGenerationAccountingReconciliationError(
+          Math.max(1, findUnreconciledGenerationCalls(
+            Array.isArray(run.metadata?.stepExecutions)
+              ? run.metadata.stepExecutions as AutomationStepExecution[]
+              : [],
+          ).length),
+        )
+      : null;
+    const externalActionRecoveryError = externalActionIncomplete
+      ? buildExternalActionReconciliationError()
+      : null;
+    const reconciliationRecoveryError = accountingRecoveryError || externalActionRecoveryError;
+    const orphanedPending = durablePending ? null : buildOrphanedAttemptSettlementPending(run, now);
+    let pending = durablePending ?? orphanedPending;
+
+    if (orphanedPending && pending) {
+      // Persist a replayable closeout before touching the ledger. If settlement
+      // fails or the process dies again, the next boot can still close the hold
+      // from completed tool work and observed provider minimums without
+      // inventing an unknown charge.
+      updateTaskRun(run.id, {
+        ...(reconciliationRecoveryError ? { error: reconciliationRecoveryError } : {}),
+        metadata: {
+          ...recoveredUsageMetadata,
+          settlementPending: pending,
+          settlementReconciliationRequired: accountingIncomplete,
+          externalActionReconciliationRequired: externalActionIncomplete,
+          ...(reconciliationRecoveryError ? { settlementRecoveryError: reconciliationRecoveryError } : {}),
+          ...(manualReconciliationRequired ? { settlementReconciliationFlaggedAt: now.toISOString() } : {}),
+          accountingComplete: !accountingIncomplete,
+          knownMinimumCredits: pending.accountedActualCredits,
+        },
+      });
+    }
+
+    if ((orphanedAccountingIncomplete || orphanedExternalActionIncomplete) && !pending) {
+      // A corrupt legacy record may lack the hold identity needed to settle.
+      // It still becomes a terminal, quarantined failure rather than being
+      // rewritten as a generic safe-to-rerun orphan moments later.
+      const task = snapshot.tasks.find((candidate) => candidate.id === run.taskId);
+      if (task) {
+        updateTask(task.id, {
+          status: 'blocked',
+          delegationState: 'review',
+          metadata: {
+            ...(task.metadata || {}),
+            settlementReconciliationRequired: accountingIncomplete,
+            externalActionReconciliationRequired: externalActionIncomplete,
+            settlementRecoveryError: reconciliationRecoveryError,
+            accountingComplete: !accountingIncomplete,
+          },
+        });
+      }
+      finalizeTaskRun(run.id, {
+        status: 'failed',
+        actualCredits: Math.max(0, Math.trunc(run.actualCredits || 0)),
+        error: reconciliationRecoveryError || 'Automation reconciliation is required.',
+        metadata: {
+          ...recoveredUsageMetadata,
+          settlementReconciliationRequired: accountingIncomplete,
+          externalActionReconciliationRequired: externalActionIncomplete,
+          settlementRecoveryError: reconciliationRecoveryError,
+          settlementReconciliationFlaggedAt: now.toISOString(),
+          accountingComplete: !accountingIncomplete,
+        },
+      });
+      const automationId = typeof run.metadata?.automationId === 'string' ? run.metadata.automationId : '';
+      if (automationId) {
+        try {
+          pauseAutomationForAccountingReconciliation(automationId);
+        } catch (error) {
+          console.error(`[boot] could not pause automation ${automationId} for accounting reconciliation`, error);
+        }
+      }
+      recovered.push({ taskRunId: run.id, settledCredits: 0, status: 'failed' });
+      continue;
+    }
+    if (!pending) continue;
+
+    if (manualReconciliationRequired) {
+      const task = snapshot.tasks.find((candidate) => candidate.id === run.taskId);
+      if (task) {
+        updateTask(task.id, {
+          status: 'blocked',
+          delegationState: 'review',
+          metadata: {
+            ...(task.metadata || {}),
+            settlementReconciliationRequired: accountingIncomplete,
+            externalActionReconciliationRequired: externalActionIncomplete,
+            settlementRecoveryError: reconciliationRecoveryError,
+            accountingComplete: !accountingIncomplete,
+            knownMinimumCredits: pending.accountedActualCredits,
+          },
+        });
+      }
+      try {
+        pauseAutomationForAccountingReconciliation(pending.automationId);
+      } catch (error) {
+        console.error(`[boot] could not pause automation ${pending.automationId} for accounting reconciliation`, error);
+      }
+    }
+
+    try {
+      const existingTerminal = findCreditHoldTerminal(run.workspaceId, pending.holdId);
+      if (existingTerminal?.metadata?.holdStatus === 'released') {
+        const recoveryError = reconciliationRecoveryError
+          || 'Automation settlement could not be recovered because its credit hold was already released.';
+        const task = snapshot.tasks.find((candidate) => candidate.id === run.taskId);
+        if (task) {
+          updateTask(task.id, {
+            status: 'failed',
+            delegationState: 'review',
+            metadata: {
+              ...(task.metadata || {}),
+              settlementRecoveryError: recoveryError,
+              settlementReconciliationRequired: accountingIncomplete,
+              externalActionReconciliationRequired: externalActionIncomplete,
+              accountingComplete: !accountingIncomplete,
+            },
+          });
+        }
+        finalizeTaskRun(run.id, {
+          status: 'failed',
+          actualCredits: 0,
+          error: recoveryError,
+          metadata: {
+            ...recoveredUsageMetadata,
+            settlementPending: null,
+            settlementRecoveryError: recoveryError,
+            settlementRecoveredAt: now.toISOString(),
+            settlementReconciliationRequired: accountingIncomplete,
+            externalActionReconciliationRequired: externalActionIncomplete,
+            accountingComplete: !accountingIncomplete,
+          },
+        });
+        recovered.push({ taskRunId: run.id, settledCredits: 0, status: 'failed' });
+        continue;
+      }
+
+      const settlement = existingTerminal
+        ? {
+            settledCredits: Math.max(
+              0,
+              Math.trunc(Number(existingTerminal.metadata?.actualCredits) || Math.abs(existingTerminal.deltaCredits)),
+            ),
+            overran: false,
+          }
+        : settleCreditHoldWithOverrun(pending.holdId, {
+            workspaceId: run.workspaceId,
+            source: 'automation_run',
+            actualCredits: pending.settlementCredits,
+            referenceType: 'automation',
+            referenceId: pending.automationId,
+            note: `Recovered automation run settlement: ${pending.automationName}`,
+            now,
+            metadata: {
+              taskId: run.taskId,
+              taskRunId: run.id,
+              accountedActualCredits: pending.accountedActualCredits,
+              settlementCredits: pending.settlementCredits,
+              settlementRecoveredAt: now.toISOString(),
+              settlementReconciliationRequired: accountingIncomplete,
+              externalActionReconciliationRequired: externalActionIncomplete,
+              accountingComplete: !accountingIncomplete,
+              ...(reconciliationRecoveryError ? { settlementRecoveryError: reconciliationRecoveryError } : {}),
+            },
+          });
+      const shortfall = settlement.settledCredits < pending.accountedActualCredits;
+      const runStatus: TaskRunStatus = manualReconciliationRequired || shortfall ? 'failed' : pending.intendedRunStatus;
+      const taskStatus: TaskStatus = manualReconciliationRequired || shortfall ? 'blocked' : pending.intendedTaskStatus;
+      const delegationState: TaskRecord['delegationState'] = manualReconciliationRequired || shortfall
+        ? 'review'
+        : pending.intendedDelegationState;
+      const recoveryError = reconciliationRecoveryError || (shortfall
+        ? `Automation accounting recovered ${settlement.settledCredits} of ${pending.accountedActualCredits} credits.`
+        : undefined);
+
+      const task = snapshot.tasks.find((candidate) => candidate.id === run.taskId);
+      if (task) {
+        updateTask(task.id, {
+          status: taskStatus,
+          delegationState,
+          metadata: {
+            ...(task.metadata || {}),
+            settlementRecoveredAt: now.toISOString(),
+            settlementReconciliationRequired: accountingIncomplete,
+            externalActionReconciliationRequired: externalActionIncomplete,
+            accountingComplete: !accountingIncomplete,
+            knownMinimumCredits: pending.accountedActualCredits,
+            ...(recoveryError ? { settlementRecoveryError: recoveryError } : {}),
+          },
+        });
+      }
+      finalizeTaskRun(run.id, {
+        status: runStatus,
+        actualCredits: settlement.settledCredits,
+        ...(recoveryError ? { error: recoveryError } : {}),
+        metadata: {
+          ...recoveredUsageMetadata,
+          accountedActualCredits: pending.accountedActualCredits,
+          settlementCredits: settlement.settledCredits,
+          settlementPending: null,
+          settlementRecoveredAt: now.toISOString(),
+          settlementReconciliationRequired: accountingIncomplete,
+          externalActionReconciliationRequired: externalActionIncomplete,
+          accountingComplete: !accountingIncomplete,
+          knownMinimumCredits: pending.accountedActualCredits,
+          ...(recoveryError ? { settlementRecoveryError: recoveryError } : {}),
+        },
+      });
+      if (accountingIncomplete) {
+        try {
+          pauseAutomationForAccountingReconciliation(pending.automationId);
+        } catch (error) {
+          console.error(`[boot] could not pause automation ${pending.automationId} for accounting reconciliation`, error);
+        }
+      }
+      recovered.push({ taskRunId: run.id, settledCredits: settlement.settledCredits, status: runStatus });
+    } catch (error) {
+      // Leave settlementPending intact. A transient ledger/store failure is
+      // retried on the next boot and the orphan sweep may mark only the runtime
+      // status, never erase the durable closeout intent.
+      console.error(`[boot] could not reconcile automation settlement for ${run.id}`, error);
+    }
+  }
+
+  return recovered;
 }
 
 /**
@@ -5399,35 +7439,154 @@ function respondWorkflowNotReady(res: Response, decision: RunReadinessDecision) 
  * deserves the answer on the request rather than as a failed run discovered
  * later — the same reasoning that put the readiness check on these routes.
  *
- * Returns the block when the run cannot be afforded, `null` when it can. A
- * throw is deliberately swallowed to `null`: a broken ledger read must not
- * prevent a run that `runAutomation`'s own gate and `acquireCreditHold` will
- * still evaluate.
+ * The successful result owns an atomically acquired hold. That makes the HTTP
+ * or Slack response and the async runner one authorization decision instead of
+ * a read-only preflight that another automation can race.
  */
-function checkManualRunAffordability(
+interface ManualRunCreditAuthorization {
+  workspaceId: string;
+  automationId: string;
+  estimatedCredits: number;
+  authorizedCredits: number;
+  hold: ReturnType<typeof acquireCreditHold>;
+  generationMaxAttemptsPerRoute?: number;
+  generationMaxRoutes?: number;
+}
+
+interface AutomationLaunchReceipt {
+  taskId: string;
+  taskRunId: string;
+}
+
+interface AutomationLaunchHandoff {
+  accept: (receipt: AutomationLaunchReceipt) => void;
+  fail: (error: unknown) => void;
+}
+
+function createAutomationLaunchHandoff() {
+  let settle: ((result: { ok: true; receipt: AutomationLaunchReceipt } | { ok: false; error: string }) => void) | null = null;
+  const promise = new Promise<{ ok: true; receipt: AutomationLaunchReceipt } | { ok: false; error: string }>((resolve) => {
+    settle = resolve;
+  });
+  const finish = (result: { ok: true; receipt: AutomationLaunchReceipt } | { ok: false; error: string }) => {
+    if (!settle) return;
+    const resolve = settle;
+    settle = null;
+    resolve(result);
+  };
+  return {
+    promise,
+    handoff: {
+      accept: (receipt: AutomationLaunchReceipt) => finish({ ok: true, receipt }),
+      fail: (error: unknown) => finish({
+        ok: false,
+        error: error instanceof Error ? error.message : String(error || 'Automation launch failed.'),
+      }),
+    } satisfies AutomationLaunchHandoff,
+  };
+}
+
+function acquireManualRunCreditAuthorization(
   automation: Parameters<typeof buildAutomationExecutionPlan>[0] & { name: string },
   workspaceId: string,
-): CreditBlockDescriptor | null {
+): { authorization: ManualRunCreditAuthorization; block?: never } | {
+  authorization?: never;
+  block: CreditBlockDescriptor | CreditBudgetBlockDescriptor | ModelRouteBlockDescriptor;
+} {
+  const plan = buildAutomationExecutionPlan(automation);
+  const modelRouteBlock = buildAutomationModelRouteBlock({
+    automationName: automation.name,
+    workspaceId,
+    generationProjections: plan.generationProjections,
+  });
+  if (modelRouteBlock) return { block: modelRouteBlock };
+
+  ensureWorkspaceCredits(workspaceId);
+  const estimate = estimateCreditCost({
+    taskKind: 'automation',
+    modelTier: plan.suggestedModelTier,
+    automationRuns: 1,
+    toolCalls: plan.estimatedToolCalls,
+    complexity: plan.complexity,
+    generationProjections: plan.generationProjections,
+  });
+  const estimatedCredits = Math.max(estimate.estimatedCredits, plan.estimatedCredits);
+  const authorizationCredits = Math.max(estimatedCredits, plan.authorizationCredits);
+  const perRunBudget = readPerRunCreditBudget(
+    (automation as typeof automation & { credit_budget_per_run?: number }).credit_budget_per_run,
+  );
+  if (perRunBudget !== null && estimatedCredits > perRunBudget) {
+    return {
+      block: buildCreditBudgetBlock({
+        automationName: automation.name,
+        estimatedCredits,
+        budgetCredits: perRunBudget,
+      }),
+    };
+  }
+  // An operator-triggered run receives a truthful synchronous answer. Without
+  // an explicit mission ceiling, reserve the hard single-attempt envelope and
+  // constrain the provider to exactly that reachable policy. Background runs
+  // retain bounded retries and extend at exact call boundaries; a budgeted
+  // manual run already reserves the full operator-approved ceiling.
+  const authorizedCredits = perRunBudget ?? Math.max(
+    authorizationCredits,
+    plan.manualAuthorizationCredits,
+  );
   try {
-    ensureWorkspaceCredits(workspaceId);
-    const plan = buildAutomationExecutionPlan(automation);
-    const estimate = estimateCreditCost({
-      taskKind: 'automation',
-      modelTier: plan.suggestedModelTier,
-      automationRuns: 1,
-      toolCalls: plan.estimatedToolCalls,
-      complexity: plan.complexity,
-      modelCallCount: countPlannedModelCalls(automation.steps),
-    });
-    const affordability = checkRunAffordability({
+    const hold = acquireCreditHold({
       workspaceId,
-      estimatedCredits: Math.max(estimate.estimatedCredits, plan.estimatedCredits),
+      amountCredits: authorizedCredits,
+      referenceType: 'automation',
+      referenceId: automation.id,
+      note: `Reserved credits for operator-triggered automation: ${automation.name}`,
+      metadata: { automationId: automation.id, triggerSurface: 'operator_preflight' },
+      ttlMs: AUTOMATION_CREDIT_HOLD_LEASE_MS,
     });
-    if (affordability.affordable) return null;
-    return buildInsufficientCreditsBlock({ automationName: automation.name, affordability });
+    return {
+      authorization: {
+        workspaceId,
+        automationId: automation.id,
+        estimatedCredits,
+        authorizedCredits,
+        hold,
+        ...(perRunBudget === null
+          ? {
+              generationMaxAttemptsPerRoute: MANUAL_GENERATION_ATTEMPTS_PER_ROUTE,
+              generationMaxRoutes: MANUAL_GENERATION_ROUTE_LIMIT,
+            }
+          : {}),
+      },
+    };
   } catch (error) {
-    console.error('[automation] affordability pre-check failed; deferring to the run gate', error);
-    return null;
+    const affordability = checkRunAffordability({ workspaceId, estimatedCredits: authorizedCredits });
+    if (!affordability.affordable) {
+      return { block: buildInsufficientCreditsBlock({ automationName: automation.name, affordability }) };
+    }
+    throw error;
+  }
+}
+
+function releaseManualRunCreditAuthorization(
+  authorization: ManualRunCreditAuthorization,
+  note: string,
+) {
+  releaseCreditHold(authorization.hold.holdId, {
+    workspaceId: authorization.workspaceId,
+    referenceType: 'automation',
+    referenceId: authorization.automationId,
+    note,
+  });
+}
+
+function safelyReleaseManualRunCreditAuthorization(
+  authorization: ManualRunCreditAuthorization,
+  note: string,
+) {
+  try {
+    releaseManualRunCreditAuthorization(authorization, note);
+  } catch (error) {
+    console.error(`[automation] could not release operator credit authorization for ${authorization.automationId}`, error);
   }
 }
 
@@ -5452,6 +7611,79 @@ function respondInsufficientCredits(res: Response, block: CreditBlockDescriptor)
   });
 }
 
+function respondCreditBudgetExceeded(res: Response, block: CreditBudgetBlockDescriptor) {
+  res.status(409).json({
+    ok: false,
+    error: block.summary,
+    message: block.summary,
+    code: CREDIT_BUDGET_EXCEEDED_CODE,
+    blockers: block.blockers,
+    estimatedCredits: block.estimatedCredits,
+    budgetCredits: block.budgetCredits,
+  });
+}
+
+function respondModelRouteUnavailable(res: Response, block: ModelRouteBlockDescriptor) {
+  res.status(409).json({
+    ok: false,
+    error: block.summary,
+    message: block.summary,
+    code: MODEL_ROUTE_UNAVAILABLE_CODE,
+    blockers: block.blockers,
+    missingModelTiers: block.missingModelTiers,
+  });
+}
+
+function respondCreditPreflightUnavailable(res: Response) {
+  res.status(503).json({
+    ok: false,
+    code: 'credit_preflight_unavailable',
+    error: 'Could not verify and reserve credits for this mission. Nothing was started — try again.',
+    message: 'Could not verify and reserve credits for this mission. Nothing was started — try again.',
+  });
+}
+
+function respondAutomationAlreadyRunning(
+  res: Response,
+  automation: { id: string; name: string; workspaceId?: string },
+  workspaceId: string,
+) {
+  const inFlight = findInFlightRunForAutomation(automation.workspaceId || workspaceId, automation.id);
+  const schedulerClaimed = isAutomationExecutionInFlight(automation.id);
+  const message = inFlight
+    ? describeInFlightRun(automation.name, inFlight.startedAt)
+    : schedulerClaimed
+      ? `"${automation.name}" is already starting or running.`
+      : `"${automation.name}" could not be started because another trigger won the launch claim.`;
+  res.status(409).json({
+    ok: false,
+    code: 'run_already_in_progress',
+    error: message,
+    message,
+    ...(inFlight ? { runId: inFlight.id, startedAt: inFlight.startedAt } : {}),
+  });
+}
+
+function respondAutomationPaused(res: Response, automationName: string) {
+  const message = `"${automationName}" is paused. Resume it after resolving the recorded blocker, then try again.`;
+  res.status(409).json({
+    ok: false,
+    code: 'automation_paused',
+    error: message,
+    message,
+  });
+}
+
+function respondAutomationStartUnavailable(res: Response, automationName: string) {
+  const message = `"${automationName}" could not be handed to the runner safely. Nothing was started or spent — try again.`;
+  res.status(503).json({
+    ok: false,
+    code: 'automation_start_unavailable',
+    error: message,
+    message,
+  });
+}
+
 export async function runAutomation(automation: {
   id: string;
   workspaceId?: string;
@@ -5466,21 +7698,60 @@ export async function runAutomation(automation: {
   timezone?: string;
   reviewFeedback?: string;
   credit_budget_per_run?: number;
+  /** In-memory only: an operator surface already acquired this hold atomically. */
+  _creditAuthorization?: ManualRunCreditAuthorization;
+  /** In-memory only: acknowledge the operator only after a durable run owns the hold. */
+  _launchHandoff?: AutomationLaunchHandoff;
 }) {
   const workspaceId = automation.workspaceId || DEFAULT_WORKSPACE_ID;
   const workflowId = inferWorkflowIdFromAutomation(automation);
+  let suppliedAuthorization = automation._creditAuthorization;
+  let launchHandoff = automation._launchHandoff;
+  const acceptLaunchHandoff = (receipt: AutomationLaunchReceipt) => {
+    const handoff = launchHandoff;
+    launchHandoff = undefined;
+    handoff?.accept(receipt);
+  };
+  const failLaunchHandoff = (error: unknown) => {
+    const handoff = launchHandoff;
+    launchHandoff = undefined;
+    handoff?.fail(error);
+  };
+  const releaseSuppliedAuthorization = (note: string) => {
+    if (!suppliedAuthorization) return;
+    try {
+      releaseManualRunCreditAuthorization(suppliedAuthorization, note);
+    } catch (error) {
+      console.error(`[automation] could not release supplied authorization for ${automation.id}`, error);
+    }
+    suppliedAuthorization = undefined;
+  };
 
   // Readiness is enforced here, before credits are provisioned, held, or spent,
   // and before any model call. Every path into a run — cron, catch-up, manual
   // trigger, rerun — funnels through this function, so this is the one gate
   // that cannot be routed around.
-  const readiness = await evaluateAutomationRunReadiness({
-    workspaceId,
-    workflowId,
-    steps: automation.steps,
-    deliveryTarget: automation.notify,
-  });
+  let readiness: RunReadinessDecision;
+  try {
+    readiness = await evaluateAutomationRunReadiness({
+      workspaceId,
+      workflowId,
+      automationId: automation.id,
+      automationName: automation.name,
+      description: automation.description,
+      condition: automation.condition,
+      actions: automation.actions,
+      steps: automation.steps,
+      deliveryTarget: automation.notify,
+    });
+  } catch (error) {
+    releaseSuppliedAuthorization(`Released credits because readiness failed for ${automation.name}`);
+    failLaunchHandoff(error);
+    throw error;
+  }
   if (!readiness.allowed) {
+    releaseSuppliedAuthorization(`Released credits because ${automation.name} was not ready to run`);
+    failLaunchHandoff(readiness.summary);
     recordBlockedAutomationRun({
       automationId: automation.id,
       automationName: automation.name,
@@ -5499,15 +7770,89 @@ export async function runAutomation(automation: {
     };
   }
 
-  ensureWorkspaceCredits(workspaceId);
-  const executionPlan = buildAutomationExecutionPlan(automation);
-  const experimentAttribution = buildAutomationExperimentAttribution(automation.studio_state);
-  const scenarioTelemetry = buildAutomationScenarioTelemetry(automation.studio_state, executionPlan, experimentAttribution);
-  const modelTier = executionPlan.suggestedModelTier;
-  const runModelSource = getModelSource(modelTier, workspaceId);
-  const complexity = executionPlan.complexity;
-  const toolCallCount = executionPlan.estimatedToolCalls;
-  const executionRole = executionPlan.primaryRole;
+  const planning = (() => {
+    try {
+      ensureWorkspaceCredits(workspaceId);
+      const executionPlan = buildAutomationExecutionPlan(automation);
+      const experimentAttribution = buildAutomationExperimentAttribution(automation.studio_state);
+      const scenarioTelemetry = buildAutomationScenarioTelemetry(
+        automation.studio_state,
+        executionPlan,
+        experimentAttribution,
+      );
+      const modelTier = executionPlan.suggestedModelTier;
+      const runModelSource = getModelSource(modelTier, workspaceId);
+      const complexity = executionPlan.complexity;
+      const toolCallCount = executionPlan.estimatedToolCalls;
+      const executionRole = executionPlan.primaryRole;
+      const estimate = estimateCreditCost({
+        taskKind: 'automation',
+        modelTier,
+        automationRuns: 1,
+        toolCalls: toolCallCount,
+        complexity,
+        generationProjections: executionPlan.generationProjections,
+      });
+      const estimatedCredits = Math.max(estimate.estimatedCredits, executionPlan.estimatedCredits);
+      const authorizationCredits = Math.max(estimatedCredits, executionPlan.authorizationCredits);
+      const perRunBudget = readPerRunCreditBudget(automation.credit_budget_per_run);
+      return {
+        executionPlan,
+        experimentAttribution,
+        scenarioTelemetry,
+        modelTier,
+        runModelSource,
+        complexity,
+        toolCallCount,
+        executionRole,
+        estimatedCredits,
+        authorizationCredits,
+        perRunBudget,
+      };
+    } catch (error) {
+      releaseSuppliedAuthorization(`Released credits because planning failed for ${automation.name}`);
+      failLaunchHandoff(error);
+      throw error;
+    }
+  })();
+  const {
+    executionPlan,
+    experimentAttribution,
+    scenarioTelemetry,
+    modelTier,
+    runModelSource,
+    complexity,
+    executionRole,
+    estimatedCredits,
+    authorizationCredits,
+    perRunBudget,
+  } = planning;
+
+  const modelRouteBlock = buildAutomationModelRouteBlock({
+    automationName: automation.name,
+    workspaceId,
+    generationProjections: executionPlan.generationProjections,
+  });
+  if (modelRouteBlock) {
+    releaseSuppliedAuthorization(`Released credits because ${automation.name} had no configured model route`);
+    failLaunchHandoff(modelRouteBlock.summary);
+    recordModelRouteBlockedAutomationRun({
+      automationId: automation.id,
+      automationName: automation.name,
+      automationDescription: automation.description,
+      notify: automation.notify,
+      steps: automation.steps,
+      workspaceId,
+      workflowId,
+      block: modelRouteBlock,
+    });
+    console.warn(`[automation] ${automation.id} blocked before execution: ${modelRouteBlock.summary}`);
+    return {
+      ok: false as const,
+      error: modelRouteBlock.summary,
+      deliveryError: modelRouteBlock.summary,
+    };
+  }
 
   // ── Affordability gate ──────────────────────────────────────────────────────
   // Deliberately here: the plan is built (so the estimate is real) but nothing
@@ -5518,47 +7863,11 @@ export async function runAutomation(automation: {
   // after the task and run records exist, and settlement happens after the work,
   // so leaving this to the hold alone is what let a tenant burn a full run and
   // then lose it at `settleCreditHold`.
-  const estimate = estimateCreditCost({
-    taskKind: 'automation',
-    modelTier,
-    automationRuns: 1,
-    toolCalls: toolCallCount,
-    complexity,
-    modelCallCount: countPlannedModelCalls(automation.steps),
-  });
-  const estimatedCredits = Math.max(estimate.estimatedCredits, executionPlan.estimatedCredits);
-  const affordability = checkRunAffordability({ workspaceId, estimatedCredits });
-  if (!affordability.affordable) {
-    const creditBlock = buildInsufficientCreditsBlock({
-      automationName: automation.name,
-      affordability,
-    });
-    recordCreditBlockedAutomationRun({
-      automationId: automation.id,
-      automationName: automation.name,
-      automationDescription: automation.description,
-      notify: automation.notify,
-      steps: automation.steps,
-      workspaceId,
-      workflowId,
-      block: creditBlock,
-    });
-    console.warn(`[automation] ${automation.id} blocked before execution: ${creditBlock.summary}`);
-    return {
-      ok: false as const,
-      error: creditBlock.summary,
-      deliveryError: creditBlock.summary,
-    };
-  }
-
-  // ── Per-mission budget gate ────────────────────────────────────────────────
-  // The workspace could afford this run; the question here is whether the
-  // OPERATOR allowed this mission to cost this much. Refusing is free at this
-  // point — nothing recorded, held, or sent — which is what "pause and ask"
-  // means: the run blocks with both numbers named, and the operator decides
-  // between raising the budget and trimming the mission.
-  const perRunBudget = readPerRunCreditBudget(automation.credit_budget_per_run);
+  // The operator's budget is the authorization envelope. Reject an estimate
+  // that does not fit before reserving or spending anything.
   if (perRunBudget !== null && estimatedCredits > perRunBudget) {
+    releaseSuppliedAuthorization(`Released credits because ${automation.name} exceeded its mission budget`);
+    failLaunchHandoff(`The estimated run exceeds the mission budget for ${automation.name}.`);
     const budgetBlock = buildCreditBudgetBlock({
       automationName: automation.name,
       estimatedCredits,
@@ -5582,100 +7891,189 @@ export async function runAutomation(automation: {
     };
   }
 
-  const delegation = buildDelegationRuntimeContext({
-    workspaceId,
-    taskKind: 'automation',
-    title: automation.name,
-    description: automation.description,
-    autonomyMode: 'cautious',
-    priority: 'medium',
-    modelTier,
-    toolCountHint: automation.actions.length,
-    complexity,
-    executorRoleOverride: executionRole,
-    supportingRolesOverride: executionPlan.supportingRoles,
-    reasonOverride: executionPlan.rationale,
-  });
-  const task = createTask({
-    workspaceId,
-    title: automation.name,
-    description: automation.description,
-    kind: 'automation',
-    priority: 'medium',
-    ...delegation.taskPatch,
-    delegationPlanId: delegation.plan.id,
-    delegationPlan: delegation.plan,
-    metadata: {
+  // A budgeted run reserves the FULL approved envelope. That makes the
+  // provider-call guard and settlement operate against credits the workspace
+  // actually has, rather than an optimistic estimate that may be smaller.
+  let authorizedCredits = perRunBudget ?? authorizationCredits;
+  const suppliedAuthorizationMatches = Boolean(
+    suppliedAuthorization
+    && suppliedAuthorization.workspaceId === workspaceId
+    && suppliedAuthorization.automationId === automation.id
+    && suppliedAuthorization.authorizedCredits >= authorizedCredits,
+  );
+  if (suppliedAuthorization && !suppliedAuthorizationMatches) {
+    releaseSuppliedAuthorization(`Released stale credit authorization for ${automation.name}`);
+  }
+  if (suppliedAuthorizationMatches && suppliedAuthorization) {
+    authorizedCredits = suppliedAuthorization.authorizedCredits;
+  }
+  const suppliedGenerationMaxAttemptsPerRoute = suppliedAuthorizationMatches
+    ? suppliedAuthorization?.generationMaxAttemptsPerRoute
+    : undefined;
+  const suppliedGenerationMaxRoutes = suppliedAuthorizationMatches
+    ? suppliedAuthorization?.generationMaxRoutes
+    : undefined;
+  const affordability = suppliedAuthorizationMatches
+    ? null
+    : checkRunAffordability({ workspaceId, estimatedCredits: authorizedCredits });
+  if (affordability && !affordability.affordable) {
+    failLaunchHandoff(`The workspace cannot afford the authorized run for ${automation.name}.`);
+    const creditBlock = buildInsufficientCreditsBlock({
+      automationName: automation.name,
+      affordability,
+    });
+    recordCreditBlockedAutomationRun({
       automationId: automation.id,
-      notify: automation.notify || null,
-      delegation: delegation.ownership,
-      modelSource: runModelSource,
-      modelSourceLabel: getModelSourceLabel(runModelSource),
-      sourceSteps: automation.steps,
-      executionPolicy: automation.execution_policy,
-      studioState: automation.studio_state,
+      automationName: automation.name,
+      automationDescription: automation.description,
+      notify: automation.notify,
+      steps: automation.steps,
+      workspaceId,
+      workflowId,
+      block: creditBlock,
+    });
+    console.warn(`[automation] ${automation.id} blocked before execution: ${creditBlock.summary}`);
+    return {
+      ok: false as const,
+      error: creditBlock.summary,
+      deliveryError: creditBlock.summary,
+    };
+  }
+
+  const delegation = (() => {
+    try {
+      return buildDelegationRuntimeContext({
+        workspaceId,
+        taskKind: 'automation',
+        title: automation.name,
+        description: automation.description,
+        autonomyMode: 'cautious',
+        priority: 'medium',
+        modelTier,
+        toolCountHint: automation.actions.length,
+        complexity,
+        executorRoleOverride: executionRole,
+        supportingRolesOverride: executionPlan.supportingRoles,
+        reasonOverride: executionPlan.rationale,
+      });
+    } catch (error) {
+      releaseSuppliedAuthorization(`Released credits because delegation planning failed for ${automation.name}`);
+      failLaunchHandoff(error);
+      throw error;
+    }
+  })();
+  let task: ReturnType<typeof createTask>;
+  try {
+    task = createTask({
+      workspaceId,
+      title: automation.name,
+      description: automation.description,
+      kind: 'automation',
+      priority: 'medium',
+      ...delegation.taskPatch,
+      delegationPlanId: delegation.plan.id,
+      delegationPlan: delegation.plan,
+      metadata: {
+        automationId: automation.id,
+        notify: automation.notify || null,
+        delegation: delegation.ownership,
+        modelSource: runModelSource,
+        modelSourceLabel: getModelSourceLabel(runModelSource),
+        sourceSteps: automation.steps,
+        executionPolicy: automation.execution_policy,
+        studioState: automation.studio_state,
         experimentAttribution,
         scenarioTelemetry,
-      automationPlan: executionPlan,
-      plannedSteps: executionPlan.steps,
-      rolePlan: {
-        primaryRole: executionPlan.primaryRole,
-        supportingRoles: executionPlan.supportingRoles,
-        rationale: executionPlan.rationale,
-        elasticLanes: executionPlan.elasticLanes,
-        primaryBand: executionPlan.primaryBand,
+        automationPlan: executionPlan,
+        plannedSteps: executionPlan.steps,
+        rolePlan: {
+          primaryRole: executionPlan.primaryRole,
+          supportingRoles: executionPlan.supportingRoles,
+          rationale: executionPlan.rationale,
+          elasticLanes: executionPlan.elasticLanes,
+          primaryBand: executionPlan.primaryBand,
+        },
+        workerTopology: executionPlan.topology,
       },
-      workerTopology: executionPlan.topology,
-    },
-  });
+    });
+  } catch (error) {
+    releaseSuppliedAuthorization(`Released credits because task creation failed for ${automation.name}`);
+    failLaunchHandoff(error);
+    throw error;
+  }
   // `estimatedCredits` is computed above, before the affordability gate — the
   // run record and the hold must both quote the number the gate actually judged.
-  const taskRun = createTaskRun({
-    workspaceId,
-    taskId: task.id,
-    ...delegation.taskRunPatch,
-    modelTier,
-    estimatedCredits,
-    delegationPlan: delegation.plan,
-    metadata: {
-      automationId: automation.id,
-      title: automation.name,
-      delegation: delegation.ownership,
-      modelSource: runModelSource,
-      modelSourceLabel: getModelSourceLabel(runModelSource),
-      sourceSteps: automation.steps,
-      executionPolicy: automation.execution_policy,
-      studioState: automation.studio_state,
+  let taskRun: ReturnType<typeof createTaskRun>;
+  try {
+    taskRun = createTaskRun({
+      workspaceId,
+      taskId: task.id,
+      ...delegation.taskRunPatch,
+      modelTier,
+      estimatedCredits,
+      delegationPlan: delegation.plan,
+      metadata: {
+        automationId: automation.id,
+        title: automation.name,
+        delegation: delegation.ownership,
+        modelSource: runModelSource,
+        modelSourceLabel: getModelSourceLabel(runModelSource),
+        sourceSteps: automation.steps,
+        executionPolicy: automation.execution_policy,
+        studioState: automation.studio_state,
         experimentAttribution,
         scenarioTelemetry,
-      automationPlan: executionPlan,
-      plannedSteps: executionPlan.steps,
-      stepExecutions: [],
-      rolePlan: {
-        primaryRole: executionPlan.primaryRole,
-        supportingRoles: executionPlan.supportingRoles,
-        rationale: executionPlan.rationale,
-        elasticLanes: executionPlan.elasticLanes,
-        primaryBand: executionPlan.primaryBand,
+        automationPlan: executionPlan,
+        plannedSteps: executionPlan.steps,
+        stepExecutions: [],
+        rolePlan: {
+          primaryRole: executionPlan.primaryRole,
+          supportingRoles: executionPlan.supportingRoles,
+          rationale: executionPlan.rationale,
+          elasticLanes: executionPlan.elasticLanes,
+          primaryBand: executionPlan.primaryBand,
+        },
+        workerTopology: executionPlan.topology,
       },
-      workerTopology: executionPlan.topology,
-    },
-  });
-
-  broadcastTaskPanelEvent(workspaceId, {
-    type: 'automation_run_started',
-    automationId: automation.id,
-    taskId: task.id,
-    taskRunId: taskRun.id,
-  });
+    });
+  } catch (error) {
+    releaseSuppliedAuthorization(`Released credits because run creation failed for ${automation.name}`);
+    failLaunchHandoff(error);
+    try {
+      updateTask(task.id, {
+        status: 'failed',
+        delegationState: 'review',
+        metadata: {
+          ...(task.metadata || {}),
+          runCreationError: error instanceof Error ? error.message : 'Could not create automation run.',
+        },
+      });
+    } catch {
+      // Preserve the original storage error; the boot sweep can reconcile the
+      // queued task if this secondary write also fails.
+    }
+    throw error;
+  }
 
   let creditHold: ReturnType<typeof acquireCreditHold> | null = null;
   let creditHoldSettled = false;
+  let settledCredits = 0;
+  let latestProgress: {
+    artifacts: AutomationExecutionArtifact[];
+    summaryText: string;
+    stepErrors: string[];
+    stepExecutions: AutomationStepExecution[];
+    delivery: Record<string, unknown> | null;
+    deliveryError: string | null;
+    workerTopology: AutomationExecutionPlan['topology'];
+  } | null = null;
 
   try {
-    creditHold = acquireCreditHold({
+    creditHold = suppliedAuthorizationMatches && suppliedAuthorization
+      ? suppliedAuthorization.hold
+      : acquireCreditHold({
       workspaceId,
-      amountCredits: estimatedCredits,
+      amountCredits: authorizedCredits,
       referenceType: 'automation',
       referenceId: automation.id,
       note: `Held credits for automation run: ${automation.name}`,
@@ -5683,10 +8081,26 @@ export async function runAutomation(automation: {
         taskId: task.id,
         taskRunId: taskRun.id,
         estimatedCredits,
+        authorizedCredits,
         workflowId,
+      },
+      ttlMs: AUTOMATION_CREDIT_HOLD_LEASE_MS,
+    });
+    suppliedAuthorization = undefined;
+    updateTaskRun(taskRun.id, {
+      metadata: {
+        creditHoldId: creditHold.holdId,
+        authorizedCredits,
       },
     });
     updateTask(task.id, { status: 'running', delegationState: 'in_progress' });
+    broadcastTaskPanelEvent(workspaceId, {
+      type: 'automation_run_started',
+      automationId: automation.id,
+      taskId: task.id,
+      taskRunId: taskRun.id,
+    });
+    acceptLaunchHandoff({ taskId: task.id, taskRunId: taskRun.id });
 
     const persistProgress = async (progress: {
       artifacts: AutomationExecutionArtifact[];
@@ -5697,6 +8111,15 @@ export async function runAutomation(automation: {
       deliveryError: string | null;
       workerTopology: AutomationExecutionPlan['topology'];
     }) => {
+      // Capture in memory before disk I/O. If the progress write itself
+      // fails, the outer recovery path can still settle every completed call
+      // instead of releasing the hold and reporting zero usage.
+      latestProgress = {
+        ...progress,
+        artifacts: [...progress.artifacts],
+        stepErrors: [...progress.stepErrors],
+        stepExecutions: [...progress.stepExecutions],
+      };
       updateTaskRun(taskRun.id, {
         metadata: {
           automationId: automation.id,
@@ -5711,6 +8134,8 @@ export async function runAutomation(automation: {
         scenarioTelemetry,
           automationPlan: executionPlan,
           plannedSteps: executionPlan.steps,
+          creditHoldId: creditHold?.holdId,
+          authorizedCredits,
           stepExecutions: progress.stepExecutions,
           artifacts: progress.artifacts,
           summary: progress.summaryText || undefined,
@@ -5769,6 +8194,41 @@ export async function runAutomation(automation: {
       workflowId,
       taskId: task.id,
       taskRunId: taskRun.id,
+      // Even without an operator-authored per-run limit, the acquired hold is
+      // the authorization envelope. No provider call may outspend it.
+      creditBudgetCredits: authorizedCredits,
+      renewCreditAuthorization: () => {
+        if (!creditHold) throw new Error('Automation credit authorization is unavailable.');
+        renewCreditHold(creditHold.holdId, {
+          workspaceId,
+          ttlMs: AUTOMATION_CREDIT_HOLD_LEASE_MS,
+        });
+      },
+      ...(suppliedGenerationMaxAttemptsPerRoute
+        ? { generationMaxAttemptsPerRoute: suppliedGenerationMaxAttemptsPerRoute }
+        : {}),
+      ...(suppliedGenerationMaxRoutes
+        ? { generationMaxRoutes: suppliedGenerationMaxRoutes }
+        : {}),
+      ...(perRunBudget === null && !suppliedAuthorizationMatches
+        ? {
+            extendCreditAuthorization: (requiredCredits: number) => {
+              if (!creditHold) throw new Error('Automation credit authorization is unavailable.');
+              const extended = extendCreditHold(creditHold.holdId, {
+                workspaceId,
+                amountCredits: requiredCredits,
+                ttlMs: AUTOMATION_CREDIT_HOLD_LEASE_MS,
+              });
+              authorizedCredits = extended.heldCredits;
+              creditHold.heldCredits = extended.heldCredits;
+              creditHold.expiresAt = extended.expiresAt;
+              updateTaskRun(taskRun.id, {
+                metadata: { authorizedCredits: extended.heldCredits },
+              });
+              return extended.heldCredits;
+            },
+          }
+        : {}),
     }, persistProgress);
     const deliveryWaitingForReview = execution.stepExecutions.some((step) =>
       step.kind === 'deliver' &&
@@ -5783,28 +8243,57 @@ export async function runAutomation(automation: {
       automation.condition ? `Condition note: ${automation.condition}` : null,
     ].filter(Boolean).join('\n\n');
     const summary = execution.summaryText || fallbackSummary;
-    // Computed before classification so the review gate can carry the
-    // budget-overrun fact: the estimate fit under the mission's budget, but
-    // spend is billed on actual tokens, and a crossing must be said plainly
-    // rather than left for the ledger to reveal.
+    // Account every completed operation at full runtime cost. Settlement is
+    // capped separately below; keeping the uncapped figure here preserves
+    // truthful internal economics without debiting beyond authorization.
     const actualCredits = estimateSuccessfulAutomationCredits(execution.stepExecutions);
+    const settlementCredits = Math.min(actualCredits, authorizedCredits);
+    const accountingOverrun = actualCredits > authorizedCredits;
+    const unreconciledGenerationCalls = findUnreconciledGenerationCalls(execution.stepExecutions);
+    const generationAccountingIncomplete = unreconciledGenerationCalls.length > 0;
+    const accountingReconciliationError = generationAccountingIncomplete
+      ? buildGenerationAccountingReconciliationError(unreconciledGenerationCalls.length)
+      : null;
+    const unreconciledExternalActionAttempts = findUnreconciledExternalActionAttempts(execution.stepExecutions);
+    const externalActionReconciliationRequired = unreconciledExternalActionAttempts.length > 0;
+    const externalActionReconciliationError = externalActionReconciliationRequired
+      ? buildExternalActionReconciliationError()
+      : null;
+    const manualReconciliationRequired = generationAccountingIncomplete || externalActionReconciliationRequired;
+    const reconciliationError = [accountingReconciliationError, externalActionReconciliationError]
+      .filter((message): message is string => Boolean(message))
+      .join('\n\n') || null;
     const budgetOverrunWarnings =
-      perRunBudget !== null && actualCredits > perRunBudget
+      accountingOverrun
         ? [{
             stepId: 'credit_budget',
             title: 'Credit budget',
             message: buildCreditBudgetOverrunWarning({
               automationName: automation.name,
               actualCredits,
-              budgetCredits: perRunBudget,
+              budgetCredits: authorizedCredits,
             }),
           }]
         : [];
+    const accountingWarnings = accountingReconciliationError
+      ? [{
+          stepId: 'generation_accounting',
+          title: 'Provider usage accounting',
+          message: accountingReconciliationError,
+        }]
+      : [];
+    const externalActionWarnings = externalActionReconciliationError
+      ? [{
+          stepId: 'external_action_reconciliation',
+          title: 'External action outcome',
+          message: externalActionReconciliationError,
+        }]
+      : [];
     const outcome = classifyAutomationRunOutcome({
       deliveryWaitingForReview,
-      deliveryError: execution.deliveryError,
+      deliveryError: execution.deliveryError || execution.creditBudgetBlock?.summary || null,
       stepExecutions: execution.stepExecutions,
-      extraWarnings: budgetOverrunWarnings,
+      extraWarnings: [...budgetOverrunWarnings, ...accountingWarnings, ...externalActionWarnings],
     });
     // An approver decides from the review gate, so what the run could not finish
     // has to be on it before anything is persisted or announced.
@@ -5825,12 +8314,80 @@ export async function runAutomation(automation: {
 
     const actualToolCalls = execution.stepExecutions.reduce((total, step) => total + Math.max(0, Math.trunc(step.toolCalls || 0)), 0);
 
+    const stepCharges = buildAutomationStepCharges(execution.stepExecutions);
+
+    // Durable closeout intent comes before the ledger debit. A crash in the
+    // narrow cross-file window can be reconciled at boot from this exact
+    // amount/status instead of expiring or releasing a hold for spent work.
+    updateTaskRun(taskRun.id, {
+      metadata: {
+        artifacts: execution.artifacts,
+        stepErrors: execution.stepErrors,
+        stepExecutions: execution.stepExecutions,
+        generationCalls: execution.generationCalls,
+        stepCharges,
+        accountedActualCredits: actualCredits,
+        knownMinimumCredits: actualCredits,
+        accountingComplete: !generationAccountingIncomplete,
+        settlementReconciliationRequired: generationAccountingIncomplete,
+        externalActionReconciliationRequired,
+        ...(reconciliationError ? { settlementRecoveryError: reconciliationError } : {}),
+        authorizedCredits,
+        settlementPending: {
+          holdId: creditHold.holdId,
+          automationId: automation.id,
+          automationName: automation.name,
+          settlementCredits,
+          accountedActualCredits: actualCredits,
+          intendedRunStatus: accountingOverrun || manualReconciliationRequired ? 'failed' : outcome.runStatus,
+          intendedTaskStatus: accountingOverrun || manualReconciliationRequired ? 'blocked' : outcome.taskStatus,
+          intendedDelegationState: accountingOverrun || manualReconciliationRequired ? 'review' : outcome.delegationState,
+          preparedAt: new Date().toISOString(),
+        },
+      },
+    });
+
+    const settlement = settleCreditHoldWithOverrun(creditHold.holdId, {
+      workspaceId,
+      source: 'automation_run',
+      actualCredits: settlementCredits,
+      referenceType: 'automation',
+      referenceId: automation.id,
+      note: `Automation run: ${automation.name}`,
+      metadata: {
+        taskId: task.id,
+        taskRunId: taskRun.id,
+        actualToolCalls,
+        authorizedCredits,
+        accountedActualCredits: actualCredits,
+        knownMinimumCredits: actualCredits,
+        accountingComplete: !generationAccountingIncomplete,
+        settlementReconciliationRequired: generationAccountingIncomplete,
+        externalActionReconciliationRequired,
+        ...(reconciliationError ? { settlementRecoveryError: reconciliationError } : {}),
+        settlementCredits,
+        creditBudgetBlock: execution.creditBudgetBlock,
+        experimentAttribution,
+        scenarioTelemetry,
+        stepCharges,
+        generationCalls: execution.generationCalls,
+        deliveryError: execution.deliveryError || execution.creditBudgetBlock?.summary || externalActionReconciliationError || null,
+        reviewRequired: manualReconciliationRequired ? false : outcome.reviewRequired,
+        runOutcome: outcome,
+      },
+    });
+    creditHoldSettled = true;
+    settledCredits = settlement.settledCredits;
+
     finalizeTaskRun(taskRun.id, {
-      status: outcome.runStatus,
-      actualCredits,
+      status: accountingOverrun || manualReconciliationRequired ? 'failed' : outcome.runStatus,
+      actualCredits: settlement.settledCredits,
+      ...(reconciliationError ? { error: reconciliationError } : {}),
       metadata: {
         automationId: automation.id,
-        summary: outcome.reviewSummary && outcome.runStatus === 'failed'
+        summary: reconciliationError
+          ? `${summary}\n\n${reconciliationError}`
+          : outcome.reviewSummary && outcome.runStatus === 'failed'
           ? `${summary}\n\n${outcome.reviewSummary}`
           : summary,
         modelSource: runModelSource,
@@ -5838,14 +8395,18 @@ export async function runAutomation(automation: {
         artifacts: execution.artifacts,
         stepErrors: execution.stepErrors,
         stepExecutions: execution.stepExecutions,
-        stepCharges: execution.stepExecutions.map((step) => ({
-          stepId: step.stepId,
-          title: step.title,
-          status: step.status,
-          actualCredits: step.actualCredits || 0,
-          charge: step.charge,
-          tokenUsage: step.tokenUsage,
-        })),
+        generationCalls: execution.generationCalls,
+        authorizedCredits,
+        accountedActualCredits: actualCredits,
+        knownMinimumCredits: actualCredits,
+        accountingComplete: !generationAccountingIncomplete,
+        settlementReconciliationRequired: generationAccountingIncomplete,
+        externalActionReconciliationRequired,
+        ...(reconciliationError ? { settlementRecoveryError: reconciliationError } : {}),
+        settlementCredits: settlement.settledCredits,
+        settlementPending: null,
+        creditBudgetBlock: execution.creditBudgetBlock,
+        stepCharges,
         sourceSteps: automation.steps,
         executionPolicy: automation.execution_policy,
         studioState: automation.studio_state,
@@ -5863,8 +8424,8 @@ export async function runAutomation(automation: {
         },
         workerTopology: applyWorkerRuntimeActivity(execution.plan.topology, execution.stepExecutions),
         delivery: execution.delivery,
-        deliveryError: execution.deliveryError,
-        reviewRequired: outcome.reviewRequired,
+        deliveryError: execution.deliveryError || execution.creditBudgetBlock?.summary || externalActionReconciliationError || null,
+        reviewRequired: manualReconciliationRequired ? false : outcome.reviewRequired,
         // Surfaced beside reviewRequired rather than only inside runOutcome, so
         // review surfaces can render "delivered, but not archived" directly.
         runWarnings: outcome.runWarnings,
@@ -5872,8 +8433,8 @@ export async function runAutomation(automation: {
       },
     });
     updateTask(task.id, {
-      status: outcome.taskStatus,
-      delegationState: outcome.delegationState,
+      status: accountingOverrun || manualReconciliationRequired ? 'blocked' : outcome.taskStatus,
+      delegationState: accountingOverrun || manualReconciliationRequired ? 'review' : outcome.delegationState,
       metadata: {
         automationId: automation.id,
         notify: deliveryTarget || null,
@@ -5885,17 +8446,20 @@ export async function runAutomation(automation: {
         studioState: automation.studio_state,
         experimentAttribution,
         scenarioTelemetry,
-        latestSummary: summary,
+        latestSummary: reconciliationError
+          ? `${summary}\n\n${reconciliationError}`
+          : summary,
         latestArtifacts: execution.artifacts,
         latestStepExecutions: execution.stepExecutions,
-        stepCharges: execution.stepExecutions.map((step) => ({
-          stepId: step.stepId,
-          title: step.title,
-          status: step.status,
-          actualCredits: step.actualCredits || 0,
-          charge: step.charge,
-          tokenUsage: step.tokenUsage,
-        })),
+        generationCalls: execution.generationCalls,
+        authorizedCredits,
+        knownMinimumCredits: actualCredits,
+        accountingComplete: !generationAccountingIncomplete,
+        settlementReconciliationRequired: generationAccountingIncomplete,
+        externalActionReconciliationRequired,
+        ...(reconciliationError ? { settlementRecoveryError: reconciliationError } : {}),
+        creditBudgetBlock: execution.creditBudgetBlock,
+        stepCharges,
         automationPlan: execution.plan,
         plannedSteps: execution.plan.steps,
         rolePlan: {
@@ -5906,55 +8470,24 @@ export async function runAutomation(automation: {
           primaryBand: execution.plan.primaryBand,
         },
         workerTopology: applyWorkerRuntimeActivity(execution.plan.topology, execution.stepExecutions),
-        deliveryError: execution.deliveryError,
-        reviewRequired: outcome.reviewRequired,
+        deliveryError: execution.deliveryError || execution.creditBudgetBlock?.summary || externalActionReconciliationError || null,
+        reviewRequired: manualReconciliationRequired ? false : outcome.reviewRequired,
         runWarnings: outcome.runWarnings,
         runOutcome: outcome,
       },
     });
-    // Overrun-tolerant on purpose. The strict `settleCreditHold` throws when the
-    // actual cost exceeds what the workspace can cover — but by this line the
-    // run has already spent the money and written its artifacts, so throwing
-    // destroyed completed work instead of protecting anything. Charge what can
-    // be charged, keep the run, and say so.
-    const settlement = settleCreditHoldWithOverrun(creditHold.holdId, {
-      workspaceId,
-      source: 'automation_run',
-      actualCredits,
-      referenceType: 'automation',
-      referenceId: automation.id,
-      note: `Automation run: ${automation.name}`,
-      metadata: {
-        taskId: task.id,
-        taskRunId: taskRun.id,
-        actualToolCalls,
-        experimentAttribution,
-        scenarioTelemetry,
-        stepCharges: execution.stepExecutions.map((step) => ({
-          stepId: step.stepId,
-          title: step.title,
-          status: step.status,
-          actualCredits: step.actualCredits || 0,
-        })),
-        deliveryError: execution.deliveryError,
-        reviewRequired: outcome.reviewRequired,
-        runOutcome: outcome,
-      },
-    });
-    creditHoldSettled = true;
-
-    if (settlement.overran) {
+    if (accountingOverrun || settlement.overran) {
       const overrunReason = buildCreditOverrunReason({
         automationName: automation.name,
         settledCredits: settlement.settledCredits,
-        requestedCredits: settlement.requestedCredits,
-        overrunCredits: settlement.overrunCredits,
+        requestedCredits: actualCredits,
+        overrunCredits: Math.max(0, actualCredits - settlement.settledCredits),
       });
       const creditOverrun = {
         code: INSUFFICIENT_CREDITS_CODE,
         settledCredits: settlement.settledCredits,
-        requestedCredits: settlement.requestedCredits,
-        overrunCredits: settlement.overrunCredits,
+        requestedCredits: actualCredits,
+        overrunCredits: Math.max(0, actualCredits - settlement.settledCredits),
         reason: overrunReason,
         detectedAt: new Date().toISOString(),
       };
@@ -5977,7 +8510,73 @@ export async function runAutomation(automation: {
       console.warn(`[automation] ${automation.id} overran its credits: ${overrunReason}`);
     }
 
-    const settledRunStatus = settlement.overran || outcome.runStatus === 'failed' ? 'failed' : 'completed';
+    if (accountingReconciliationError) {
+      // Unknown provider usage is never certified as a zero-cost success. The
+      // known minimum is settled, the run is quarantined, and future launches
+      // stay paused until a human reconciles the provider record.
+      finalizeTaskRun(taskRun.id, {
+        status: 'failed',
+        actualCredits: settlement.settledCredits,
+        error: accountingReconciliationError,
+        metadata: {
+          settlementReconciliationRequired: true,
+          settlementRecoveryError: accountingReconciliationError,
+          accountingComplete: false,
+          knownMinimumCredits: actualCredits,
+        },
+      });
+      updateTask(task.id, {
+        status: 'blocked',
+        delegationState: 'review',
+        metadata: {
+          settlementReconciliationRequired: true,
+          settlementRecoveryError: accountingReconciliationError,
+          accountingComplete: false,
+          knownMinimumCredits: actualCredits,
+        },
+      });
+      try {
+        pauseAutomationForAccountingReconciliation(automation.id);
+      } catch (pauseError) {
+        console.error(`[automation] could not pause ${automation.id} after incomplete provider accounting`, pauseError);
+      }
+      console.warn(`[automation] ${automation.id} requires accounting reconciliation: ${accountingReconciliationError}`);
+    }
+
+    if (externalActionReconciliationError) {
+      // A rejected mutating call may be a lost response or a partial multi-send.
+      // Settle the fixed minimum, but never advertise the run as safely
+      // repeatable until the remote destination has been checked.
+      finalizeTaskRun(taskRun.id, {
+        status: 'failed',
+        actualCredits: settlement.settledCredits,
+        error: reconciliationError || externalActionReconciliationError,
+        metadata: {
+          externalActionReconciliationRequired: true,
+          settlementRecoveryError: reconciliationError || externalActionReconciliationError,
+          knownMinimumCredits: actualCredits,
+        },
+      });
+      updateTask(task.id, {
+        status: 'blocked',
+        delegationState: 'review',
+        metadata: {
+          externalActionReconciliationRequired: true,
+          settlementRecoveryError: reconciliationError || externalActionReconciliationError,
+          knownMinimumCredits: actualCredits,
+        },
+      });
+      try {
+        pauseAutomationForAccountingReconciliation(automation.id);
+      } catch (pauseError) {
+        console.error(`[automation] could not pause ${automation.id} after an ambiguous external action`, pauseError);
+      }
+      console.warn(`[automation] ${automation.id} requires external-action reconciliation: ${externalActionReconciliationError}`);
+    }
+
+    const settledRunStatus = accountingOverrun || manualReconciliationRequired || settlement.overran || outcome.runStatus === 'failed'
+      ? 'failed'
+      : 'completed';
     const completedSnapshot = buildTaskRunSnapshotEvent(workspaceId, taskRun.id, settledRunStatus);
     if (completedSnapshot) {
       broadcastTaskPanelEvent(workspaceId, completedSnapshot);
@@ -5987,87 +8586,82 @@ export async function runAutomation(automation: {
     // buttons, so an operator never has to poll the dashboard to discover that
     // something is waiting on them. Fail-soft: the dashboard is the source of
     // truth, and a card that cannot be posted must not fail the run.
-    if (outcome.reviewRequired) {
-      // One approvable draft per automation, always the newest: every older
-      // open gate closes as superseded the moment this one parks. Closing is
-      // NOT delivering — the stale drafts ship nowhere, and the ledger says so.
-      for (const stale of selectSupersededReviewTasks(listTasks(workspaceId), {
-        automationId: automation.id,
-        keepTaskId: task.id,
-      })) {
-        updateTask(stale.id, {
-          status: 'completed',
-          delegationState: 'completed',
-          metadata: {
-            ...stale.metadata,
-            reviewRequired: false,
-            reviewSuperseded: {
-              byTaskId: task.id,
-              byRunId: taskRun.id,
-              supersededAt: new Date().toISOString(),
+    if (outcome.reviewRequired && !accountingOverrun && !manualReconciliationRequired && !settlement.overran) {
+      try {
+        // One approvable draft per automation, always the newest: every older
+        // open gate closes as superseded the moment this one parks. Closing is
+        // NOT delivering — the stale drafts ship nowhere, and the ledger says so.
+        for (const stale of selectSupersededReviewTasks(listTasks(workspaceId), {
+          automationId: automation.id,
+          keepTaskId: task.id,
+        })) {
+          updateTask(stale.id, {
+            status: 'completed',
+            delegationState: 'completed',
+            metadata: {
+              ...stale.metadata,
+              reviewRequired: false,
+              reviewSuperseded: {
+                byTaskId: task.id,
+                byRunId: taskRun.id,
+                supersededAt: new Date().toISOString(),
+              },
             },
-          },
-        });
-        appendWorkflowLedgerEvent({
-          workspaceId,
-          workflowId,
-          automationId: automation.id,
-          taskId: stale.id,
-          type: 'approval_superseded',
-          summary: `An earlier ${automation.name} draft closed without delivery — a newer draft is now the one waiting for review.`,
-          metadata: { supersededTaskId: stale.id, byTaskId: task.id, byRunId: taskRun.id },
-        });
-        console.log(`[review] superseded stale review task ${stale.id} with ${task.id}`);
-      }
+          });
+          appendWorkflowLedgerEvent({
+            workspaceId,
+            workflowId,
+            automationId: automation.id,
+            taskId: stale.id,
+            type: 'approval_superseded',
+            summary: `An earlier ${automation.name} draft closed without delivery — a newer draft is now the one waiting for review.`,
+            metadata: { supersededTaskId: stale.id, byTaskId: task.id, byRunId: taskRun.id },
+          });
+          console.log(`[review] superseded stale review task ${stale.id} with ${task.id}`);
+        }
 
-      const reviewGate = execution.artifacts.find((artifact) =>
-        (artifact as { kind?: string }).kind === 'review_gate'
-      ) as { payload?: { deliveryTarget?: string } } | undefined;
-      const reviewTarget = reviewGate?.payload?.deliveryTarget || deliveryTarget || '';
-      if (reviewTarget) {
-        await postSlackReviewCard({
+        const reviewGate = execution.artifacts.find((artifact) =>
+          (artifact as { kind?: string }).kind === 'review_gate'
+        ) as { payload?: { deliveryTarget?: string } } | undefined;
+        const reviewTarget = reviewGate?.payload?.deliveryTarget || deliveryTarget || '';
+        if (reviewTarget) {
+          await postSlackReviewCard({
+            workspaceId,
+            automationId: automation.id,
+            missionName: automation.name,
+            runId: taskRun.id,
+            deliveryTarget: reviewTarget,
+            summary,
+          });
+        }
+        // Independent of reviewTarget on purpose: a review with no delivery
+        // destination still needs a human to know it exists.
+        await emailTenantReviewNotice({
           workspaceId,
-          automationId: automation.id,
           missionName: automation.name,
           runId: taskRun.id,
-          deliveryTarget: reviewTarget,
-          summary,
         });
+      } catch (error) {
+        // Settlement and terminal run truth are already durable. Notification
+        // or stale-gate cleanup is auxiliary and may never roll accounting
+        // back to a zero-credit failed run.
+        console.error(`[review] post-settlement review follow-up failed for ${automation.id}`, error);
       }
-      // Independent of reviewTarget on purpose: a review with no delivery
-      // destination still needs a human to know it exists.
-      await emailTenantReviewNotice({
-        workspaceId,
-        missionName: automation.name,
-        runId: taskRun.id,
-      });
     }
 
     return {
-      // An overrun run is a failed run for scheduling purposes even when the
-      // work itself succeeded — the next run needs credits before it fires.
-      ok: settlement.overran ? false : outcome.schedulerOk,
-      deliveryError: execution.deliveryError || undefined,
+      // A runtime budget pause is a refused run for scheduling purposes. It
+      // can resume only after the operator changes the approved envelope or
+      // trims the mission and explicitly reruns it.
+      ok: execution.creditBudgetBlock || accountingOverrun || manualReconciliationRequired || settlement.overran
+        ? false
+        : outcome.schedulerOk,
+      deliveryError:
+        execution.deliveryError || execution.creditBudgetBlock?.summary || reconciliationError || undefined,
     };
   } catch (error) {
+    failLaunchHandoff(error);
     const errorMessage = error instanceof Error ? error.message : 'Unknown automation error';
-    if (creditHold && !creditHoldSettled) {
-      try {
-        releaseCreditHold(creditHold.holdId, {
-          workspaceId,
-          referenceType: 'automation',
-          referenceId: automation.id,
-          note: `Released held credits after automation failure: ${automation.name}`,
-          metadata: {
-            taskId: task.id,
-            taskRunId: taskRun.id,
-            error: errorMessage,
-          },
-        });
-      } catch {
-        // Best-effort release; the hold expires automatically if this fails.
-      }
-    }
     const failureSummary = errorMessage.toLowerCase().includes('insufficient credits')
       ? `Automation could not start because the workspace does not have enough credits for this run.\n\n${errorMessage}`
       : `Automation failed before it could finish cleanly.\n\n${errorMessage}`;
@@ -6076,84 +8670,229 @@ export async function runAutomation(automation: {
     // its artifacts rather than substituted for them — a run that died on its
     // last step still produced everything before it, and erasing that is how a
     // real customer's completed work disappeared from the dashboard.
-    const priorProgress = readPersistedRunProgress(workspaceId, taskRun.id);
+    const persistedProgress = readPersistedRunProgress(workspaceId, taskRun.id);
+    const inMemoryProgress = latestProgress as null | {
+      artifacts: AutomationExecutionArtifact[];
+      summaryText: string;
+      stepErrors: string[];
+      stepExecutions: AutomationStepExecution[];
+      delivery: Record<string, unknown> | null;
+      deliveryError: string | null;
+      workerTopology: AutomationExecutionPlan['topology'];
+    };
+    const recoveryArtifacts = inMemoryProgress?.artifacts ?? persistedProgress.artifacts;
+    const recoverySteps = inMemoryProgress?.stepExecutions ?? persistedProgress.stepExecutions;
+    const accountedActualCredits = estimateSuccessfulAutomationCredits(recoverySteps);
+    const recoveryGenerationCalls = readAutomationGenerationCalls(recoverySteps);
+    const unreconciledRecoveryCalls = findUnreconciledGenerationCalls(recoverySteps);
+    const recoveryAccountingIncomplete = unreconciledRecoveryCalls.length > 0;
+    const recoveryAccountingError = recoveryAccountingIncomplete
+      ? buildGenerationAccountingReconciliationError(unreconciledRecoveryCalls.length)
+      : null;
+    const recoveryExternalActionIncomplete = readAutomationToolAttempts(recoverySteps)
+      .some((attempt) => attempt.mutating
+        && ['started', 'succeeded', 'outcome_unknown'].includes(attempt.status));
+    const recoveryExternalActionError = recoveryExternalActionIncomplete
+      ? buildExternalActionReconciliationError()
+      : null;
+    const recoveryManualReconciliationRequired = recoveryAccountingIncomplete || recoveryExternalActionIncomplete;
+    const recoveryReconciliationError = [recoveryAccountingError, recoveryExternalActionError]
+      .filter((message): message is string => Boolean(message))
+      .join('\n\n') || null;
+    const terminalErrorMessage = recoveryReconciliationError || errorMessage;
+    const recoveryStepCharges = buildAutomationStepCharges(recoverySteps);
+    let settlementPending: AutomationSettlementPending | null = null;
 
-    finalizeTaskRun(taskRun.id, {
-      status: 'failed',
-      actualCredits: 0,
-      error: errorMessage,
-      metadata: {
-        automationId: automation.id,
-        summary: failureSummary,
-        modelSource: runModelSource,
-        modelSourceLabel: getModelSourceLabel(runModelSource),
-        plannedSteps: executionPlan.steps,
-        stepExecutions: priorProgress.stepExecutions,
-        executionPolicy: automation.execution_policy,
-        studioState: automation.studio_state,
-        experimentAttribution,
-        scenarioTelemetry,
-        rolePlan: {
-          primaryRole: executionPlan.primaryRole,
-          supportingRoles: executionPlan.supportingRoles,
-          rationale: executionPlan.rationale,
-          elasticLanes: executionPlan.elasticLanes,
-          primaryBand: executionPlan.primaryBand,
-        },
-        workerTopology: applyWorkerRuntimeActivity(executionPlan.topology, []),
-        sourceSteps: automation.steps,
-        artifacts: [
-          ...priorProgress.artifacts,
-          {
-            kind: 'note',
-            title: `${automation.name} execution status`,
-            payload: {
-              note: failureSummary,
-              error: errorMessage,
+    if (creditHold && !creditHoldSettled) {
+      const existingTerminal = findCreditHoldTerminal(workspaceId, creditHold.holdId);
+      if (existingTerminal?.metadata?.holdStatus === 'settled') {
+        creditHoldSettled = true;
+        settledCredits = Math.max(
+          0,
+          Math.trunc(Number(existingTerminal.metadata?.actualCredits) || Math.abs(existingTerminal.deltaCredits)),
+        );
+      } else if (accountedActualCredits > 0 || recoveryManualReconciliationRequired) {
+        settlementPending = {
+          holdId: creditHold.holdId,
+          automationId: automation.id,
+          automationName: automation.name,
+          settlementCredits: Math.min(accountedActualCredits, authorizedCredits),
+          accountedActualCredits,
+          intendedRunStatus: 'failed',
+          intendedTaskStatus: recoveryManualReconciliationRequired ? 'blocked' : 'failed',
+          intendedDelegationState: 'review',
+          preparedAt: new Date().toISOString(),
+        };
+        try {
+          updateTaskRun(taskRun.id, {
+            metadata: {
+              stepExecutions: recoverySteps,
+              artifacts: recoveryArtifacts,
+              generationCalls: recoveryGenerationCalls,
+              stepCharges: recoveryStepCharges,
+              accountedActualCredits,
+              knownMinimumCredits: accountedActualCredits,
+              accountingComplete: !recoveryAccountingIncomplete,
+              settlementReconciliationRequired: recoveryAccountingIncomplete,
+              externalActionReconciliationRequired: recoveryExternalActionIncomplete,
+              ...(recoveryReconciliationError ? { settlementRecoveryError: recoveryReconciliationError } : {}),
+              authorizedCredits,
+              settlementPending,
             },
-          },
-        ],
-      },
-    });
-    updateTask(task.id, {
-      status: 'failed',
-      delegationState: 'review',
-      metadata: {
-        automationId: automation.id,
-        notify: automation.notify || null,
-        delegation: delegation.ownership,
-        modelSource: runModelSource,
-        modelSourceLabel: getModelSourceLabel(runModelSource),
-        sourceSteps: automation.steps,
-        executionPolicy: automation.execution_policy,
-        studioState: automation.studio_state,
-        experimentAttribution,
-        scenarioTelemetry,
-        latestSummary: failureSummary,
-        latestStepExecutions: priorProgress.stepExecutions,
-        automationPlan: executionPlan,
-        plannedSteps: executionPlan.steps,
-        rolePlan: {
-          primaryRole: executionPlan.primaryRole,
-          supportingRoles: executionPlan.supportingRoles,
-          rationale: executionPlan.rationale,
-          elasticLanes: executionPlan.elasticLanes,
-          primaryBand: executionPlan.primaryBand,
-        },
-        workerTopology: applyWorkerRuntimeActivity(executionPlan.topology, []),
-        latestArtifacts: [
-          ...priorProgress.artifacts,
-          {
-            kind: 'note',
-            title: `${automation.name} execution status`,
-            payload: {
-              note: failureSummary,
-              error: errorMessage,
+          });
+        } catch (persistError) {
+          console.error(`[automation] could not persist recovery settlement intent for ${automation.id}`, persistError);
+        }
+        try {
+          const settlement = settleCreditHoldWithOverrun(creditHold.holdId, {
+            workspaceId,
+            source: 'automation_run',
+            actualCredits: settlementPending.settlementCredits,
+            referenceType: 'automation',
+            referenceId: automation.id,
+            note: `Recovered charges after automation failure: ${automation.name}`,
+            metadata: {
+              taskId: task.id,
+              taskRunId: taskRun.id,
+              authorizedCredits,
+              accountedActualCredits,
+              settlementCredits: settlementPending.settlementCredits,
+              stepCharges: recoveryStepCharges,
+              generationCalls: recoveryGenerationCalls,
+              recoveryError: errorMessage,
+              knownMinimumCredits: accountedActualCredits,
+              accountingComplete: !recoveryAccountingIncomplete,
+              settlementReconciliationRequired: recoveryAccountingIncomplete,
+              externalActionReconciliationRequired: recoveryExternalActionIncomplete,
+              ...(recoveryReconciliationError ? { settlementRecoveryError: recoveryReconciliationError } : {}),
             },
+          });
+          creditHoldSettled = true;
+          settledCredits = settlement.settledCredits;
+          settlementPending = null;
+        } catch (settlementError) {
+          // Never release a hold after billable work. The pending intent is
+          // retained for boot reconciliation instead.
+          console.error(`[automation] could not settle recovery charges for ${automation.id}`, settlementError);
+        }
+      } else if (!existingTerminal) {
+        try {
+          releaseCreditHold(creditHold.holdId, {
+            workspaceId,
+            referenceType: 'automation',
+            referenceId: automation.id,
+            note: `Released unused credits after automation failure: ${automation.name}`,
+            metadata: { taskId: task.id, taskRunId: taskRun.id, error: errorMessage },
+          });
+          creditHoldSettled = true;
+        } catch {
+          // No billable work exists; expiry is a safe last resort.
+        }
+      }
+    }
+
+    if (recoveryManualReconciliationRequired) {
+      try {
+        pauseAutomationForAccountingReconciliation(automation.id);
+      } catch (pauseError) {
+        console.error(`[automation] could not pause ${automation.id} after recovery reconciliation failed`, pauseError);
+      }
+    }
+
+    const reconciliationSuffix = recoveryReconciliationError
+      ? `\n\n${recoveryReconciliationError}`
+      : '';
+    const recoveredFailureSummary = `${failureSummary}${reconciliationSuffix}`;
+    const failureArtifact: AutomationExecutionArtifact = {
+      kind: 'note',
+      title: `${automation.name} execution status`,
+      payload: { note: recoveredFailureSummary, error: terminalErrorMessage },
+    };
+    const failureArtifacts = [...recoveryArtifacts, failureArtifact];
+    try {
+      finalizeTaskRun(taskRun.id, {
+        status: 'failed',
+        actualCredits: settledCredits,
+        error: terminalErrorMessage,
+        metadata: {
+          automationId: automation.id,
+          summary: recoveredFailureSummary,
+          modelSource: runModelSource,
+          modelSourceLabel: getModelSourceLabel(runModelSource),
+          plannedSteps: executionPlan.steps,
+          stepExecutions: recoverySteps,
+          generationCalls: recoveryGenerationCalls,
+          stepCharges: recoveryStepCharges,
+          accountedActualCredits,
+          knownMinimumCredits: accountedActualCredits,
+          accountingComplete: !recoveryAccountingIncomplete,
+          settlementReconciliationRequired: recoveryAccountingIncomplete,
+          externalActionReconciliationRequired: recoveryExternalActionIncomplete,
+          ...(recoveryReconciliationError ? { settlementRecoveryError: recoveryReconciliationError } : {}),
+          settlementCredits: settledCredits,
+          settlementPending,
+          authorizedCredits,
+          executionPolicy: automation.execution_policy,
+          studioState: automation.studio_state,
+          experimentAttribution,
+          scenarioTelemetry,
+          rolePlan: {
+            primaryRole: executionPlan.primaryRole,
+            supportingRoles: executionPlan.supportingRoles,
+            rationale: executionPlan.rationale,
+            elasticLanes: executionPlan.elasticLanes,
+            primaryBand: executionPlan.primaryBand,
           },
-        ],
-      },
-    });
+          workerTopology: applyWorkerRuntimeActivity(executionPlan.topology, recoverySteps),
+          sourceSteps: automation.steps,
+          artifacts: failureArtifacts,
+        },
+      });
+    } catch (finalizeError) {
+      console.error(`[automation] could not finalize failed run ${taskRun.id}`, finalizeError);
+    }
+    try {
+      updateTask(task.id, {
+        status: recoveryManualReconciliationRequired ? 'blocked' : 'failed',
+        delegationState: 'review',
+        metadata: {
+          automationId: automation.id,
+          notify: automation.notify || null,
+          delegation: delegation.ownership,
+          modelSource: runModelSource,
+          modelSourceLabel: getModelSourceLabel(runModelSource),
+          sourceSteps: automation.steps,
+          executionPolicy: automation.execution_policy,
+          studioState: automation.studio_state,
+          experimentAttribution,
+          scenarioTelemetry,
+          latestSummary: recoveredFailureSummary,
+          latestStepExecutions: recoverySteps,
+          generationCalls: recoveryGenerationCalls,
+          stepCharges: recoveryStepCharges,
+          accountedActualCredits,
+          knownMinimumCredits: accountedActualCredits,
+          accountingComplete: !recoveryAccountingIncomplete,
+          settlementReconciliationRequired: recoveryAccountingIncomplete,
+          externalActionReconciliationRequired: recoveryExternalActionIncomplete,
+          ...(recoveryReconciliationError ? { settlementRecoveryError: recoveryReconciliationError } : {}),
+          settlementCredits: settledCredits,
+          automationPlan: executionPlan,
+          plannedSteps: executionPlan.steps,
+          rolePlan: {
+            primaryRole: executionPlan.primaryRole,
+            supportingRoles: executionPlan.supportingRoles,
+            rationale: executionPlan.rationale,
+            elasticLanes: executionPlan.elasticLanes,
+            primaryBand: executionPlan.primaryBand,
+          },
+          workerTopology: applyWorkerRuntimeActivity(executionPlan.topology, recoverySteps),
+          latestArtifacts: failureArtifacts,
+        },
+      });
+    } catch (taskError) {
+      console.error(`[automation] could not close failed task ${task.id}`, taskError);
+    }
     const failedSnapshot = buildTaskRunSnapshotEvent(workspaceId, taskRun.id, 'failed');
     if (failedSnapshot) {
       broadcastTaskPanelEvent(workspaceId, failedSnapshot);
@@ -6161,7 +8900,7 @@ export async function runAutomation(automation: {
     console.error(`[automation] ${automation.id} failed`, error);
     return {
       ok: false as const,
-      error: errorMessage,
+      error: terminalErrorMessage,
     };
   }
 }
@@ -7737,6 +10476,11 @@ app.post('/api/workspace/library/folder-drop/verify', async (req: Request, res: 
     return;
   }
   const { workspaceId } = resolveWorkspaceContext(req);
+  const readerEmail = getFolderDropReaderEmail();
+  if (!readerEmail) {
+    res.json({ laneState: 'not_configured', readerEmail: null, rootFolderId: null });
+    return;
+  }
   const rootLookup = await findLibraryRootFolderId(workspaceId);
   if (!rootLookup.ok) {
     res.status(502).json({
@@ -7753,7 +10497,7 @@ app.post('/api/workspace/library/folder-drop/verify', async (req: Request, res: 
     rootFolderId,
     actorEmail: authUser.email,
   });
-  res.json({ laneState, readerEmail: getFolderDropReaderEmail(), rootFolderId });
+  res.json({ laneState, readerEmail, rootFolderId });
 });
 
 app.post('/api/workspace/library/folder-drop/share', async (req: Request, res: Response) => {
@@ -7763,6 +10507,11 @@ app.post('/api/workspace/library/folder-drop/share', async (req: Request, res: R
     return;
   }
   const { workspaceId } = resolveWorkspaceContext(req);
+  const readerEmail = getFolderDropReaderEmail();
+  if (!readerEmail) {
+    res.json({ laneState: 'not_configured', readerEmail: null, rootFolderId: null });
+    return;
+  }
   const rootLookup = await findLibraryRootFolderId(workspaceId);
   if (!rootLookup.ok) {
     res.status(502).json({
@@ -7772,16 +10521,47 @@ app.post('/api/workspace/library/folder-drop/share', async (req: Request, res: R
     return;
   }
   const rootFolderId = rootLookup.folderId;
-  const readerEmail = getFolderDropReaderEmail();
 
   // Nothing to share to (lane unconfigured) or nowhere to share (the
   // operator's library folder does not exist in Drive yet) — either way,
   // there is no live call worth making, and this is not the same thing as
   // "sharing requires a manual step".
-  let manualShare = false;
   if (readerEmail && rootFolderId) {
     const shareResult = await shareLibraryFolderWithReader(workspaceId, rootFolderId, readerEmail);
-    manualShare = !shareResult.ok && shareResult.reason === 'manual_share_required';
+    if (!shareResult.ok) {
+      const failure = shareResult.reason === 'integration_scope_insufficient'
+        ? {
+            status: 409,
+            code: 'folder_drop_share_scope_insufficient',
+            error: 'Your Google Drive connection cannot share this folder automatically. Reauthorize Drive with permission to manage sharing, then retry.',
+          }
+        : shareResult.reason === 'integration_not_ready'
+          ? {
+              status: 409,
+              code: 'folder_drop_share_not_ready',
+              error: 'Google Drive is not connected for this workspace. Connect or reauthorize Drive, then retry.',
+            }
+          : shareResult.reason === 'manual_share_required'
+            ? {
+                status: 409,
+                code: 'folder_drop_manual_share_required',
+                error: 'This folder cannot be shared automatically. Share it manually with the reader address, then verify.',
+              }
+            : {
+                status: 502,
+                code: 'folder_drop_share_failed',
+                error: 'Your Violema Library folder could not be shared automatically because Google Drive is temporarily unavailable. Retry later.',
+              };
+      res.status(failure.status).json({
+        error: failure.error,
+        code: failure.code,
+        ...(shareResult.reason === 'manual_share_required' ? { manualShare: true } : {}),
+        ...(shareResult.reason === 'manual_share_required' ? { laneState: 'needs_share' } : {}),
+        readerEmail,
+        rootFolderId,
+      });
+      return;
+    }
   }
 
   const laneState = await getFolderDropLaneState(rootFolderId);
@@ -7793,7 +10573,6 @@ app.post('/api/workspace/library/folder-drop/share', async (req: Request, res: R
   });
 
   res.json({
-    ...(manualShare ? { manualShare: true } : {}),
     laneState,
     readerEmail,
     rootFolderId,
@@ -8166,6 +10945,8 @@ async function handleSlackApproveInteraction(input: {
     actor,
     // A Slack approval is a real approval. There is no dry-run button.
     send: buildApprovalSend(input.workspaceId, false),
+    preflight: buildApprovalPreflight(input.workspaceId),
+    tracksExternalBoundary: true,
     onBroadcast: (context, eventType) => {
       broadcastAutomationReviewUpdate(input.workspaceId, context.automation.id, context.taskRun.id, eventType);
     },
@@ -8173,16 +10954,19 @@ async function handleSlackApproveInteraction(input: {
 
   if (result.status !== 'ok') {
     const detail = describeReviewFailureForSlack(result);
-    // The card is rewritten even on failure, so a consumed review stops
-    // offering buttons that cannot work.
-    await updateSlackReviewCard({
-      channel: input.channel,
-      ts: input.messageTs,
-      missionName: result.missionName || 'this review',
-      outcome: result.status === 'invalid' && result.resolved ? 'already_resolved' : 'blocked',
-      detail,
-      actorLabel: `<@${input.slackUserId}>`,
-    });
+    // A route preflight refusal consumed nothing: keep the card actionable so
+    // the operator can connect/fix the destination and approve again. Every
+    // post-boundary failure remains blocked and loses its replay buttons.
+    if (result.status !== 'delivery_not_ready') {
+      await updateSlackReviewCard({
+        channel: input.channel,
+        ts: input.messageTs,
+        missionName: result.missionName || 'this review',
+        outcome: result.status === 'invalid' && result.resolved ? 'already_resolved' : 'blocked',
+        detail,
+        actorLabel: `<@${input.slackUserId}>`,
+      });
+    }
     await replyInSlack(input.channel, detail, input.messageTs);
     return;
   }
@@ -8517,6 +11301,12 @@ function readBodyString(value: unknown, fallback = '') {
   return typeof value === 'string' && value.trim() ? value.trim() : fallback;
 }
 
+const MAX_AUTOMATION_REVIEW_FEEDBACK_CHARS = 2_000;
+
+function readReviewFeedbackString(value: unknown, fallback = '') {
+  return readBodyString(value, fallback).slice(0, MAX_AUTOMATION_REVIEW_FEEDBACK_CHARS);
+}
+
 function readDryRunFlag(value: unknown) {
   return value === true || value === 'true' || value === 1 || value === '1';
 }
@@ -8595,6 +11385,16 @@ app.post('/api/automations', async (req: Request, res: Response) => {
     condition?: string | null;
   };
 
+  if (
+    (Array.isArray(body.steps) && body.steps.length > MAX_PERSISTED_AUTOMATION_STEPS)
+    || (Array.isArray(body.actions) && body.actions.length > MAX_PERSISTED_AUTOMATION_STEPS)
+  ) {
+    res.status(400).json({
+      error: `A mission can contain at most ${MAX_PERSISTED_AUTOMATION_STEPS} workflow steps. Nothing was saved.`,
+    });
+    return;
+  }
+
   const normalizedSteps = Array.isArray(body.steps) ? normalizePersistedAutomationSteps(body.steps) : [];
   const normalizedActions = normalizedSteps.length > 0
     ? deriveLegacyActionsFromSteps(normalizedSteps)
@@ -8612,6 +11412,19 @@ app.post('/api/automations', async (req: Request, res: Response) => {
       notify: typeof body.notify === 'string' ? body.notify.trim() : undefined,
       steps: normalizedSteps,
     });
+    if (normalizedSteps.length === 0 && normalizedActions.filter(actionNeedsDelivery).length > 1) {
+      throw new Error('A mission can contain only one delivery step. Split multiple destinations into separate missions.');
+    }
+    validateAutomationExecutableStepArguments(buildAutomationExecutableSteps({
+      id: 'automation_draft',
+      workspaceId,
+      name: body.name.trim(),
+      description: typeof body.description === 'string' ? body.description.trim() || undefined : undefined,
+      actions: normalizedActions,
+      steps: normalizedSteps.length > 0 ? normalizedSteps : undefined,
+      notify: typeof body.notify === 'string' ? body.notify.trim() || undefined : undefined,
+      condition: typeof body.condition === 'string' ? body.condition.trim() || undefined : undefined,
+    }));
     const record = createAutomation({
       workspaceId,
       owner_user_id: authUser?.id,
@@ -8646,6 +11459,10 @@ app.post('/api/automations/:id/run', async (req: Request, res: Response) => {
     res.status(404).json({ error: 'Automation not found' });
     return;
   }
+  if (automation.status === 'paused') {
+    respondAutomationPaused(res, automation.name);
+    return;
+  }
 
   const inFlight = findInFlightRunForAutomation(automation.workspaceId || workspaceId, req.params.id);
   if (inFlight) {
@@ -8667,6 +11484,11 @@ app.post('/api/automations/:id/run', async (req: Request, res: Response) => {
     const readiness = await evaluateAutomationRunReadiness({
       workspaceId: automation.workspaceId || workspaceId,
       workflowId: inferWorkflowIdFromAutomation(automation),
+      automationId: automation.id,
+      automationName: automation.name,
+      description: automation.description,
+      condition: automation.condition,
+      actions: automation.actions,
       steps: automation.steps,
       deliveryTarget: automation.notify,
     });
@@ -8680,20 +11502,66 @@ app.post('/api/automations/:id/run', async (req: Request, res: Response) => {
     return;
   }
 
-  // Connected but unaffordable is still a refusal the operator should see now,
-  // with the numbers, rather than as a blocked run they have to go find.
-  const creditBlock = checkManualRunAffordability(
-    automation,
-    automation.workspaceId || workspaceId,
-  );
-  if (creditBlock) {
-    respondInsufficientCredits(res, creditBlock);
+  // Reserve the exact authorization envelope before acknowledging the
+  // trigger. This is the authoritative affordability decision, not a
+  // read-only estimate another concurrent mission could race.
+  let creditDecision: ReturnType<typeof acquireManualRunCreditAuthorization>;
+  try {
+    creditDecision = acquireManualRunCreditAuthorization(
+      automation,
+      automation.workspaceId || workspaceId,
+    );
+  } catch (error) {
+    console.error('[automation] credit authorization failed before manual run', error);
+    respondCreditPreflightUnavailable(res);
+    return;
+  }
+  if (creditDecision.block) {
+    if (creditDecision.block.code === MODEL_ROUTE_UNAVAILABLE_CODE) {
+      respondModelRouteUnavailable(res, creditDecision.block);
+    } else if (creditDecision.block.code === CREDIT_BUDGET_EXCEEDED_CODE) {
+      respondCreditBudgetExceeded(res, creditDecision.block);
+    } else {
+      respondInsufficientCredits(res, creditDecision.block);
+    }
     return;
   }
 
-  const record = triggerAutomationNow(req.params.id, runAutomation);
-  if (!record) {
-    res.status(404).json({ error: 'Automation not found' });
+  const authorization = creditDecision.authorization;
+  const launch = createAutomationLaunchHandoff();
+  const trigger = triggerAutomationNow(
+    req.params.id,
+    (fresh) => runAutomation({
+      ...fresh,
+      _creditAuthorization: authorization,
+      _launchHandoff: launch.handoff,
+    }),
+    automation,
+  );
+  if (trigger.status !== 'started') {
+    safelyReleaseManualRunCreditAuthorization(
+      authorization,
+      `Released credits because ${automation.name} did not start (${trigger.status})`,
+    );
+    if (trigger.status === 'condition_skipped') {
+      const message = `${automation.name} was skipped: ${trigger.reason} Nothing was spent.`;
+      res.status(409).json({ ok: false, code: 'condition_not_met', error: message, message });
+    } else if (trigger.status === 'stale_record') {
+      const message = `${automation.name} changed while this run was being checked. Nothing was started — try again.`;
+      res.status(409).json({ ok: false, code: 'automation_changed', error: message, message });
+    } else if (trigger.status === 'handoff_failed') {
+      respondAutomationStartUnavailable(res, automation.name);
+    } else if (trigger.status === 'paused') {
+      respondAutomationPaused(res, automation.name);
+    } else {
+      respondAutomationAlreadyRunning(res, automation, workspaceId);
+    }
+    return;
+  }
+  const record = trigger.record;
+  const launchResult = await launch.promise;
+  if (!launchResult.ok) {
+    respondAutomationStartUnavailable(res, automation.name);
     return;
   }
 
@@ -8722,7 +11590,15 @@ function buildApprovalSend(workspaceId: string, dryRun: boolean) {
     });
   }
 
-  return ({ to, body, subject, channel, evidenceLinks, chartSpecs }: ReviewSendInput) => sendMessage({
+  return ({
+    to,
+    body,
+    subject,
+    channel,
+    evidenceLinks,
+    chartSpecs,
+    onExternalRequestStart,
+  }: ReviewSendInput) => sendMessage({
     to,
     body,
     subject,
@@ -8732,6 +11608,17 @@ function buildApprovalSend(workspaceId: string, dryRun: boolean) {
       ? renderChartSpecsToFiles({ specs: chartSpecs, dir: BRIEF_CHARTS_DIR, baseUrl: PUBLIC_APP_BASE_URL })
       : undefined,
     // The approved send is the tenant's, so it uses the tenant's Slack.
+    workspaceId,
+    onExternalRequestStart,
+  });
+}
+
+function buildApprovalPreflight(workspaceId: string) {
+  return ({ to, body, subject, channel }: ReviewSendInput) => preflightMessageDelivery({
+    to,
+    body,
+    subject,
+    channel,
     workspaceId,
   });
 }
@@ -8749,6 +11636,145 @@ function respondReviewFailure(res: Response, failure: Exclude<Awaited<ReturnType
   res.status(reviewFailureStatusCode(failure)).json({ error: failure.error });
 }
 
+type RerunnableReviewState = {
+  context: ReviewActionContext;
+  reviewRequest: Record<string, unknown>;
+};
+
+function inspectRerunnableReview(context: ReviewActionContext):
+  | { ok: true; value: RerunnableReviewState }
+  | { ok: false; error: string } {
+  const runs = listTaskRuns(context.taskRun.workspaceId);
+  const runIndex = runs.findIndex((run) => run.id === context.taskRun.id);
+  const currentRun = runIndex >= 0 ? runs[runIndex] : null;
+  const currentTask = listTasks(context.task.workspaceId).find((task) => task.id === context.task.id);
+  if (!currentRun || !currentTask) {
+    return { ok: false, error: 'This review no longer exists.' };
+  }
+
+  const reviewRequest = currentRun.metadata?.reviewRequest;
+  const hasOpenChangeRequest =
+    isObjectRecord(reviewRequest)
+    && reviewRequest.status === 'changes_requested'
+    && currentRun.metadata?.reviewRequired === true
+    && currentTask.status === 'blocked'
+    && currentTask.delegationState === 'review';
+  if (!hasOpenChangeRequest) {
+    return { ok: false, error: 'This review is not waiting for a changes-requested rerun.' };
+  }
+
+  // Task runs are stored newest-first. Any newer run for this automation makes
+  // the old review gate historical, even if stale metadata still says that it
+  // once had a changes request.
+  const supersedingRun = runs.slice(0, runIndex).find((run) =>
+    run.metadata?.automationId === context.automation.id
+  );
+  if (supersedingRun) {
+    return { ok: false, error: 'This review was superseded by a newer run.' };
+  }
+
+  return {
+    ok: true,
+    value: {
+      context: { ...context, task: currentTask, taskRun: currentRun },
+      reviewRequest,
+    },
+  };
+}
+
+const activeReviewRerunClaims = new Map<string, string>();
+
+function claimRerunnableReview(
+  context: ReviewActionContext,
+  reviewer: string,
+):
+  | { ok: false; error: string }
+  | {
+      ok: true;
+      value: RerunnableReviewState & {
+        claimId: string;
+        release: () => void;
+        consume: (input: { note: string; requestedAt: string }) => void;
+      };
+    } {
+  const inspected = inspectRerunnableReview(context);
+  if (!inspected.ok) return inspected;
+
+  const claimKey = `${inspected.value.context.taskRun.workspaceId}:${inspected.value.context.taskRun.id}`;
+  if (activeReviewRerunClaims.has(claimKey)) {
+    return { ok: false, error: 'A fresh run is already being requested for this review.' };
+  }
+  const claimId = crypto.randomUUID();
+  const claimedContext = inspected.value.context;
+  // Leave the durable changes request intact while readiness and billing
+  // await. The synchronous local claim closes same-process races; a crash
+  // simply drops it and leaves the review retryable. Once a fresh run exists,
+  // normal supersession makes the old gate historical across restarts.
+  activeReviewRerunClaims.set(claimKey, claimId);
+  const claimStillOwned = () => activeReviewRerunClaims.get(claimKey) === claimId;
+
+  return {
+    ok: true,
+    value: {
+      ...inspected.value,
+      claimId,
+      release: () => {
+        if (!claimStillOwned()) return;
+        activeReviewRerunClaims.delete(claimKey);
+      },
+      consume: ({ note, requestedAt }) => {
+        if (!claimStillOwned()) {
+          throw new Error('The rerun review claim is no longer owned by this request.');
+        }
+        const receipt = {
+          status: 'rerun_started',
+          reviewer,
+          note,
+          requestedAt,
+          previousRunId: claimedContext.taskRun.id,
+        };
+        try {
+          // The task run is authoritative for rerunnability. Consume it first;
+          // failure to mirror the receipt onto the task cannot make an already
+          // started fresh run replayable or turn the HTTP response into 500.
+          updateTaskRun(claimedContext.taskRun.id, {
+            metadata: {
+              reviewRequest: null,
+              reviewRerunClaim: null,
+              reviewRerun: receipt,
+            },
+          });
+          const currentTask = listTasks(claimedContext.task.workspaceId)
+            .find((task) => task.id === claimedContext.task.id);
+          try {
+            updateTask(claimedContext.task.id, {
+              metadata: {
+                ...(currentTask?.metadata || claimedContext.task.metadata || {}),
+                reviewRequest: null,
+                reviewRerunClaim: null,
+                reviewRerun: receipt,
+              },
+            });
+          } catch (error) {
+            console.error(`[review] could not mirror rerun receipt to task ${claimedContext.task.id}`, error);
+          }
+        } finally {
+          activeReviewRerunClaims.delete(claimKey);
+        }
+      },
+    },
+  };
+}
+
+function respondReviewNotRerunnable(res: Response, error: string) {
+  res.status(409).json({
+    ok: false,
+    code: 'review_not_rerunnable',
+    error,
+    message: error,
+  });
+}
+
 app.post('/api/automations/:id/reviews/:runId/approve', async (req: Request, res: Response) => {
   const { workspaceId } = resolveWorkspaceContext(req);
   const dryRun = readDryRunFlag(req.body?.dryRun);
@@ -8759,6 +11785,8 @@ app.post('/api/automations/:id/reviews/:runId/approve', async (req: Request, res
     actor: { surface: 'dashboard', label: readBodyString(req.body?.reviewer, 'Violema reviewer') },
     dryRun,
     send: buildApprovalSend(workspaceId, dryRun),
+    preflight: buildApprovalPreflight(workspaceId),
+    tracksExternalBoundary: true,
     onBroadcast: (context, eventType) => {
       broadcastAutomationReviewUpdate(workspaceId, context.automation.id, context.taskRun.id, eventType);
     },
@@ -8798,7 +11826,7 @@ app.post('/api/automations/:id/reviews/:runId/request-changes', (req: Request, r
     automationId: req.params.id,
     runId: req.params.runId,
     actor: { surface: 'dashboard', label: readBodyString(req.body?.reviewer, 'Violema reviewer') },
-    note: readBodyString(req.body?.note, 'Changes requested before delivery.'),
+    note: readReviewFeedbackString(req.body?.note, 'Changes requested before delivery.'),
     dryRun: readDryRunFlag(req.body?.dryRun),
     onBroadcast: (context, eventType) => {
       broadcastAutomationReviewUpdate(workspaceId, context.automation.id, context.taskRun.id, eventType);
@@ -8837,57 +11865,106 @@ app.post('/api/automations/:id/reviews/:runId/rerun', async (req: Request, res: 
     res.status(context.error === 'Automation not found' ? 404 : 400).json({ error: context.error });
     return;
   }
+  const reviewer = readBodyString(req.body?.reviewer, 'Violema reviewer');
+  const note = readReviewFeedbackString(req.body?.note, 'Reviewer requested a fresh run.');
+  const dryRun = readDryRunFlag(req.body?.dryRun);
+
+  // A rerun is a one-shot transition from an unresolved changes request, not
+  // a generic historical-run launch URL. Live requests claim that state
+  // synchronously before the first await; dry runs only inspect it.
+  const inspected = dryRun
+    ? inspectRerunnableReview(context)
+    : claimRerunnableReview(context, reviewer);
+  if (!inspected.ok) {
+    respondReviewNotRerunnable(res, inspected.error);
+    return;
+  }
+  const rerunState = inspected.value;
+  const liveClaim = dryRun ? null : inspected.value as Extract<ReturnType<typeof claimRerunnableReview>, { ok: true }>['value'];
+  if (context.automation.status === 'paused') {
+    liveClaim?.release();
+    respondAutomationPaused(res, context.automation.name);
+    return;
+  }
+  const storedChangeNote = typeof rerunState.reviewRequest.note === 'string'
+    ? rerunState.reviewRequest.note
+    : undefined;
+  const reviewFeedback = [note, storedChangeNote]
+    .map((value) => (typeof value === 'string'
+      ? value.trim().slice(0, MAX_AUTOMATION_REVIEW_FEEDBACK_CHARS)
+      : ''))
+    .filter((value) => value && value !== 'Reviewer requested a fresh run.')
+    .filter((value, index, all) => all.indexOf(value) === index)
+    .join(' — ')
+    .slice(0, MAX_AUTOMATION_REVIEW_FEEDBACK_CHARS);
 
   try {
     const rerunReadiness = await evaluateAutomationRunReadiness({
       workspaceId: context.automation.workspaceId || workspaceId,
       workflowId: inferWorkflowIdFromAutomation(context.automation),
+      automationId: context.automation.id,
+      automationName: context.automation.name,
+      description: context.automation.description,
+      condition: context.automation.condition,
+      actions: context.automation.actions,
       steps: context.automation.steps,
       deliveryTarget: context.automation.notify,
     });
     if (!rerunReadiness.allowed) {
+      liveClaim?.release();
       respondWorkflowNotReady(res, rerunReadiness);
       return;
     }
   } catch (error) {
+    liveClaim?.release();
     console.error('[automation] readiness check failed before rerun', error);
     res.status(500).json({ error: 'Could not verify workflow readiness. Try again.' });
     return;
   }
 
-  const reviewer = readBodyString(req.body?.reviewer, 'Violema reviewer');
-  const note = readBodyString(req.body?.note, 'Reviewer requested a fresh run.');
-  const dryRun = readDryRunFlag(req.body?.dryRun);
-
   // A live rerun spends exactly like a first run, so it gets the same refusal.
   // A dry run spends nothing and triggers nothing — blocking it would hide the
   // very validation an operator uses to decide whether the rerun is worth
   // buying credits for.
+  let authorization: ManualRunCreditAuthorization | null = null;
   if (!dryRun) {
-    const rerunCreditBlock = checkManualRunAffordability(
-      context.automation,
-      context.automation.workspaceId || workspaceId,
-    );
-    if (rerunCreditBlock) {
-      respondInsufficientCredits(res, rerunCreditBlock);
+    let creditDecision: ReturnType<typeof acquireManualRunCreditAuthorization>;
+    try {
+      creditDecision = acquireManualRunCreditAuthorization(
+        { ...context.automation, reviewFeedback: reviewFeedback || undefined },
+        context.automation.workspaceId || workspaceId,
+      );
+    } catch (error) {
+      liveClaim?.release();
+      console.error('[automation] credit authorization failed before rerun', error);
+      respondCreditPreflightUnavailable(res);
       return;
     }
+    if (creditDecision.block) {
+      liveClaim?.release();
+      if (creditDecision.block.code === MODEL_ROUTE_UNAVAILABLE_CODE) {
+        respondModelRouteUnavailable(res, creditDecision.block);
+      } else if (creditDecision.block.code === CREDIT_BUDGET_EXCEEDED_CODE) {
+        respondCreditBudgetExceeded(res, creditDecision.block);
+      } else {
+        respondInsufficientCredits(res, creditDecision.block);
+      }
+      return;
+    }
+    authorization = creditDecision.authorization;
   }
-  // The fresh run creates and owns its own task. Flipping the OLD task to
-  // 'running' here left a task no run would ever close — the origin of the
-  // swept zombie-task family. The stored request-changes note is likewise
-  // consumed by exactly one rerun: cleared below so a stale client-held run id
-  // can never replay it (2026-08-05: "add Viktor" resurfaced a day later
-  // through this path).
+  const requestedAt = new Date().toISOString();
   const taskPatch = {
     metadata: {
-      ...(context.task.metadata || {}),
+      ...(rerunState.context.task.metadata || {}),
       reviewRequest: null,
+      reviewRerunClaim: null,
       reviewRerun: {
+        status: 'rerun_started',
         reviewer,
         note,
-        requestedAt: new Date().toISOString(),
-        previousRunId: context.taskRun.id,
+        requestedAt,
+        previousRunId: rerunState.context.taskRun.id,
       },
     },
   } as const;
@@ -8902,18 +11979,57 @@ app.post('/api/automations/:id/reviews/:runId/rerun', async (req: Request, res: 
     return;
   }
 
-  updateTask(context.task.id, taskPatch);
-  // Consume the stored note on the run side too — one rerun, one application.
-  updateTaskRun(context.taskRun.id, { metadata: { reviewRequest: null } });
-  // Feed the reviewer's ask into the fresh run: the rerun note plus any stored
-  // request-changes note, so research and drafting both address it.
-  const storedChangeNote = (context.taskRun.metadata?.reviewRequest as { note?: string } | undefined)?.note;
-  const reviewFeedback = [note, storedChangeNote]
-    .map((value) => (typeof value === 'string' ? value.trim() : ''))
-    .filter((value) => value && value !== 'Reviewer requested a fresh run.')
-    .filter((value, index, all) => all.indexOf(value) === index)
-    .join(' — ');
-  const record = triggerAutomationNow(req.params.id, (fresh) => runAutomation({ ...fresh, reviewFeedback: reviewFeedback || undefined }));
+  if (!authorization || !liveClaim) {
+    res.status(500).json({ error: 'Could not establish the rerun authorization.' });
+    return;
+  }
+  const rerunAuthorization = authorization;
+  const rerunClaim = liveClaim;
+  const launch = createAutomationLaunchHandoff();
+
+  const trigger = triggerAutomationNow(
+    req.params.id,
+    (fresh) => runAutomation({
+      ...fresh,
+      reviewFeedback: reviewFeedback || undefined,
+      _creditAuthorization: rerunAuthorization,
+      _launchHandoff: launch.handoff,
+    }),
+    context.automation,
+  );
+  if (trigger.status !== 'started') {
+    safelyReleaseManualRunCreditAuthorization(
+      rerunAuthorization,
+      `Released credits because ${context.automation.name} did not start (${trigger.status})`,
+    );
+    rerunClaim.release();
+    if (trigger.status === 'condition_skipped') {
+      const message = `${context.automation.name} was skipped: ${trigger.reason} Nothing was spent.`;
+      res.status(409).json({ ok: false, code: 'condition_not_met', error: message, message });
+    } else if (trigger.status === 'stale_record') {
+      const message = `${context.automation.name} changed while this rerun was being checked. Nothing was started — try again.`;
+      res.status(409).json({ ok: false, code: 'automation_changed', error: message, message });
+    } else if (trigger.status === 'handoff_failed') {
+      respondAutomationStartUnavailable(res, context.automation.name);
+    } else if (trigger.status === 'paused') {
+      respondAutomationPaused(res, context.automation.name);
+    } else {
+      respondAutomationAlreadyRunning(res, context.automation, workspaceId);
+    }
+    return;
+  }
+  const record = trigger.record;
+  const launchResult = await launch.promise;
+  if (!launchResult.ok) {
+    rerunClaim.release();
+    respondAutomationStartUnavailable(res, context.automation.name);
+    return;
+  }
+
+  // The scheduler claim is now live and the fresh runner owns the credit
+  // hold. Permanently consume the old review only after both transfers have
+  // succeeded, so a refused trigger remains retryable and unbilled.
+  rerunClaim.consume({ note, requestedAt });
   broadcastAutomationReviewUpdate(workspaceId, context.automation.id, context.taskRun.id, 'automation_review_rerun_requested');
   res.json({
     ok: true,
@@ -8930,6 +12046,16 @@ app.patch('/api/automations/:id', async (req: Request, res: Response) => {
   const automation = getAutomationById(req.params.id);
   if (!automation || !automationBelongsToWorkspace(automation, workspaceId)) {
     res.status(404).json({ error: 'Automation not found' });
+    return;
+  }
+
+  if (
+    (Array.isArray(req.body.steps) && req.body.steps.length > MAX_PERSISTED_AUTOMATION_STEPS)
+    || (Array.isArray(req.body.actions) && req.body.actions.length > MAX_PERSISTED_AUTOMATION_STEPS)
+  ) {
+    res.status(400).json({
+      error: `A mission can contain at most ${MAX_PERSISTED_AUTOMATION_STEPS} workflow steps. Nothing was saved.`,
+    });
     return;
   }
 
@@ -8956,7 +12082,9 @@ app.patch('/api/automations/:id', async (req: Request, res: Response) => {
     patch.actions = deriveLegacyActionsFromSteps(normalizedSteps);
   }
   if (Array.isArray(req.body.actions)) {
-    patch.actions = req.body.actions.map((item: unknown) => String(item).trim()).filter(Boolean);
+    patch.actions = req.body.actions
+      .map((item: unknown) => String(item).trim().slice(0, MAX_AUTOMATION_STEP_TEXT_CHARS))
+      .filter(Boolean);
     if (!Array.isArray(req.body.steps)) {
       patch.steps = undefined;
       patch.version = undefined;
@@ -8979,10 +12107,36 @@ app.patch('/api/automations/:id', async (req: Request, res: Response) => {
   if (req.body.creditBudgetPerRun === null) patch.credit_budget_per_run = undefined;
 
   try {
+    const finalSteps = Array.isArray(patch.steps)
+      ? patch.steps as PersistedAutomationStep[]
+      : Array.isArray(req.body.actions) && !Array.isArray(req.body.steps)
+        ? []
+        : automation.steps || [];
+    const finalActions = Array.isArray(patch.actions)
+      ? patch.actions as string[]
+      : automation.actions || [];
     const deliveryDraft = validateAutomationDeliveryDraft({
-      notify: typeof patch.notify === 'string' ? patch.notify : undefined,
-      steps: Array.isArray(patch.steps) ? patch.steps as PersistedAutomationStep[] : undefined,
+      notify: Object.prototype.hasOwnProperty.call(patch, 'notify')
+        ? typeof patch.notify === 'string' ? patch.notify : undefined
+        : automation.notify,
+      steps: finalSteps,
     });
+    if (finalSteps.length === 0 && finalActions.filter(actionNeedsDelivery).length > 1) {
+      throw new Error('A mission can contain only one delivery step. Split multiple destinations into separate missions.');
+    }
+    const finalNotify = Object.prototype.hasOwnProperty.call(patch, 'notify')
+      ? typeof patch.notify === 'string' ? patch.notify : undefined
+      : automation.notify;
+    validateAutomationExecutableStepArguments(buildAutomationExecutableSteps({
+      id: automation.id,
+      workspaceId,
+      name: typeof patch.name === 'string' ? patch.name : automation.name,
+      description: typeof patch.description === 'string' ? patch.description : automation.description,
+      actions: finalActions,
+      steps: finalSteps.length > 0 ? finalSteps : undefined,
+      notify: finalNotify,
+      condition: typeof patch.condition === 'string' ? patch.condition : automation.condition,
+    }));
     const updated = updateAutomation(req.params.id, patch, runAutomation);
     if (!updated) {
       res.status(404).json({ error: 'Automation not found' });
@@ -9062,46 +12216,106 @@ app.get('/api/platform/ledger', (req: Request, res: Response) => {
   res.json({ items: listLedgerEntries(workspaceId) });
 });
 
+export function summarizeTaskRunProviderUsage(
+  run: ReturnType<typeof listTaskRuns>[number],
+) {
+  const metadata = run.metadata as Record<string, unknown> | undefined;
+  const stepCharges = Array.isArray(metadata?.stepCharges)
+    ? metadata.stepCharges as Array<Record<string, unknown>>
+    : Array.isArray(metadata?.stepExecutions)
+      ? metadata.stepExecutions as Array<Record<string, unknown>>
+      : [];
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let totalTokens = 0;
+  let providerCostUsd = 0;
+  let hasProviderCost = false;
+  const modelRoutes = new Set<string>();
+  const seenGenerationIds = new Set<string>();
+
+  const addUsage = (usage: {
+    inputTokens?: number;
+    outputTokens?: number;
+    totalTokens?: number;
+    provider?: string;
+    model?: string;
+    baseUrl?: string;
+  }, modelTier: ModelTier) => {
+    const callInputTokens = typeof usage.inputTokens === 'number' && Number.isFinite(usage.inputTokens)
+      ? Math.max(0, usage.inputTokens)
+      : 0;
+    const callOutputTokens = typeof usage.outputTokens === 'number' && Number.isFinite(usage.outputTokens)
+      ? Math.max(0, usage.outputTokens)
+      : 0;
+    const callTotalTokens = Math.max(
+      typeof usage.totalTokens === 'number' && Number.isFinite(usage.totalTokens)
+        ? Math.max(0, usage.totalTokens)
+        : 0,
+      callInputTokens + callOutputTokens,
+    );
+    inputTokens += callInputTokens;
+    outputTokens += callOutputTokens;
+    totalTokens += callTotalTokens;
+    const callProviderCostUsd = estimateProviderCostUsdForUsage(modelTier, usage);
+    if (callProviderCostUsd !== null) {
+      providerCostUsd += callProviderCostUsd;
+      hasProviderCost = true;
+    }
+    if (typeof usage.provider === 'string' || typeof usage.model === 'string') {
+      modelRoutes.add(`${usage.provider || 'unknown'}/${usage.model || 'unknown'}`);
+    }
+  };
+
+  for (const step of stepCharges) {
+    const generationCalls = Array.isArray(step.generationCalls)
+      ? step.generationCalls as Array<Record<string, unknown>>
+      : [];
+    if (generationCalls.length > 0) {
+      for (const call of generationCalls) {
+        const id = typeof call.id === 'string' ? call.id : '';
+        if (id && seenGenerationIds.has(id)) continue;
+        if (id) seenGenerationIds.add(id);
+        const usage = call.usage;
+        if (!usage || typeof usage !== 'object' || Array.isArray(usage)) continue;
+        const modelTier = typeof call.modelTier === 'string'
+          ? call.modelTier as ModelTier
+          : run.modelTier;
+        addUsage(usage as Parameters<typeof addUsage>[0], modelTier);
+      }
+      continue;
+    }
+
+    // Backward compatibility for task runs written before generation events.
+    const tokenUsage = step.tokenUsage;
+    if (tokenUsage && typeof tokenUsage === 'object' && !Array.isArray(tokenUsage)) {
+      addUsage(tokenUsage as Parameters<typeof addUsage>[0], run.modelTier);
+    }
+  }
+
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens,
+    providerCostUsd,
+    hasProviderCost,
+    modelRoutes: Array.from(modelRoutes),
+  };
+}
+
 app.get('/api/billing/recent-usage', (req: Request, res: Response) => {
   const { workspaceId } = resolveWorkspaceContext(req);
   const items = listTaskRuns(workspaceId)
     .slice(0, 8)
     .map((run) => {
-      const stepCharges = Array.isArray((run.metadata as Record<string, unknown> | undefined)?.stepCharges)
-        ? (run.metadata as Record<string, unknown>).stepCharges as Array<Record<string, unknown>>
-        : [];
-      let inputTokens = 0;
-      let outputTokens = 0;
-      let totalTokens = 0;
-      let providerCostUsd = 0;
-      let hasProviderCost = false;
-      const modelRoutes = new Set<string>();
-      for (const step of stepCharges) {
-        const tu = step.tokenUsage as {
-          inputTokens?: number;
-          outputTokens?: number;
-          totalTokens?: number;
-          provider?: string;
-          model?: string;
-          baseUrl?: string;
-        } | undefined;
-        if (tu && typeof tu === 'object') {
-          inputTokens += typeof tu.inputTokens === 'number' ? tu.inputTokens : 0;
-          outputTokens += typeof tu.outputTokens === 'number' ? tu.outputTokens : 0;
-          totalTokens += typeof tu.totalTokens === 'number' ? tu.totalTokens : 0;
-          const stepProviderCostUsd = estimateProviderCostUsdForUsage(run.modelTier, tu);
-          if (stepProviderCostUsd !== null) {
-            providerCostUsd += stepProviderCostUsd;
-            hasProviderCost = true;
-          }
-          if (typeof tu.provider === 'string' || typeof tu.model === 'string') {
-            modelRoutes.add(`${tu.provider || 'unknown'}/${tu.model || 'unknown'}`);
-          }
-        }
-      }
-      if (totalTokens === 0 && (inputTokens > 0 || outputTokens > 0)) {
-        totalTokens = inputTokens + outputTokens;
-      }
+      const usage = summarizeTaskRunProviderUsage(run);
+      const {
+        inputTokens,
+        outputTokens,
+        totalTokens,
+        providerCostUsd,
+        hasProviderCost,
+        modelRoutes,
+      } = usage;
 
       const credits = run.actualCredits ?? run.estimatedCredits;
       const estimatedProviderCostUsd =
@@ -9129,7 +12343,7 @@ app.get('/api/billing/recent-usage', (req: Request, res: Response) => {
         inputTokens: inputTokens > 0 ? inputTokens : null,
         outputTokens: outputTokens > 0 ? outputTokens : null,
         providerCostUsd: estimatedProviderCostUsd,
-        modelRoutes: Array.from(modelRoutes),
+        modelRoutes,
         creditValueUsd,
         marginPct,
       };
@@ -9254,6 +12468,14 @@ export function startServer() {
     } catch (error) {
       console.error(`[boot] could not record migration audit event for ${automationId}`, error);
     }
+  }
+  const reconciledSettlements = reconcilePendingAutomationSettlements(bootTime);
+  if (reconciledSettlements.length > 0) {
+    console.log(`Reconciled ${reconciledSettlements.length} pending automation settlement(s).`);
+  }
+  const reconciledReviewDeliveries = reconcilePendingReviewDeliveries();
+  if (reconciledReviewDeliveries.length > 0) {
+    console.log(`Reconciled ${reconciledReviewDeliveries.length} pending review delivery attempt(s).`);
   }
   const orphaned = sweepOrphanedTaskRuns(bootTime);
   if (orphaned.length > 0) {

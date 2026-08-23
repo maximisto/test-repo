@@ -241,10 +241,10 @@ export function buildCreditBudgetBlock(input: {
 }
 
 /**
- * The warning for a run whose ACTUAL cost crossed the budget the estimate
- * fit under. Spend cannot be un-spent, so the honest move is to say it
- * plainly on the run the operator reviews — silent burning is exactly what
- * the budget exists to prevent.
+ * The warning for the rare case where fixed/duration accounting lands above
+ * the envelope after the final guarded operation. Provider calls are blocked
+ * prospectively and settlement is capped; this preserves the uncapped cost
+ * signal without implying the operator was debited beyond authorization.
  */
 export function buildCreditBudgetOverrunWarning(input: {
   automationName: string;
@@ -252,9 +252,9 @@ export function buildCreditBudgetOverrunWarning(input: {
   budgetCredits: number;
 }): string {
   return [
-    `This run cost ${input.actualCredits} credits — over the ${input.budgetCredits}-credit per-run budget set for "${input.automationName}".`,
-    'The work is kept and the cost is on the ledger.',
-    "If this keeps happening, raise the mission's budget or trim its steps.",
+    `This run accounted for ${input.actualCredits} credits — above the ${input.budgetCredits}-credit per-run budget set for "${input.automationName}".`,
+    `The debit was capped at ${input.budgetCredits} credits; no charge beyond the approved budget was settled.`,
+    "The partial work is kept. Raise the mission's budget or trim its steps before rerunning.",
   ].join(' ');
 }
 

@@ -14,7 +14,7 @@ export type PartnerComposioSource =
 export type PartnerComposioExecutor = (
   actionName: string,
   input: Record<string, unknown>,
-  ctx: { entityId: string },
+  ctx: { entityId: string; signal?: AbortSignal },
 ) => Promise<unknown>;
 
 export interface PartnerComposioQueryInput {
@@ -24,6 +24,7 @@ export interface PartnerComposioQueryInput {
   filters?: Record<string, unknown>;
   limit?: number;
   now?: Date;
+  signal?: AbortSignal;
   execute?: PartnerComposioExecutor;
 }
 
@@ -45,7 +46,7 @@ const SOURCE_LABELS: Record<PartnerComposioSource, string> = {
   github: 'GitHub',
 };
 
-const QUERY_TYPES: Record<PartnerComposioSource, string> = {
+export const PARTNER_COMPOSIO_QUERY_TYPES: Readonly<Record<PartnerComposioSource, string>> = {
   email: 'commitments',
   calendar: 'weekly_commitments',
   google_drive: 'recent_files',
@@ -338,6 +339,21 @@ export function classifyFailure(error: unknown): IntegrationReadinessError['code
     }
   }
 
+  // Drive reports rate/quota exhaustion as HTTP 403. That is a transient
+  // platform failure, not missing OAuth scope; telling the operator to
+  // reauthorize cannot fix it and hides the actual outage.
+  if (
+    text.includes('ratelimitexceeded') ||
+    text.includes('rate_limit') ||
+    text.includes('rate limit') ||
+    text.includes('userratelimitexceeded') ||
+    text.includes('quota') ||
+    text.includes('dailylimit') ||
+    text.includes('daily limit')
+  ) {
+    return 'integration_query_failed';
+  }
+
   if (
     text.includes('scope') ||
     text.includes('permission') ||
@@ -368,9 +384,10 @@ async function executeRead(
   workspaceId: string,
   actionName: string,
   input: Record<string, unknown>,
+  signal?: AbortSignal,
 ): Promise<unknown | PartnerActionFailure> {
   try {
-    const response = await execute(actionName, input, { entityId: workspaceId });
+    const response = await execute(actionName, input, { entityId: workspaceId, signal });
     if (!isRecord(response)) {
       return { error: 'invalid partner response' };
     }
@@ -410,7 +427,7 @@ function liveResult(
 export async function queryPartnerComposio(
   input: PartnerComposioQueryInput,
 ): Promise<IntegrationQueryResult> {
-  const expectedQueryType = QUERY_TYPES[input.source];
+  const expectedQueryType = PARTNER_COMPOSIO_QUERY_TYPES[input.source];
   if (input.queryType !== expectedQueryType) {
     return errorResult(input.source, 'unsupported_query');
   }
@@ -430,7 +447,7 @@ export async function queryPartnerComposio(
       max_results: limit,
       include_payload: false,
       include_spam_trash: false,
-    });
+    }, input.signal);
     if (isPartnerFailure(payload)) {
       return errorResult(input.source, classifyFailure(payload.error));
     }
@@ -446,7 +463,7 @@ export async function queryPartnerComposio(
       single_events: true,
       response_detail: 'minimal',
       max_results_per_calendar: limit,
-    });
+    }, input.signal);
     if (isPartnerFailure(payload)) {
       return errorResult(input.source, classifyFailure(payload.error));
     }
@@ -466,7 +483,7 @@ export async function queryPartnerComposio(
       orderBy: 'modifiedTime desc',
       pageSize: limit,
       spaces: 'drive',
-    });
+    }, input.signal);
     if (isPartnerFailure(payload)) {
       return errorResult(input.source, classifyFailure(payload.error));
     }
@@ -478,7 +495,7 @@ export async function queryPartnerComposio(
       query: 'updated in the last 7 days',
       first: limit,
       include_archived: false,
-    });
+    }, input.signal);
     if (isPartnerFailure(payload)) {
       return errorResult(input.source, classifyFailure(payload.error));
     }
@@ -493,7 +510,7 @@ export async function queryPartnerComposio(
   const since = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString();
   const shared = { owner, repo };
   const [repository, pullRequests, issues, commits] = await Promise.all([
-    executeRead(execute, input.workspaceId, ACTIONS.github.repository, shared),
+    executeRead(execute, input.workspaceId, ACTIONS.github.repository, shared, input.signal),
     executeRead(execute, input.workspaceId, ACTIONS.github.pullRequests, {
       ...shared,
       state: 'open',
@@ -501,7 +518,7 @@ export async function queryPartnerComposio(
       direction: 'desc',
       page: 1,
       per_page: limit,
-    }),
+    }, input.signal),
     executeRead(execute, input.workspaceId, ACTIONS.github.issues, {
       ...shared,
       state: 'open',
@@ -509,13 +526,13 @@ export async function queryPartnerComposio(
       direction: 'desc',
       page: 1,
       per_page: limit,
-    }),
+    }, input.signal),
     executeRead(execute, input.workspaceId, ACTIONS.github.commits, {
       ...shared,
       page: 1,
       per_page: limit,
       since,
-    }),
+    }, input.signal),
   ]);
 
   const failedPayload = [repository, pullRequests, issues, commits].find(isPartnerFailure);

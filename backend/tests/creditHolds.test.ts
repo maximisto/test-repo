@@ -72,6 +72,54 @@ test('active credit holds reduce available balance until released or expired', a
   assert.equal(store.getWorkspaceCreditReserve(workspaceId, new Date('2099-07-04T18:02:00.000Z')).availableCredits, 20);
 }));
 
+test('renewing a live hold prevents a concurrent run from reserving the same credits', async () => withTempPlatformStore(async () => {
+  const store = await import('../src/platform/store');
+  const workspaceId = 'workspace_renewed_hold';
+  const startedAt = new Date('2099-07-04T18:00:00.000Z');
+  store.addLedgerEntry({
+    workspaceId,
+    source: 'manual_adjustment',
+    deltaCredits: 20,
+    referenceType: 'manual',
+    referenceId: 'renewal_balance',
+  });
+  const first = store.acquireCreditHold({
+    workspaceId,
+    amountCredits: 15,
+    referenceType: 'automation',
+    referenceId: 'run_a',
+    now: startedAt,
+    ttlMs: 10_000,
+  });
+
+  store.renewCreditHold(first.holdId, {
+    workspaceId,
+    now: new Date('2099-07-04T18:00:05.000Z'),
+    ttlMs: 60_000,
+  });
+  const afterOriginalExpiry = new Date('2099-07-04T18:00:20.000Z');
+  assert.equal(store.getWorkspaceCreditReserve(workspaceId, afterOriginalExpiry).availableCredits, 5);
+  assert.throws(
+    () => store.acquireCreditHold({
+      workspaceId,
+      amountCredits: 10,
+      referenceType: 'automation',
+      referenceId: 'run_b',
+      now: afterOriginalExpiry,
+      ttlMs: 60_000,
+    }),
+    /Insufficient credits/,
+  );
+  assert.throws(
+    () => store.renewCreditHold(first.holdId, {
+      workspaceId,
+      now: new Date('2099-07-04T18:01:10.000Z'),
+      ttlMs: 60_000,
+    }),
+    /expired before the next billable operation/,
+  );
+}));
+
 test('settling a credit hold debits once and releases the held balance', async () => withTempPlatformStore(async () => {
   const store = await import('../src/platform/store');
   const workspaceId = 'workspace_settle_hold';

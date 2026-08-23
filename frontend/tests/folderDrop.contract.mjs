@@ -52,6 +52,10 @@ assert(
   'needs_share lane-state copy is present verbatim.',
 );
 assert(
+  settingsSource.includes('Google Drive or the Violema reader is temporarily unavailable. Retry later; re-sharing the folder will not fix this incident.'),
+  'unavailable lane-state copy assigns the incident to the platform and does not blame sharing.',
+);
+assert(
   settingsSource.includes('Violema can see files you drop in your Violema Library folder.'),
   'active lane-state copy is present verbatim.',
 );
@@ -60,6 +64,10 @@ assert(
 assert(
   settingsSource.includes('folderDropLoading') && settingsSource.includes('folderDropStatus'),
   'The folder-drop status pill is driven by fetched server state with a loading state first.',
+);
+assert(
+  settingsSource.includes('folderDropError') && !settingsSource.includes("folderDropStatus?.laneState ?? 'not_configured'"),
+  'A failed status/verify/share request renders an explicit persistent error, never the not_configured fallback.',
 );
 
 // 5. A reader-email copy control.
@@ -82,8 +90,9 @@ assert(
 // When programmatic sharing is not possible, the guided instructions reuse
 // the needs_share copy rather than inventing separate wording.
 assert(
-  settingsSource.includes('manualShare'),
-  'SettingsPage handles the manualShare flag from the share endpoint.',
+  settingsSource.includes("payload?.manualShare && payload.laneState === 'needs_share'")
+    && settingsSource.includes('folderDropStatus?.manualShare'),
+  'SettingsPage preserves the expected manual-share 409 payload and renders its reader instructions.',
 );
 
 // 6. "Add a link to your library": URL input feeding the same ingestion

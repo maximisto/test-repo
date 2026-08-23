@@ -97,11 +97,40 @@ test('chunkSlackBlocks splits long briefs into threaded parts with continuation 
   assert.deepEqual(chunkSlackBlocks(blocks.slice(0, 10)), [blocks.slice(0, 10)], 'short briefs stay one message');
 });
 
-test('runaway briefs still hit the backstop with a pointer back to the run', () => {
+test('runaway briefs preserve every section across threaded chunks', () => {
   const huge = Array.from({ length: 120 }, (_, i) => `## Section ${i}\n\ncontent ${i}`).join('\n\n');
   const blocks = markdownToSlackBlocks(huge);
-  assert.ok(blocks.length <= 131);
-  const last = blocks[blocks.length - 1];
-  assert.equal(last.type, 'context');
-  assert.match(JSON.stringify(last), /truncated/i);
+  const rendered = JSON.stringify(blocks);
+  assert.match(rendered, /Section 0/);
+  assert.match(rendered, /Section 119/);
+  assert.doesNotMatch(rendered, /Brief truncated/);
+});
+
+test('oversized paragraphs are split into complete Slack sections without dropping the tail', () => {
+  const tail = 'TAIL_PARAGRAPH_EVIDENCE';
+  const markdown = `## Evidence\n\n${'fact '.repeat(900)}${tail}`;
+  const blocks = markdownToSlackBlocks(markdown);
+  const sections = blocks.filter(
+    (block): block is Extract<typeof block, { type: 'section' }> => block.type === 'section',
+  );
+
+  assert.ok(sections.length > 2, 'the paragraph is split instead of sliced');
+  assert.ok(sections.every((block) => block.text.text.length <= 2900));
+  assert.match(sections.map((block) => block.text.text).join(''), new RegExp(tail));
+});
+
+test('oversized rendered tables preserve their final row across multiple Slack sections', () => {
+  const rows = Array.from(
+    { length: 100 },
+    (_, index) => `| Company ${index} | ${'detail '.repeat(12)} |`,
+  );
+  const markdown = ['| Company | Evidence |', '| --- | --- |', ...rows].join('\n');
+  const blocks = markdownToSlackBlocks(markdown);
+  const rendered = blocks
+    .filter((block): block is Extract<typeof block, { type: 'section' }> => block.type === 'section')
+    .map((block) => block.text.text)
+    .join('\n');
+
+  assert.match(rendered, /Company 0/);
+  assert.match(rendered, /Company 99/);
 });

@@ -109,7 +109,6 @@ test('custom automation with only stripe steps passes when Stripe is configured'
     steps: [
       { kind: 'query', title: 'Revenue', inputs: { source: 'stripe', query_type: 'revenue_summary' } },
       { kind: 'query', title: 'Failed payments', inputs: { source: 'stripe', query_type: 'failed_payments' } },
-      { kind: 'deliver', title: 'Send it', inputs: {} },
     ],
   });
 
@@ -176,23 +175,69 @@ test('a demo workspace may not satisfy Stripe readiness with the server key', ()
   assert.deepEqual(blockers.map((blocker) => blocker.key), ['stripe']);
 });
 
-test('custom automation with zero query steps passes', () => {
-  const decision = evaluateRunReadiness({
+test('custom search and delivery require the providers they will actually call', () => {
+  const steps = [
+    { kind: 'search', title: 'Scan the market', inputs: { query: 'competitors' } },
+    { kind: 'summarize', title: 'Write it up', inputs: {} },
+    { kind: 'deliver', title: 'Send it', inputs: {} },
+  ];
+  const blocked = evaluateRunReadiness({
     workflowId: 'custom-workflow',
     workspaceId: 'workspace_real',
     isDemoWorkspace: false,
     settingsView: DISCONNECTED_STRIPE,
     runtimeStatus: partnerReady(),
-    steps: [
-      { kind: 'search', title: 'Scan the market', inputs: { query: 'competitors' } },
-      { kind: 'summarize', title: 'Write it up', inputs: {} },
-      { kind: 'deliver', title: 'Send it', inputs: {} },
-    ],
+    deliveryTarget: '#ops',
+    steps,
   });
 
-  assert.equal(decision.allowed, true);
-  assert.equal(decision.tier, 'step_sources');
-  assert.deepEqual(decision.blockers, []);
+  assert.equal(blocked.allowed, false);
+  assert.equal(blocked.tier, 'step_sources');
+  assert.deepEqual(blocked.blockers.map((blocker) => blocker.key), ['tavily', 'slack']);
+
+  const allowed = evaluateRunReadiness({
+    workflowId: 'custom-workflow',
+    workspaceId: 'workspace_real',
+    isDemoWorkspace: false,
+    settingsView: DISCONNECTED_STRIPE,
+    runtimeStatus: partnerReady('tavily', 'slack'),
+    deliveryTarget: '#ops',
+    steps,
+  });
+
+  assert.equal(allowed.allowed, true);
+  assert.deepEqual(allowed.blockers, []);
+});
+
+test('an explicit step delivery target takes precedence over the workflow notify target', () => {
+  const steps = [{
+    kind: 'deliver',
+    title: 'Email the founder',
+    inputs: {},
+    deliveryTarget: { channel: 'email' as const, target: 'founder@example.com' },
+  }];
+  const allowed = evaluateRunReadiness({
+    workflowId: 'custom-workflow',
+    workspaceId: 'workspace_real',
+    isDemoWorkspace: false,
+    runtimeStatus: partnerReady('postmark'),
+    deliveryTarget: '#wrong-channel',
+    steps,
+  });
+
+  assert.equal(allowed.allowed, true);
+  assert.deepEqual(allowed.blockers, []);
+
+  const blocked = evaluateRunReadiness({
+    workflowId: 'custom-workflow',
+    workspaceId: 'workspace_real',
+    isDemoWorkspace: false,
+    runtimeStatus: partnerReady('slack'),
+    deliveryTarget: '#wrong-channel',
+    steps,
+  });
+  assert.equal(blocked.allowed, false);
+  assert.deepEqual(blocked.blockers.map((blocker) => blocker.key), ['postmark']);
 });
 
 test('custom automation with no steps at all passes', () => {

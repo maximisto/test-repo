@@ -231,19 +231,22 @@ test('an unconfigured folder-drop lane reports not_configured and never audits',
   });
 });
 
-test('a workspace with a working reader but no Violema Library folder yet reports no_library_yet, never not_configured', async () => {
+test('a successful Drive lookup confirming no root folder reports no_library_yet', async (t) => {
   // MEASURED IN PRODUCTION: purpleorangehq and workspace_158339ffa04cc7ef both
   // have a working platform reader but no rootFolderId yet (their first
   // library write has not happened), and reported `not_configured` — which
   // blames the SERVER for a WORKSPACE-level condition. No lane-state
-  // override here: findLibraryRootFolderId genuinely returns null in this
-  // fresh temp workspace (there is no Composio connection at all, so the
-  // Drive lookup fails closed to null, same as "the folder does not exist"),
-  // and the real getFolderDropLaneState must read that as no_library_yet
-  // because a reader key IS configured.
+  // A missing Composio connection is NOT evidence of absence. This fixture
+  // explicitly models the only state allowed to mean fresh workspace: a
+  // successful Drive query whose result set is empty.
   const readerKeyEnvValue = buildTestReaderKeyEnvValue('reader@test.iam');
 
   await withApiServer({ readerKeyEnvValue }, async ({ baseUrl, sessionToken }) => {
+    if (!accountLibraryModule) throw new Error('accountLibrary module not loaded yet.');
+    t.mock.method(accountLibraryModule, 'findLibraryRootFolderId', async () => ({
+      ok: true as const,
+      folderId: null,
+    }));
     const status = await fetch(`${baseUrl}/api/workspace/library/folder-drop`, {
       headers: authHeaders(sessionToken),
     });
@@ -261,11 +264,16 @@ test('a workspace with a working reader but no Violema Library folder yet report
   });
 });
 
-test('the first transition to active audits exactly once, even across repeated verify calls', async () => {
+test('the first transition to active audits exactly once, even across repeated verify calls', async (t) => {
   const readerKeyEnvValue = buildTestReaderKeyEnvValue('reader@test.iam');
 
   await withApiServer({ readerKeyEnvValue }, async ({ baseUrl, sessionToken, workspaceId }) => {
     if (!librarySweepModule) throw new Error('librarySweep module not loaded yet.');
+    if (!accountLibraryModule) throw new Error('accountLibrary module not loaded yet.');
+    t.mock.method(accountLibraryModule, 'findLibraryRootFolderId', async () => ({
+      ok: true as const,
+      folderId: 'root-folder',
+    }));
     librarySweepModule.setLibrarySweepOverridesForTests({ laneState: 'active' });
 
     const first = await fetch(`${baseUrl}/api/workspace/library/folder-drop/verify`, {
@@ -319,6 +327,11 @@ test('concurrent verify + share requests racing the first activation audit exact
 
   await withApiServer({ readerKeyEnvValue }, async ({ baseUrl, sessionToken, workspaceId }) => {
     if (!librarySweepModule) throw new Error('librarySweep module not loaded yet.');
+    if (!accountLibraryModule) throw new Error('accountLibrary module not loaded yet.');
+    t.mock.method(accountLibraryModule, 'findLibraryRootFolderId', async () => ({
+      ok: true as const,
+      folderId: 'root-folder',
+    }));
 
     // Both routes' handlers now pause here for ~30ms before reaching the
     // stamp call, guaranteeing the two concurrent requests below are both
@@ -327,6 +340,7 @@ test('concurrent verify + share requests racing the first activation audit exact
       await new Promise((resolve) => setTimeout(resolve, 30));
       return 'active' as const;
     });
+    t.mock.method(librarySweepModule, 'shareLibraryFolderWithReader', async () => ({ ok: true as const }));
 
     const [verifyResponse, shareResponse] = await Promise.all([
       fetch(`${baseUrl}/api/workspace/library/folder-drop/verify`, {
@@ -388,5 +402,63 @@ test('a failed root-folder lookup surfaces as a platform failure, never as onboa
     assert.equal(share.status, 502);
 
     assert.equal(readFolderDropShareAuditEvents().length, 0, 'a failed lookup must never audit an enablement.');
+  });
+});
+
+test('a failed programmatic share returns a mapped non-2xx error instead of pretending needs_share', async (t) => {
+  const readerKeyEnvValue = buildTestReaderKeyEnvValue('reader@test.iam');
+
+  await withApiServer({ readerKeyEnvValue }, async ({ baseUrl, sessionToken }) => {
+    if (!librarySweepModule) throw new Error('librarySweep module not loaded yet.');
+    if (!accountLibraryModule) throw new Error('accountLibrary module not loaded yet.');
+    t.mock.method(accountLibraryModule, 'findLibraryRootFolderId', async () => ({
+      ok: true as const,
+      folderId: 'root-folder',
+    }));
+    t.mock.method(librarySweepModule, 'shareLibraryFolderWithReader', async () => ({
+      ok: false as const,
+      reason: 'integration_query_failed' as const,
+    }));
+
+    const response = await fetch(`${baseUrl}/api/workspace/library/folder-drop/share`, {
+      method: 'POST',
+      headers: authHeaders(sessionToken),
+    });
+    assert.equal(response.status, 502);
+    const body = await response.json() as Record<string, unknown>;
+    assert.equal(body.code, 'folder_drop_share_failed');
+    assert.match(String(body.error), /could not be shared automatically/i);
+    assert.equal(body.laneState, undefined, 'a failed share must not invent a healthy onboarding state');
+    assert.equal(readFolderDropShareAuditEvents().length, 0);
+  });
+});
+
+test('manual-share-required preserves the actionable lane state and reader address on 409', async (t) => {
+  const readerKeyEnvValue = buildTestReaderKeyEnvValue('reader@test.iam');
+
+  await withApiServer({ readerKeyEnvValue }, async ({ baseUrl, sessionToken }) => {
+    if (!librarySweepModule) throw new Error('librarySweep module not loaded yet.');
+    if (!accountLibraryModule) throw new Error('accountLibrary module not loaded yet.');
+    t.mock.method(accountLibraryModule, 'findLibraryRootFolderId', async () => ({
+      ok: true as const,
+      folderId: 'root-folder',
+    }));
+    t.mock.method(librarySweepModule, 'shareLibraryFolderWithReader', async () => ({
+      ok: false as const,
+      reason: 'manual_share_required' as const,
+    }));
+
+    const response = await fetch(`${baseUrl}/api/workspace/library/folder-drop/share`, {
+      method: 'POST',
+      headers: authHeaders(sessionToken),
+    });
+    assert.equal(response.status, 409);
+    const body = await response.json() as Record<string, unknown>;
+    assert.equal(body.code, 'folder_drop_manual_share_required');
+    assert.equal(body.manualShare, true);
+    assert.equal(body.laneState, 'needs_share');
+    assert.equal(body.readerEmail, 'reader@test.iam');
+    assert.equal(body.rootFolderId, 'root-folder');
+    assert.equal(readFolderDropShareAuditEvents().length, 0);
   });
 });

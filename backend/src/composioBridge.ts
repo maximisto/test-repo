@@ -24,6 +24,7 @@ export interface ComposioClientAdapter {
         arguments: Record<string, unknown>;
         dangerouslySkipVersionCheck: true;
       },
+      options?: { signal?: AbortSignal },
     ): Promise<unknown>;
   };
   authConfigs: {
@@ -52,7 +53,7 @@ export interface ComposioClientAdapter {
       statuses: ComposioConnectionStatus[];
       /** Page token from the previous response's `nextCursor`. Omit for page 1. */
       cursor?: string;
-    }): Promise<{
+    }, options?: { signal?: AbortSignal }): Promise<{
       items: Array<{
         id?: string | null;
         toolkit?: { slug?: string } | null;
@@ -292,7 +293,7 @@ export function createComposioBridge(
         userIds: [ctx.entityId],
         statuses: ['ACTIVE'],
         ...(cursor ? { cursor } : {}),
-      });
+      }, ctx.signal ? { signal: ctx.signal } : undefined);
 
       for (const connection of connections.items) {
         const toolkit = connection.toolkit?.slug ?? '';
@@ -329,7 +330,7 @@ export function createComposioBridge(
         userIds: [ctx.entityId],
         statuses: [...COMPOSIO_CONNECTION_STATUSES],
         ...(cursor ? { cursor } : {}),
-      });
+      }, ctx.signal ? { signal: ctx.signal } : undefined);
 
       for (const connection of connections.items) {
         const toolkit = connection.toolkit?.slug ?? '';
@@ -400,7 +401,7 @@ export function createComposioBridge(
         // Violema accepts dynamic partner-tool names, so there is no single
         // toolkit version to pin at this boundary.
         dangerouslySkipVersionCheck: true,
-      });
+      }, ctx.signal ? { signal: ctx.signal } : undefined);
     },
 
     async startConnection(appName, ctx, options) {
@@ -523,6 +524,8 @@ export function isComposioToolName(name: string): boolean {
 export interface ComposioExecutionContext {
   /** Stable per-workspace identifier — Composio uses this to look up OAuth credentials. */
   entityId: string;
+  /** Cancels the upstream HTTP request when an automation deadline expires. */
+  signal?: AbortSignal;
 }
 
 /**
